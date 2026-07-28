@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pathbridger"
+version = "0.1.0"
+description = "PathBridger for offline goal-conditioned reinforcement learning."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+dependencies = [
+    "absl-py",
+    "flax>=0.8.4",
+    "gymnasium>=0.29.1",
+    "jax>=0.4.26",
+    "ml-collections",
+    "numpy>=1.26",
+    "ogbench==1.1.0",
+    "optax",
+    "tqdm",
+]
+
+[project.scripts]
+pathbridger-train = "main:run"
+pathbridger-eval = "evaluate:run"
+
+[project.optional-dependencies]
+tracking = ["wandb"]
+dev = ["pytest", "ruff"]
+
+[tool.setuptools]
+py-modules = ["main", "evaluate"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["agents*", "configs*", "envs*", "utils*"]
+
+[tool.setuptools.data-files]
+"share/pathbridger/assets" = ["assets/architecture.jpg"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+
+[tool.ruff.format]
+quote-style = "single"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

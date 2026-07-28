@@ -1,0 +1,305 @@
+"""State-only offline dataset utilities for PathBridger.
+
+The sampler intentionally exposes only the supervision used by the final
+PathBridger objective.  It assumes OGBench's compact layout: observations are a
+single state sequence and ``terminals`` marks the final state of every episode.
+No image augmentation, frame stacking, replay storage, actor target, or action
+chunk target is implemented here.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+from collections.abc import Iterator, Mapping
+from types import MappingProxyType
+from typing import Any
+
+import numpy as np
+
+_ACTION_HORIZON = 5
+
+
+class Dataset(Mapping[str, np.ndarray]):
+    """An immutable mapping of equally sized NumPy arrays.
+
+    The mapping cannot be changed after construction and each stored array is
+    exposed through a read-only view.  Indexing a dataset returns an ordinary
+    mutable batch dictionary, which is convenient for JAX training code.
+    """
+
+    @classmethod
+    def create(cls, freeze: bool = True, **fields: Any) -> "Dataset":
+        """Create a dataset from named array fields.
+
+        ``freeze=False`` is accepted for API compatibility, but the mapping
+        itself remains immutable.  PathBridger's offline loaders always use the
+        default read-only arrays.
+        """
+
+        return cls(fields, freeze=freeze)
+
+    def __init__(self, fields: Mapping[str, Any], *, freeze: bool = True):
+        if "observations" not in fields:
+            raise ValueError("Dataset requires an 'observations' field.")
+        if not fields:
+            raise ValueError("Dataset cannot be empty.")
+
+        arrays: dict[str, np.ndarray] = {}
+        size: int | None = None
+        for key, value in fields.items():
+            array = np.asarray(value)
+            if array.ndim == 0:
+                raise ValueError(f"Dataset field {key!r} must have a leading batch dimension.")
+            if size is None:
+                size = len(array)
+            elif len(array) != size:
+                raise ValueError(
+                    f"Dataset fields must have equal lengths; {key!r} has {len(array)}, expected {size}."
+                )
+            if freeze:
+                array = array.view()
+                array.setflags(write=False)
+            arrays[str(key)] = array
+
+        if size is None or size == 0:
+            raise ValueError("Dataset must contain at least one transition.")
+        self._data = MappingProxyType(arrays)
+        self.size = size
+
+        if "valids" in arrays:
+            valids = np.asarray(arrays["valids"]).reshape(-1)
+            self._valid_idxs = np.flatnonzero(valids > 0)
+            if len(self._valid_idxs) == 0:
+                raise ValueError("Dataset contains no valid transitions.")
+        else:
+            self._valid_idxs = None
+
+    def __getitem__(self, key: str) -> np.ndarray:
+        return self._data[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._data)
+
+    def __len__(self) -> int:
+        return len(self._data)
+
+    def get_random_idxs(self, num_idxs: int) -> np.ndarray:
+        """Sample transition indices, respecting compact-dataset ``valids``."""
+
+        num_idxs = int(num_idxs)
+        if num_idxs < 1:
+            raise ValueError(f"num_idxs must be positive, got {num_idxs}.")
+        if self._valid_idxs is None:
+            return np.random.randint(0, self.size, size=num_idxs, dtype=np.int64)
+        choices = np.random.randint(0, len(self._valid_idxs), size=num_idxs)
+        return self._valid_idxs[choices]
+
+    def get_subset(self, idxs: Any) -> dict[str, np.ndarray]:
+        """Return fields at ``idxs`` and infer compact next observations."""
+
+        idxs = np.asarray(idxs, dtype=np.int64)
+        if np.any(idxs < 0) or np.any(idxs >= self.size):
+            raise IndexError(f"Dataset indices must lie in [0, {self.size}); got {idxs}.")
+        result = {key: value[idxs] for key, value in self._data.items()}
+        if "next_observations" not in result:
+            next_idxs = np.minimum(idxs + 1, self.size - 1)
+            result["next_observations"] = self._data["observations"][next_idxs]
+        return result
+
+    def sample(self, batch_size: int, idxs: Any | None = None) -> dict[str, np.ndarray]:
+        """Sample a transition batch."""
+
+        if idxs is None:
+            idxs = self.get_random_idxs(batch_size)
+        return self.get_subset(idxs)
+
+
+@dataclasses.dataclass(frozen=True)
+class PathBridgerDatasetConfig:
+    """The complete sampler configuration."""
+
+    horizon: int
+    discount: float
+
+
+def _config_get(config: Any, key: str) -> Any:
+    """Read one setting from a mapping, ConfigDict, or dataclass-like object."""
+
+    if isinstance(config, Mapping):
+        try:
+            return config[key]
+        except KeyError as exc:
+            raise ValueError(f"PathBridgerDataset config is missing {key!r}.") from exc
+    try:
+        return getattr(config, key)
+    except AttributeError as exc:
+        raise ValueError(f"PathBridgerDataset config is missing {key!r}.") from exc
+
+
+@dataclasses.dataclass
+class PathBridgerDataset:
+    """Add PathBridger hindsight supervision to a compact offline dataset.
+
+    Only ``horizon`` and ``discount`` are read from ``config``.  Passing the
+    complete agent ConfigDict is therefore supported without coupling this
+    sampler to unrelated model hyperparameters.
+    """
+
+    dataset: Dataset
+    config: Any
+
+    def __post_init__(self) -> None:
+        self.horizon = int(_config_get(self.config, "horizon"))
+        self.discount = float(_config_get(self.config, "discount"))
+        if self.horizon < _ACTION_HORIZON:
+            raise ValueError(
+                f"horizon must be at least {_ACTION_HORIZON}, got {self.horizon}."
+            )
+        if not 0.0 < self.discount < 1.0:
+            raise ValueError(f"discount must lie in (0, 1), got {self.discount}.")
+
+        observations = np.asarray(self.dataset["observations"])
+        if observations.ndim != 2:
+            raise ValueError(
+                "PathBridger_dist supports state-vector observations only; "
+                f"expected observations with shape [N, D], got {observations.shape}."
+            )
+        if "actions" not in self.dataset:
+            raise ValueError("PathBridgerDataset requires an 'actions' field.")
+        if "terminals" not in self.dataset:
+            raise ValueError(
+                "PathBridgerDataset requires compact OGBench 'terminals' to preserve episode boundaries."
+            )
+
+        terminals = np.asarray(self.dataset["terminals"])
+        if terminals.ndim != 1:
+            raise ValueError(f"terminals must have shape [N], got {terminals.shape}.")
+        self.size = self.dataset.size
+        self.terminal_locs = np.flatnonzero(terminals > 0).astype(np.int64)
+        if len(self.terminal_locs) == 0 or int(self.terminal_locs[-1]) != self.size - 1:
+            raise ValueError("The final compact-dataset observation must be marked terminal.")
+        self.initial_locs = np.concatenate(
+            [np.asarray([0], dtype=np.int64), self.terminal_locs[:-1] + 1]
+        )
+
+        # Cache the episode terminal for every state and all starts whose full
+        # K-window is present in one episode.
+        self._final_for_idx = np.empty(self.size, dtype=np.int64)
+        valid_parts: list[np.ndarray] = []
+        for start, final in zip(self.initial_locs, self.terminal_locs):
+            self._final_for_idx[start : final + 1] = final
+            last_start = int(final) - self.horizon
+            if last_start >= int(start):
+                valid_parts.append(np.arange(start, last_start + 1, dtype=np.int64))
+        if not valid_parts:
+            raise ValueError(
+                f"No episode contains a full horizon-{self.horizon} state window."
+            )
+        self.valid_starts = np.concatenate(valid_parts)
+        self._path_offsets = np.arange(self.horizon + 1, dtype=np.int64)
+
+    def _validate_starts(self, idxs: Any) -> np.ndarray:
+        idxs = np.asarray(idxs, dtype=np.int64)
+        if idxs.ndim != 1 or len(idxs) == 0:
+            raise ValueError(f"idxs must be a non-empty 1D array, got shape {idxs.shape}.")
+        if np.any(idxs < 0) or np.any(idxs >= self.size):
+            raise IndexError(f"Sample starts must lie in [0, {self.size}); got {idxs}.")
+        finals = self._final_for_idx[idxs]
+        bad = idxs + self.horizon > finals
+        if np.any(bad):
+            row = int(np.flatnonzero(bad)[0])
+            raise ValueError(
+                "A PathBridger training window cannot cross an episode boundary: "
+                f"start={int(idxs[row])}, horizon={self.horizon}, terminal={int(finals[row])}."
+            )
+        return idxs
+
+    @staticmethod
+    def _uniform_positive_offsets(max_offsets: np.ndarray) -> np.ndarray:
+        """Uniformly sample an integer in ``[1, max_offset]`` per row."""
+
+        max_offsets = np.asarray(max_offsets, dtype=np.int64)
+        if np.any(max_offsets < 1):
+            raise ValueError("Positive future sampling requires at least one remaining state.")
+        return 1 + np.floor(np.random.random(len(max_offsets)) * max_offsets).astype(np.int64)
+
+    def sample(self, batch_size: int, idxs: Any | None = None) -> dict[str, np.ndarray]:
+        """Sample one PathBridger training batch.
+
+        Endpoint goals are uniform future states.  Value goals use geometric
+        future sampling with ``p=1-discount``.  Short base pairs use offsets
+        1--5, and transitive splits are active only for value pairs longer than
+        five transitions.
+        """
+
+        batch_size = int(batch_size)
+        if batch_size < 1:
+            raise ValueError(f"batch_size must be positive, got {batch_size}.")
+        if idxs is None:
+            choices = np.random.randint(0, len(self.valid_starts), size=batch_size)
+            idxs = self.valid_starts[choices]
+        else:
+            idxs = self._validate_starts(idxs)
+            if len(idxs) != batch_size:
+                raise ValueError(
+                    f"batch_size={batch_size} does not match the {len(idxs)} provided indices."
+                )
+        idxs = self._validate_starts(idxs)
+
+        observations = np.asarray(self.dataset["observations"])
+        finals = self._final_for_idx[idxs]
+        remaining = finals - idxs
+
+        # Endpoint proposer supervision: sample a final hindsight goal uniformly
+        # from the strict future, then clip/pad the K-window at that goal.
+        distances = np.random.random(batch_size)
+        endpoint_goal_idxs = np.round(
+            (idxs + 1) * distances + finals * (1.0 - distances)
+        ).astype(np.int64)
+        endpoint_target_idxs = np.minimum(idxs + self.horizon, endpoint_goal_idxs)
+        trajectory_idxs = idxs[:, None] + self._path_offsets[None, :]
+        trajectory_idxs = np.minimum(trajectory_idxs, endpoint_target_idxs[:, None])
+
+        # Value supervision follows the research sampler's geometric future
+        # relabeling.  Clipping at the terminal keeps the goal in the episode.
+        geometric_offsets = np.random.geometric(
+            p=1.0 - self.discount, size=batch_size
+        ).astype(np.int64)
+        value_goal_idxs = np.minimum(idxs + geometric_offsets, finals)
+        value_offsets = value_goal_idxs - idxs
+
+        # The short anchor horizon H_b is fixed to five in the final method.
+        base_max_offsets = np.minimum(5, remaining)
+        base_offsets = self._uniform_positive_offsets(base_max_offsets)
+        base_goal_idxs = idxs + base_offsets
+
+        # TRL splits are strictly internal to long pairs.  Invalid rows use the
+        # current state and zero offset; their contribution is removed by the
+        # explicit float mask.
+        transitive_valids = value_offsets > 5
+        transitive_offsets = np.zeros(batch_size, dtype=np.int64)
+        if np.any(transitive_valids):
+            max_split_offsets = value_offsets[transitive_valids] - 1
+            transitive_offsets[transitive_valids] = self._uniform_positive_offsets(
+                max_split_offsets
+            )
+        transitive_idxs = idxs + transitive_offsets
+
+        return {
+            "observations": np.asarray(observations[idxs], dtype=np.float32),
+            "next_observations": np.asarray(observations[idxs + 1], dtype=np.float32),
+            "actions": np.asarray(self.dataset["actions"][idxs], dtype=np.float32),
+            "trajectory": np.asarray(observations[trajectory_idxs], dtype=np.float32),
+            "endpoint_goals": np.asarray(observations[endpoint_goal_idxs], dtype=np.float32),
+            "endpoint_targets": np.asarray(observations[endpoint_target_idxs], dtype=np.float32),
+            "value_goals": np.asarray(observations[value_goal_idxs], dtype=np.float32),
+            "value_offsets": value_offsets.astype(np.float32),
+            "base_goals": np.asarray(observations[base_goal_idxs], dtype=np.float32),
+            "base_offsets": base_offsets.astype(np.float32),
+            "transitive_subgoals": np.asarray(observations[transitive_idxs], dtype=np.float32),
+            "transitive_offsets": transitive_offsets.astype(np.float32),
+            "transitive_valids": transitive_valids.astype(np.float32),
+        }
+
+
+__all__ = ["Dataset", "PathBridgerDataset", "PathBridgerDatasetConfig"]

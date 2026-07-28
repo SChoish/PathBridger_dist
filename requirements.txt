@@ -1,0 +1,10 @@
+absl-py
+flax >= 0.8.4
+gymnasium >= 0.29.1
+jax >= 0.4.26
+ml-collections
+numpy >= 1.26
+ogbench == 1.1.0
+optax
+tqdm
+
