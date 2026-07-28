@@ -27,7 +27,7 @@ pathbridger-eval = "evaluate:run"
 
 [project.optional-dependencies]
 tracking = ["wandb"]
-dev = ["pytest", "ruff"]
+dev = ["ruff"]
 
 [tool.setuptools]
 py-modules = ["main", "evaluate"]
@@ -45,6 +45,3 @@ line-length = 120
 
 [tool.ruff.format]
 quote-style = "single"
-
-[tool.pytest.ini_options]
-testpaths = ["tests"]

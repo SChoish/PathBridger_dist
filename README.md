@@ -208,10 +208,3 @@ For compatibility with the experiments that produced the reported results,
 training keeps the research sampler's close-goal behavior: when a sampled final
 goal occurs before \(t+K\), the endpoint is clipped to that goal and the
 remaining trajectory window is padded with the goal state.
-
-## Tests
-
-```bash
-pip install -e ".[dev]"
-pytest -q
-```
