@@ -58,6 +58,29 @@ def _literal_assignment(tree: ast.AST, name: str):
     raise AssertionError(f"{name} was not assigned")
 
 
+def _agent_default_config() -> dict[str, object]:
+    path = PROJECT_ROOT / "agents" / "pathbridger.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    get_config = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "get_config"
+    )
+    returned = next(
+        node.value for node in get_config.body if isinstance(node, ast.Return)
+    )
+    assert isinstance(returned, ast.Call)
+    assert len(returned.args) == 1
+    payload = returned.args[0]
+    assert isinstance(payload, ast.Call)
+    assert isinstance(payload.func, ast.Name) and payload.func.id == "dict"
+    return {
+        keyword.arg: ast.literal_eval(keyword.value)
+        for keyword in payload.keywords
+        if keyword.arg is not None
+    }
+
+
 def test_all_sixteen_configs_match_the_paper_best_parameter_table():
     discovered = {
         (family, path.stem)
@@ -82,6 +105,22 @@ def test_all_sixteen_configs_match_the_paper_best_parameter_table():
         )
         assert values["endpoint_distribution"] == distribution[family]
         assert tuple(values[field] for field in fields) == expected
+
+
+def test_shared_goal_mixes_use_paper_four_tuple_order_without_geom_flags():
+    defaults = _agent_default_config()
+    assert defaults["actor_p"] == (0.0, 0.0, 1.0, 0.0)
+    assert defaults["critic_p"] == (0.0, 1.0, 0.0, 0.0)
+
+    source_paths = (
+        PROJECT_ROOT / "agents" / "pathbridger.py",
+        PROJECT_ROOT / "utils" / "datasets.py",
+        PROJECT_ROOT / "configs" / "_base.py",
+    )
+    source = "\n".join(path.read_text(encoding="utf-8") for path in source_paths)
+    assert "actor_geom_sample" not in source
+    assert "critic_geom_sample" not in source
+    assert "value_geom_sample" not in source
 
 
 def test_sampler_and_agent_share_the_exact_thirteen_key_contract():
@@ -129,7 +168,7 @@ def test_sampler_and_agent_share_the_exact_thirteen_key_contract():
     assert returned_keys == required
 
 
-def test_agent_source_contains_no_actor_or_action_q_module_or_config():
+def test_agent_source_contains_no_neural_actor_or_action_q_module():
     path = PROJECT_ROOT / "agents" / "pathbridger.py"
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
 

@@ -25,6 +25,17 @@ BATCH_KEYS = {
 }
 
 
+def _sampler_config(**overrides):
+    config = {
+        "horizon": 5,
+        "discount": 0.99,
+        "actor_p": (0.0, 0.0, 1.0, 0.0),
+        "critic_p": (0.0, 1.0, 0.0, 0.0),
+    }
+    config.update(overrides)
+    return config
+
+
 def _two_episode_dataset() -> Dataset:
     """Episodes occupy indices 0..6 and 7..14."""
 
@@ -49,7 +60,7 @@ def test_batch_contract_and_close_goal_clip_pad(monkeypatch):
 
     sampler = PathBridgerDataset(
         _two_episode_dataset(),
-        {"horizon": 5, "discount": 0.99},
+        _sampler_config(),
     )
 
     # sample() calls random() for endpoint interpolation, base offsets, then
@@ -108,7 +119,7 @@ def test_batch_contract_and_close_goal_clip_pad(monkeypatch):
 def test_valid_starts_and_explicit_windows_never_cross_episode_boundaries():
     sampler = PathBridgerDataset(
         _two_episode_dataset(),
-        {"horizon": 5, "discount": 0.99},
+        _sampler_config(),
     )
 
     np.testing.assert_array_equal(sampler.valid_starts, [0, 1, 7, 8, 9])
@@ -123,7 +134,7 @@ def test_every_sampled_index_stays_inside_its_source_episode():
     np.random.seed(7)
     sampler = PathBridgerDataset(
         _two_episode_dataset(),
-        {"horizon": 5, "discount": 0.99},
+        _sampler_config(),
     )
     batch = sampler.sample(batch_size=256)
 
@@ -172,4 +183,106 @@ def test_dataset_rejects_missing_final_terminal():
         terminals=terminals,
     )
     with pytest.raises(ValueError, match="final compact-dataset observation"):
-        PathBridgerDataset(dataset, {"horizon": 2, "discount": 0.99})
+        PathBridgerDataset(dataset, _sampler_config())
+
+
+def test_four_tuple_goal_mixes_select_geometric_and_trajectory_future(monkeypatch):
+    sampler = PathBridgerDataset(
+        _two_episode_dataset(),
+        _sampler_config(
+            actor_p=(0.0, 1.0, 0.0, 0.0),
+            critic_p=(0.0, 0.0, 1.0, 0.0),
+        ),
+    )
+
+    random_results = iter(
+        (
+            np.asarray([1.0, 0.0]),       # critic trajectory goals: 2 and 14
+            np.asarray([0.0, 0.999]),     # base offsets: 1 and 5
+            np.asarray([0.4]),            # long-pair split: offset 3
+        )
+    )
+    monkeypatch.setattr(np.random, "random", lambda size: next(random_results))
+    monkeypatch.setattr(
+        np.random,
+        "geometric",
+        lambda p, size: np.asarray([2, 10], dtype=np.int64),
+    )
+
+    batch = sampler.sample(batch_size=2, idxs=np.asarray([1, 8]))
+
+    np.testing.assert_array_equal(_state_ids(batch["endpoint_goals"]), [3, 14])
+    np.testing.assert_array_equal(_state_ids(batch["endpoint_targets"]), [3, 13])
+    np.testing.assert_array_equal(_state_ids(batch["value_goals"]), [2, 14])
+    np.testing.assert_array_equal(batch["value_offsets"], [1.0, 6.0])
+    np.testing.assert_array_equal(
+        _state_ids(batch["trajectory"][0]),
+        [1, 2, 3, 3, 3, 3],
+    )
+
+
+def test_random_actor_goal_keeps_endpoint_target_on_source_trajectory(monkeypatch):
+    dataset = _two_episode_dataset()
+    sampler = PathBridgerDataset(
+        dataset,
+        _sampler_config(actor_p=(0.0, 0.0, 0.0, 1.0)),
+    )
+
+    monkeypatch.setattr(
+        dataset,
+        "get_random_idxs",
+        lambda size: np.asarray([14, 0], dtype=np.int64),
+    )
+    monkeypatch.setattr(
+        np.random,
+        "geometric",
+        lambda p, size: np.asarray([3, 6], dtype=np.int64),
+    )
+    random_results = iter(
+        (
+            np.asarray([0.0, 0.999]),     # base offsets: 1 and 5
+            np.asarray([0.4]),            # long-pair split: offset 3
+        )
+    )
+    monkeypatch.setattr(np.random, "random", lambda size: next(random_results))
+
+    batch = sampler.sample(batch_size=2, idxs=np.asarray([1, 8]))
+
+    np.testing.assert_array_equal(_state_ids(batch["endpoint_goals"]), [14, 0])
+    np.testing.assert_array_equal(_state_ids(batch["endpoint_targets"]), [6, 13])
+    np.testing.assert_array_equal(
+        _state_ids(batch["trajectory"]),
+        [[1, 2, 3, 4, 5, 6], [8, 9, 10, 11, 12, 13]],
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    (
+        ("actor_p", (0.0, 1.0, 0.0), "4-tuple"),
+        ("actor_p", (0.0, -0.1, 1.1, 0.0), "non-negative"),
+        ("actor_p", (0.0, np.nan, 1.0, 0.0), "finite"),
+        ("actor_p", (0.0, 0.4, 0.0, 0.5), "sum to 1"),
+        (
+            "actor_p",
+            (0.0, 0.5, 0.5, 0.0),
+            "geometric and ordinary trajectory-future",
+        ),
+        (
+            "critic_p",
+            (0.1, 0.9, 0.0, 0.0),
+            "ordered future-goal component",
+        ),
+        (
+            "critic_p",
+            (0.0, 0.9, 0.0, 0.1),
+            "ordered future-goal component",
+        ),
+    ),
+)
+def test_goal_mix_validation(field, value, message):
+    with pytest.raises(ValueError, match=message):
+        PathBridgerDataset(
+            _two_episode_dataset(),
+            _sampler_config(**{field: value}),
+        )

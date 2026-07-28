@@ -170,6 +170,22 @@ endpoint value-weight scale and `lambda` is the value distance-weight exponent.
 | `pbg/puzzle_4x4.py` | puzzle-4x4-play-v0 | 40 | 0.995 | 10 | 2.0 | 32 | 0.5 |
 | `pbg/scene.py` | scene-play-v0 | 40 | 0.99 | 5 | 1.0 | 16 | 0.5 |
 
+## Goal-sampling mixes
+
+Goal probabilities use the paper's four-tuple order
+`(p_cur, p_geom, p_traj, p_rand)`. There is no separate geometric-sampling
+boolean.
+
+- `actor_p=(0, 0, 1, 0)` samples ordinary trajectory-future goals for endpoint
+  supervision. Here `actor` follows the paper's “endpoint/actor goal mix”
+  label; the distribution does not contain a neural actor.
+- `critic_p=(0, 1, 0, 0)` samples geometric future goals for the scalar
+  transitive value.
+
+`p_geom` and `p_traj` are mutually exclusive future-goal implementations.
+Because the final transitive value loss requires an ordered in-trajectory pair,
+`critic_p` must place all probability on either `p_geom` or `p_traj`.
+
 ## Fixed implementation choices
 
 The following are code constants rather than configuration options:

@@ -17,6 +17,9 @@ from typing import Any
 import numpy as np
 
 _ACTION_HORIZON = 5
+_CURRENT_GOAL = 0
+_FUTURE_GOAL = 1
+_RANDOM_GOAL = 2
 
 
 class Dataset(Mapping[str, np.ndarray]):
@@ -120,6 +123,8 @@ class PathBridgerDatasetConfig:
 
     horizon: int
     discount: float
+    actor_p: tuple[float, float, float, float]
+    critic_p: tuple[float, float, float, float]
 
 
 def _config_get(config: Any, key: str) -> Any:
@@ -136,13 +141,45 @@ def _config_get(config: Any, key: str) -> Any:
         raise ValueError(f"PathBridgerDataset config is missing {key!r}.") from exc
 
 
+def _validate_goal_mix(value: Any, *, name: str) -> tuple[float, float, float, float]:
+    """Validate a ``(p_cur, p_geom, p_traj, p_rand)`` goal-sampling mix."""
+
+    try:
+        probabilities = np.asarray(value, dtype=np.float64)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"{name} must be a numeric 4-tuple ordered as "
+            "(p_cur, p_geom, p_traj, p_rand)."
+        ) from exc
+    if probabilities.shape != (4,):
+        raise ValueError(
+            f"{name} must be a 4-tuple ordered as "
+            f"(p_cur, p_geom, p_traj, p_rand), got shape {probabilities.shape}."
+        )
+    if not np.all(np.isfinite(probabilities)):
+        raise ValueError(f"{name} probabilities must be finite, got {tuple(probabilities)}.")
+    if np.any(probabilities < 0.0):
+        raise ValueError(f"{name} probabilities must be non-negative, got {tuple(probabilities)}.")
+    total = float(np.sum(probabilities))
+    if not np.isclose(total, 1.0, rtol=0.0, atol=1e-6):
+        raise ValueError(f"{name} probabilities must sum to 1, got {total}.")
+    if probabilities[1] > 0.0 and probabilities[2] > 0.0:
+        raise ValueError(
+            f"{name} cannot enable geometric and ordinary trajectory-future "
+            "sampling at the same time."
+        )
+    probabilities = probabilities / total
+    return tuple(float(probability) for probability in probabilities)
+
+
 @dataclasses.dataclass
 class PathBridgerDataset:
     """Add PathBridger hindsight supervision to a compact offline dataset.
 
-    Only ``horizon`` and ``discount`` are read from ``config``.  Passing the
-    complete agent ConfigDict is therefore supported without coupling this
-    sampler to unrelated model hyperparameters.
+    ``actor_p`` controls endpoint/actor goals and ``critic_p`` controls scalar
+    value/critic goals.  Both use the paper's four-component order
+    ``(p_cur, p_geom, p_traj, p_rand)``; there is no separate geometric-sampling
+    boolean.
     """
 
     dataset: Dataset
@@ -151,12 +188,25 @@ class PathBridgerDataset:
     def __post_init__(self) -> None:
         self.horizon = int(_config_get(self.config, "horizon"))
         self.discount = float(_config_get(self.config, "discount"))
+        self.actor_p = _validate_goal_mix(
+            _config_get(self.config, "actor_p"),
+            name="actor_p",
+        )
+        self.critic_p = _validate_goal_mix(
+            _config_get(self.config, "critic_p"),
+            name="critic_p",
+        )
         if self.horizon < _ACTION_HORIZON:
             raise ValueError(
                 f"horizon must be at least {_ACTION_HORIZON}, got {self.horizon}."
             )
         if not 0.0 < self.discount < 1.0:
             raise ValueError(f"discount must lie in (0, 1), got {self.discount}.")
+        if self.critic_p[0] > 0.0 or self.critic_p[3] > 0.0:
+            raise ValueError(
+                "critic_p must place all probability on one ordered future-goal "
+                "component (p_geom or p_traj) for the transitive value objective."
+            )
 
         observations = np.asarray(self.dataset["observations"])
         if observations.ndim != 2:
@@ -223,13 +273,66 @@ class PathBridgerDataset:
             raise ValueError("Positive future sampling requires at least one remaining state.")
         return 1 + np.floor(np.random.random(len(max_offsets)) * max_offsets).astype(np.int64)
 
+    def _sample_goal_indices(
+        self,
+        idxs: np.ndarray,
+        finals: np.ndarray,
+        probabilities: tuple[float, float, float, float],
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Sample current, future, or random goals from one paper-format mix."""
+
+        p_cur, p_geom, p_traj, p_rand = probabilities
+        p_future = p_geom + p_traj
+        batch_size = len(idxs)
+
+        if p_cur == 1.0:
+            components = np.full(batch_size, _CURRENT_GOAL, dtype=np.int8)
+        elif p_future == 1.0:
+            components = np.full(batch_size, _FUTURE_GOAL, dtype=np.int8)
+        elif p_rand == 1.0:
+            components = np.full(batch_size, _RANDOM_GOAL, dtype=np.int8)
+        else:
+            draws = np.random.random(batch_size)
+            components = np.full(batch_size, _RANDOM_GOAL, dtype=np.int8)
+            components[draws < p_cur + p_future] = _FUTURE_GOAL
+            components[draws < p_cur] = _CURRENT_GOAL
+
+        goal_idxs = idxs.copy()
+        future_mask = components == _FUTURE_GOAL
+        if np.any(future_mask):
+            future_idxs = idxs[future_mask]
+            future_finals = finals[future_mask]
+            if p_geom > 0.0:
+                offsets = np.random.geometric(
+                    p=1.0 - self.discount,
+                    size=len(future_idxs),
+                ).astype(np.int64)
+                goal_idxs[future_mask] = np.minimum(
+                    future_idxs + offsets,
+                    future_finals,
+                )
+            else:
+                distances = np.random.random(len(future_idxs))
+                goal_idxs[future_mask] = np.round(
+                    (future_idxs + 1) * distances
+                    + future_finals * (1.0 - distances)
+                ).astype(np.int64)
+
+        random_mask = components == _RANDOM_GOAL
+        if np.any(random_mask):
+            goal_idxs[random_mask] = self.dataset.get_random_idxs(
+                int(np.sum(random_mask))
+            )
+        return goal_idxs, components
+
     def sample(self, batch_size: int, idxs: Any | None = None) -> dict[str, np.ndarray]:
         """Sample one PathBridger training batch.
 
-        Endpoint goals are uniform future states.  Value goals use geometric
-        future sampling with ``p=1-discount``.  Short base pairs use offsets
-        1--5, and transitive splits are active only for value pairs longer than
-        five transitions.
+        Endpoint and value goals follow ``actor_p`` and ``critic_p``.  The paper
+        defaults select ordinary trajectory-future endpoints and geometric
+        value goals, respectively.  Short base pairs use offsets 1--5, and
+        transitive splits are active only for value pairs longer than five
+        transitions.
         """
 
         batch_size = int(batch_size)
@@ -250,22 +353,27 @@ class PathBridgerDataset:
         finals = self._final_for_idx[idxs]
         remaining = finals - idxs
 
-        # Endpoint proposer supervision: sample a final hindsight goal uniformly
-        # from the strict future, then clip/pad the K-window at that goal.
-        distances = np.random.random(batch_size)
-        endpoint_goal_idxs = np.round(
-            (idxs + 1) * distances + finals * (1.0 - distances)
-        ).astype(np.int64)
+        # Endpoint proposer supervision follows actor_p.  A random conditioning
+        # goal keeps the actual K-step endpoint on the source trajectory.
+        endpoint_goal_idxs, endpoint_components = self._sample_goal_indices(
+            idxs,
+            finals,
+            self.actor_p,
+        )
         endpoint_target_idxs = np.minimum(idxs + self.horizon, endpoint_goal_idxs)
+        random_endpoint_rows = endpoint_components == _RANDOM_GOAL
+        endpoint_target_idxs[random_endpoint_rows] = (
+            idxs[random_endpoint_rows] + self.horizon
+        )
         trajectory_idxs = idxs[:, None] + self._path_offsets[None, :]
         trajectory_idxs = np.minimum(trajectory_idxs, endpoint_target_idxs[:, None])
 
-        # Value supervision follows the research sampler's geometric future
-        # relabeling.  Clipping at the terminal keeps the goal in the episode.
-        geometric_offsets = np.random.geometric(
-            p=1.0 - self.discount, size=batch_size
-        ).astype(np.int64)
-        value_goal_idxs = np.minimum(idxs + geometric_offsets, finals)
+        # The final transitive value objective requires ordered future pairs.
+        value_goal_idxs, _ = self._sample_goal_indices(
+            idxs,
+            finals,
+            self.critic_p,
+        )
         value_offsets = value_goal_idxs - idxs
 
         # The short anchor horizon H_b is fixed to five in the final method.

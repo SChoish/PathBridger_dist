@@ -964,6 +964,8 @@ def get_config() -> ml_collections.ConfigDict:
             endpoint_distribution='flow',
             horizon=25,
             discount=0.99,
+            actor_p=(0.0, 0.0, 1.0, 0.0),
+            critic_p=(0.0, 1.0, 0.0, 0.0),
             endpoint_value_scale=10.0,
             value_distance_weight_power=0.0,
             eval_num_candidates=8,
