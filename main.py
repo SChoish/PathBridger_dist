@@ -6,6 +6,7 @@ import json
 import os
 import random
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 
 import jax
@@ -45,6 +46,11 @@ flags.DEFINE_integer('save_interval', 100_000, 'Checkpoint interval; 0 saves onl
 flags.DEFINE_integer('eval_episodes', 50, 'Evaluation episodes for each of the five OGBench tasks.')
 flags.DEFINE_boolean('use_wandb', False, 'Enable optional Weights & Biases logging.')
 flags.DEFINE_boolean('use_tqdm', True, 'Show a training progress bar.')
+flags.DEFINE_boolean(
+    'async_prefetch',
+    True,
+    'Overlap host batch sampling with the accelerator update.',
+)
 
 config_flags.DEFINE_config_file(
     'agent',
@@ -150,12 +156,36 @@ def main(_):
     eval_logger = CsvLogger(os.path.join(run_dir, 'eval.csv'))
     start_time = time.time()
     interval_start = start_time
+    prefetch_pool = (
+        ThreadPoolExecutor(max_workers=1, thread_name_prefix='train-prefetch')
+        if FLAGS.async_prefetch
+        else None
+    )
+
+    def _submit_batch() -> Future:
+        return prefetch_pool.submit(dataset.sample, _BATCH_SIZE)
+
+    next_batch_future = _submit_batch() if prefetch_pool is not None else None
 
     try:
         for step in steps:
-            batch = dataset.sample(_BATCH_SIZE)
-            agent, update_info = agent.update(batch)
+            if next_batch_future is None:
+                batch = dataset.sample(_BATCH_SIZE)
+            else:
+                batch = next_batch_future.result()
+                next_batch_future = None
+
             is_final = step == FLAGS.train_steps
+            do_save = is_final or (
+                FLAGS.save_interval > 0
+                and step % FLAGS.save_interval == 0
+            )
+            # Do not sample past a checkpoint before its NumPy RNG state is
+            # serialized. This preserves exact batch-stream resume semantics.
+            if prefetch_pool is not None and not do_save:
+                next_batch_future = _submit_batch()
+
+            agent, update_info = agent.update(batch)
 
             if step % FLAGS.log_interval == 0 or is_final:
                 train_metrics = _host_metrics(update_info)
@@ -182,10 +212,13 @@ def main(_):
                 if wandb_run is not None:
                     wandb_run.log(eval_metrics, step=step)
 
-            do_save = is_final or (FLAGS.save_interval > 0 and step % FLAGS.save_interval == 0)
             if do_save:
                 save_agent(agent, checkpoint_dir, step)
+                if prefetch_pool is not None and not is_final:
+                    next_batch_future = _submit_batch()
     finally:
+        if prefetch_pool is not None:
+            prefetch_pool.shutdown(wait=True)
         train_logger.close()
         eval_logger.close()
         if wandb_run is not None:

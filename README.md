@@ -96,6 +96,10 @@ Training uses one million gradient steps, a batch size of 1024, and saves every
 100k steps by default. The checkpoints used by the paper protocol—800k, 900k,
 and 1M—are therefore always available.
 
+Host batch sampling is prefetched on one worker by default and can be disabled
+with `--noasync_prefetch`. Checkpoint boundaries preserve the exact sampler RNG
+state used for deterministic resume.
+
 An explicit directory containing compact OGBench train/validation shards can be
 passed with `--dataset_dir`. Run `python main.py --helpfull` for runtime and
 logging flags.
@@ -206,5 +210,5 @@ applied to both base and transitive value losses.
 
 For compatibility with the experiments that produced the reported results,
 training keeps the research sampler's close-goal behavior: when a sampled final
-goal occurs before \(t+K\), the endpoint is clipped to that goal and the
-remaining trajectory window is padded with the goal state.
+goal occurs before \(t+K\), the endpoint is clipped to that goal and the five
+supervised bridge-prefix targets are padded with the goal state.

@@ -246,7 +246,11 @@ class PathBridgerDataset:
                 f"No episode contains a full horizon-{self.horizon} state window."
             )
         self.valid_starts = np.concatenate(valid_parts)
-        self._path_offsets = np.arange(self.horizon + 1, dtype=np.int64)
+        self._bridge_offsets = np.arange(
+            1,
+            _ACTION_HORIZON + 1,
+            dtype=np.int64,
+        )
 
     def _validate_starts(self, idxs: Any) -> np.ndarray:
         idxs = np.asarray(idxs, dtype=np.int64)
@@ -365,8 +369,11 @@ class PathBridgerDataset:
         endpoint_target_idxs[random_endpoint_rows] = (
             idxs[random_endpoint_rows] + self.horizon
         )
-        trajectory_idxs = idxs[:, None] + self._path_offsets[None, :]
-        trajectory_idxs = np.minimum(trajectory_idxs, endpoint_target_idxs[:, None])
+        bridge_target_idxs = idxs[:, None] + self._bridge_offsets[None, :]
+        bridge_target_idxs = np.minimum(
+            bridge_target_idxs,
+            endpoint_target_idxs[:, None],
+        )
 
         # The final transitive value objective requires ordered future pairs.
         value_goal_idxs, _ = self._sample_goal_indices(
@@ -397,7 +404,10 @@ class PathBridgerDataset:
             "observations": np.asarray(observations[idxs], dtype=np.float32),
             "next_observations": np.asarray(observations[idxs + 1], dtype=np.float32),
             "actions": np.asarray(self.dataset["actions"][idxs], dtype=np.float32),
-            "trajectory": np.asarray(observations[trajectory_idxs], dtype=np.float32),
+            "bridge_targets": np.asarray(
+                observations[bridge_target_idxs],
+                dtype=np.float32,
+            ),
             "endpoint_goals": np.asarray(observations[endpoint_goal_idxs], dtype=np.float32),
             "endpoint_targets": np.asarray(observations[endpoint_target_idxs], dtype=np.float32),
             "value_goals": np.asarray(observations[value_goal_idxs], dtype=np.float32),
