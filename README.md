@@ -6,7 +6,7 @@ offline goal-conditioned reinforcement learning on OGBench.
 PathBridger learns exactly four components:
 
 1. a bounded transitive state-goal value and its EMA target,
-2. a value-weighted \(K\)-step endpoint proposer,
+2. a value-weighted $K$-step endpoint proposer,
 3. an endpoint-pinned residual state-space bridge, and
 4. an inverse-dynamics model (IDM) that decodes the first five bridge
    transitions into actions.
@@ -140,30 +140,32 @@ python evaluate.py \
 For an exact `params_<step>.pkl` path, the step is inferred from the filename;
 for a checkpoint directory, pass `--checkpoint_step`.
 
-The configuration supplies the paper's endpoint candidate count \(N\) and
-sampling temperature \(T\).
+The configuration supplies the paper's endpoint candidate count $N$ and
+sampling temperature $T$.
 
 ## Paper configurations
 
-The following values are transcribed from the paper bundle. `Gap` is the
-endpoint value-weight scale and `lambda` is the value distance-weight exponent.
+The following values are transcribed from the paper table
+`tab:pathbridger_env_complete`. $c_{\mathrm{sg}}$ is the endpoint
+value-weight scale and $\lambda$ is the value distance-weight exponent.
+$N$ and $T$ are the Best-of-$N$ candidate count and sampling temperature.
 
 ### PBF
 
-| Config | Environment | K | gamma | Gap | lambda | N | T |
+| Config | Environment | $K$ | $\gamma$ | $c_{\mathrm{sg}}$ | $\lambda$ | $N$ | $T$ |
 |---|---|---:|---:|---:|---:|---:|---:|
-| `pbf/antmaze_medium.py` | antmaze-medium-navigate-v0 | 25 | 0.99 | 10 | 0.0 | 8 | 0.25 |
-| `pbf/antmaze_large.py` | antmaze-large-navigate-v0 | 25 | 0.995 | 10 | 0.0 | 32 | 0.5 |
+| `pbf/antmaze_medium.py` | antmaze-medium-navigate-v0 | 25 | 0.99 | 10 | 0.0 | 2 | 0.25 |
+| `pbf/antmaze_large.py` | antmaze-large-navigate-v0 | 25 | 0.995 | 10 | 0.0 | 16 | 0.5 |
 | `pbf/cube_single.py` | cube-single-play-v0 | 40 | 0.99 | 5 | 0.7 | 1 | 0 |
-| `pbf/cube_double.py` | cube-double-play-v0 | 40 | 0.99 | 10 | 1.0 | 8 | 0.25 |
+| `pbf/cube_double.py` | cube-double-play-v0 | 40 | 0.99 | 10 | 1.0 | 2 | 0.25 |
 | `pbf/cube_triple.py` | cube-triple-play-v0 | 40 | 0.995 | 10 | 1.0 | 1 | 0 |
 | `pbf/puzzle_3x3.py` | puzzle-3x3-play-v0 | 25 | 0.99 | 10 | 0.5 | 32 | 1.0 |
-| `pbf/puzzle_4x4.py` | puzzle-4x4-play-v0 | 25 | 0.99 | 10 | 2.0 | 16 | 1.0 |
-| `pbf/scene.py` | scene-play-v0 | 25 | 0.99 | 5 | 1.0 | 8 | 0.5 |
+| `pbf/puzzle_4x4.py` | puzzle-4x4-play-v0 | 25 | 0.99 | 10 | 2.0 | 32 | 1.0 |
+| `pbf/scene.py` | scene-play-v0 | 25 | 0.99 | 5 | 1.0 | 16 | 0.5 |
 
 ### PBG
 
-| Config | Environment | K | gamma | Gap | lambda | N | T |
+| Config | Environment | $K$ | $\gamma$ | $c_{\mathrm{sg}}$ | $\lambda$ | $N$ | $T$ |
 |---|---|---:|---:|---:|---:|---:|---:|
 | `pbg/antmaze_medium.py` | antmaze-medium-navigate-v0 | 25 | 0.99 | 10 | 0.0 | 1 | 0 |
 | `pbg/antmaze_large.py` | antmaze-large-navigate-v0 | 25 | 0.995 | 10 | 0.0 | 1 | 0 |
@@ -171,7 +173,7 @@ endpoint value-weight scale and `lambda` is the value distance-weight exponent.
 | `pbg/cube_double.py` | cube-double-play-v0 | 25 | 0.99 | 10 | 1.0 | 1 | 0 |
 | `pbg/cube_triple.py` | cube-triple-play-v0 | 25 | 0.995 | 10 | 1.0 | 1 | 0 |
 | `pbg/puzzle_3x3.py` | puzzle-3x3-play-v0 | 40 | 0.99 | 10 | 0.5 | 2 | 0.25 |
-| `pbg/puzzle_4x4.py` | puzzle-4x4-play-v0 | 40 | 0.995 | 10 | 2.0 | 32 | 0.5 |
+| `pbg/puzzle_4x4.py` | puzzle-4x4-play-v0 | 40 | 0.995 | 10 | 2.0 | 16 | 0.5 |
 | `pbg/scene.py` | scene-play-v0 | 40 | 0.99 | 5 | 1.0 | 16 | 0.5 |
 
 ## Goal-sampling mixes
@@ -195,20 +197,25 @@ Because the final transitive value loss requires an ordered in-trajectory pair,
 The following are code constants rather than configuration options:
 
 - three 512-unit GELU layers with layer normalization,
-- Adam with learning rate \(3\times10^{-4}\),
+- Adam with learning rate $3\times10^{-4}$,
 - value expectile 0.7 and EMA rate 0.005,
 - base and action horizons of 5,
 - endpoint-weight cap 5,
 - eight Euler steps for PBF,
-- bridge interpolation \(\alpha_i=(i/K)^{0.8}\),
-- endpoint mask \(m_i=i(K-i)/K^2\),
-- product endpoint score \(V(s,z)V(z,g)\), and
 - unit coefficients for the value, endpoint, bridge, and IDM losses.
+
+Bridge interpolation, endpoint mask, and product endpoint score:
+
+$$
+\alpha_i=(i/K)^{0.8},\qquad
+m_i=\frac{i(K-i)}{K^2},\qquad
+V(s,z)\,V(z,g).
+$$
 
 Distance weighting uses the target value without an undocumented clip and is
 applied to both base and transitive value losses.
 
 For compatibility with the experiments that produced the reported results,
 training keeps the research sampler's close-goal behavior: when a sampled final
-goal occurs before \(t+K\), the endpoint is clipped to that goal and the five
+goal occurs before $t+K$, the endpoint is clipped to that goal and the five
 supervised bridge-prefix targets are padded with the goal state.
