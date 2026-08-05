@@ -121,3 +121,27 @@ def test_agent_create_update_and_sample_action_chunks(monkeypatch):
     chunks = np.asarray(jax.device_get(chunks))
     assert chunks.shape == (1, 5, actions.shape[-1])
     assert np.isfinite(chunks).all()
+
+
+def test_training_prefix_matches_full_bridge(monkeypatch):
+    """The optimized five-index path must preserve full-bridge semantics."""
+
+    agent, observations, _ = _small_agent(monkeypatch)
+    endpoints = observations + 0.05
+    full = agent._construct_bridge(observations, endpoints)
+    prefix = agent._construct_bridge_at_indices(
+        observations,
+        endpoints,
+        jnp.arange(1, 6),
+    )
+
+    np.testing.assert_allclose(
+        np.asarray(jax.device_get(prefix)),
+        np.asarray(jax.device_get(full[:, 1:6])),
+        rtol=1e-6,
+        atol=1e-6,
+    )
+    np.testing.assert_array_equal(
+        np.asarray(jax.device_get(prefix[:, -1])),
+        np.asarray(jax.device_get(endpoints)),
+    )

@@ -288,9 +288,18 @@ class PathBridgerAgent(flax.struct.PyTreeNode):
         goals = batch['value_goals']
         actions = batch['action_chunk_actions']
 
-        base_logits = self.network.select('action_critic')(
-            observations, batch['trl_base_goals'], actions,
+        # Both online-Q objectives use the same network and action chunks. A
+        # single larger GEMM is substantially more efficient on accelerators
+        # than launching the 512-wide MLP twice at batch size B.
+        batch_size = observations.shape[0]
+        online_logits = self.network.select('action_critic')(
+            jnp.concatenate([observations, observations], axis=0),
+            jnp.concatenate([batch['trl_base_goals'], goals], axis=0),
+            jnp.concatenate([actions, actions], axis=0),
             params=grad_params,
+        )
+        base_logits, triangle_logits = jnp.split(
+            online_logits, [batch_size], axis=1,
         )
         base_target = jnp.clip(
             jnp.power(discount, jnp.asarray(batch['trl_base_offsets'], dtype=jnp.float32)),
@@ -303,20 +312,30 @@ class PathBridgerAgent(flax.struct.PyTreeNode):
         )
         base_loss = self._weighted_mean(base_loss_per, valid_mask)
 
-        triangle_logits = self.network.select('action_critic')(
-            observations, goals, actions,
-            params=grad_params,
+        # Likewise, all three target-Q evaluations share parameters. Batch
+        # them to avoid three small, sequential MLP launches.
+        target_logits = self.network.select('target_action_critic')(
+            jnp.concatenate([
+                observations,
+                batch['trl_split_observations'],
+                observations,
+            ], axis=0),
+            jnp.concatenate([
+                batch['trl_split_goals'],
+                goals,
+                goals,
+            ], axis=0),
+            jnp.concatenate([
+                actions,
+                batch['trl_split_action_chunk_actions'],
+                actions,
+            ], axis=0),
         )
-        left_logits = self.network.select('target_action_critic')(
-            observations, batch['trl_split_goals'], actions,
+        left_logits, right_logits, target_q_logits = jnp.split(
+            target_logits, [batch_size, 2 * batch_size], axis=1,
         )
         left_q = jnp.clip(
             self._aggregate_q(jax.nn.sigmoid(left_logits)), eps, 1.0,
-        )
-        right_logits = self.network.select('target_action_critic')(
-            batch['trl_split_observations'],
-            goals,
-            batch['trl_split_action_chunk_actions'],
         )
         right_q = jnp.clip(
             self._aggregate_q(jax.nn.sigmoid(right_logits)), eps, 1.0,
@@ -351,9 +370,6 @@ class PathBridgerAgent(flax.struct.PyTreeNode):
 
         value_logits = self.network.select('value')(
             observations, goals, params=grad_params,
-        )
-        target_q_logits = self.network.select('target_action_critic')(
-            observations, goals, actions,
         )
         value_target = jax.lax.stop_gradient(jnp.clip(
             self._aggregate_q(jax.nn.sigmoid(target_q_logits)), eps, 1.0,
@@ -402,11 +418,15 @@ class PathBridgerAgent(flax.struct.PyTreeNode):
         goals: jnp.ndarray,
         endpoint_targets: jnp.ndarray,
     ) -> tuple[jnp.ndarray, jnp.ndarray]:
-        current_values = jax.nn.sigmoid(
-            self.network.select('target_value')(observations, goals)
+        batch_size = observations.shape[0]
+        target_values = jax.nn.sigmoid(
+            self.network.select('target_value')(
+                jnp.concatenate([observations, endpoint_targets], axis=0),
+                jnp.concatenate([goals, goals], axis=0),
+            )
         )
-        endpoint_values = jax.nn.sigmoid(
-            self.network.select('target_value')(endpoint_targets, goals)
+        current_values, endpoint_values = jnp.split(
+            target_values, [batch_size], axis=0,
         )
         value_gap = endpoint_values - current_values
         weights = jnp.minimum(
@@ -504,19 +524,22 @@ class PathBridgerAgent(flax.struct.PyTreeNode):
             })
         return loss, info
 
-    def _construct_bridge(
+    def _construct_bridge_at_indices(
         self,
         observations: jnp.ndarray,
         endpoints: jnp.ndarray,
+        indices: jnp.ndarray,
         *,
         params: Any | None = None,
     ) -> jnp.ndarray:
+        """Construct only the requested bridge indices."""
+
         horizon = int(self.config['horizon'])
-        indices = jnp.arange(horizon + 1, dtype=jnp.float32)
+        indices = jnp.asarray(indices, dtype=jnp.float32)
         times = indices / jnp.asarray(horizon, dtype=jnp.float32)
         times = jnp.broadcast_to(
             times[None, :],
-            (observations.shape[0], horizon + 1),
+            (observations.shape[0], indices.shape[0]),
         )
         alphas = jnp.power(times, _BRIDGE_ALPHA_POWER)
         masks = (
@@ -535,10 +558,31 @@ class PathBridgerAgent(flax.struct.PyTreeNode):
             + masks[None, :, None] * residuals
         )
         bridge = observations[:, None, :] + displacements
-        # Preserve both pins exactly, including under finite-precision arithmetic.
-        bridge = bridge.at[:, 0, :].set(observations)
-        bridge = bridge.at[:, -1, :].set(endpoints)
+        # Preserve requested endpoint pins exactly, including under
+        # finite-precision arithmetic.
+        bridge = jnp.where(
+            (indices == 0)[None, :, None], observations[:, None, :], bridge,
+        )
+        bridge = jnp.where(
+            (indices == horizon)[None, :, None], endpoints[:, None, :], bridge,
+        )
         return bridge
+
+    def _construct_bridge(
+        self,
+        observations: jnp.ndarray,
+        endpoints: jnp.ndarray,
+        *,
+        params: Any | None = None,
+    ) -> jnp.ndarray:
+        """Construct the full bridge for inference and public callers."""
+
+        return self._construct_bridge_at_indices(
+            observations,
+            endpoints,
+            jnp.arange(int(self.config['horizon']) + 1),
+            params=params,
+        )
 
     @jax.jit
     def construct_bridge(
@@ -564,14 +608,14 @@ class PathBridgerAgent(flax.struct.PyTreeNode):
         """Mean L1 reconstruction for exactly bridge indices 1 through 5."""
 
         trajectory = batch['trajectory']
-        predicted = self._construct_bridge(
+        prefix = self._construct_bridge_at_indices(
             batch['observations'],
             trajectory[:, -1, :],
+            jnp.arange(1, _ACTION_HORIZON + 1),
             params=grad_params,
         )
         prefix_errors = jnp.sum(
-            jnp.abs(predicted[:, 1 : _ACTION_HORIZON + 1, :]
-                    - trajectory[:, 1 : _ACTION_HORIZON + 1, :]),
+            jnp.abs(prefix - trajectory[:, 1 : _ACTION_HORIZON + 1, :]),
             axis=-1,
         )
         loss = prefix_errors.mean()
@@ -580,9 +624,9 @@ class PathBridgerAgent(flax.struct.PyTreeNode):
         }
         if full_metrics:
             info['bridge/prefix_l1'] = loss
-            info['bridge/endpoint_error'] = jnp.mean(
-                jnp.abs(predicted[:, -1, :] - trajectory[:, -1, :])
-            )
+            # The endpoint is pinned by construction, so this invariant is
+            # exactly zero and does not require constructing the full bridge.
+            info['bridge/endpoint_error'] = jnp.zeros((), dtype=loss.dtype)
         return loss, info
 
     def idm_loss(
