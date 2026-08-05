@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+from concurrent.futures import Future, ThreadPoolExecutor
 import json
 import os
 import random
+import signal
 import time
-from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 
 import jax
@@ -18,13 +19,12 @@ from ml_collections import config_flags
 from agents import PathBridgerAgent
 from envs.env_utils import make_env_and_datasets
 from utils.datasets import PathBridgerDataset
-from utils.evaluation import DEFAULT_TASK_IDS, evaluate
 from utils.flax_utils import resolve_checkpoint, restore_agent, save_agent
 from utils.log_utils import CsvLogger, get_exp_name, get_flag_dict, setup_wandb
 
 FLAGS = flags.FLAGS
 
-_BATCH_SIZE = 1024
+_DEFAULT_BATCH_SIZE = 256
 _DEFAULT_CONFIG = str(
     Path(__file__).resolve().parent / 'configs' / 'pbf' / 'antmaze_medium.py'
 )
@@ -39,18 +39,23 @@ flags.DEFINE_integer(
     0,
     'Checkpoint step; required for a directory and inferred from an exact params_<step>.pkl file.',
 )
+flags.DEFINE_string(
+    'run_dir',
+    '',
+    'Optional existing experiment directory; when set, continue logging/checkpoints there.',
+)
 flags.DEFINE_integer('train_steps', 1_000_000, 'Number of gradient updates.')
 flags.DEFINE_integer('log_interval', 5_000, 'Training CSV/W&B logging interval.')
-flags.DEFINE_integer('eval_interval', 100_000, 'Environment evaluation interval; 0 disables intermediate eval.')
+flags.DEFINE_integer(
+    'eval_interval', 0, 'Must remain 0; use evaluate.py in a separate process.'
+)
 flags.DEFINE_integer('save_interval', 100_000, 'Checkpoint interval; 0 saves only the final checkpoint.')
-flags.DEFINE_integer('eval_episodes', 50, 'Evaluation episodes for each of the five OGBench tasks.')
+flags.DEFINE_integer(
+    'eval_episodes', 50, 'Kept for CLI compatibility; evaluation runs via evaluate.py.'
+)
 flags.DEFINE_boolean('use_wandb', False, 'Enable optional Weights & Biases logging.')
 flags.DEFINE_boolean('use_tqdm', True, 'Show a training progress bar.')
-flags.DEFINE_boolean(
-    'async_prefetch',
-    True,
-    'Overlap host batch sampling with the accelerator update.',
-)
+flags.DEFINE_boolean('async_prefetch', True, 'Overlap host batch sampling with accelerator work.')
 
 config_flags.DEFINE_config_file(
     'agent',
@@ -89,8 +94,13 @@ def _validate_runtime_flags() -> None:
         raise ValueError('restore_step requires restore_path.')
     if FLAGS.log_interval < 1:
         raise ValueError('log_interval must be at least 1.')
-    if FLAGS.eval_interval < 0 or FLAGS.save_interval < 0:
-        raise ValueError('eval_interval and save_interval cannot be negative.')
+    if FLAGS.eval_interval != 0:
+        raise ValueError(
+            'In-process evaluation is disabled; set eval_interval=0 and run '
+            'evaluate.py against saved checkpoints in a separate process.'
+        )
+    if FLAGS.save_interval < 0:
+        raise ValueError('save_interval cannot be negative.')
     if FLAGS.eval_episodes < 1:
         raise ValueError('eval_episodes must be at least 1.')
 
@@ -110,7 +120,7 @@ def main(_):
     random.seed(FLAGS.seed)
     np.random.seed(FLAGS.seed)
 
-    env, train_data, _ = make_env_and_datasets(
+    _, train_data, _ = make_env_and_datasets(
         str(config.env_name),
         dataset_dir=FLAGS.dataset_dir or None,
     )
@@ -125,14 +135,18 @@ def main(_):
     if FLAGS.restore_path:
         agent = restore_agent(agent, FLAGS.restore_path, FLAGS.restore_step)
 
-    exp_name = get_exp_name(
-        FLAGS.seed,
-        env_name=str(config.env_name),
-        agent_name=f'pathbridger_{config.endpoint_distribution}',
-    )
-    run_dir = os.path.abspath(
-        os.path.join(FLAGS.save_dir, 'pathbridger', FLAGS.run_group, exp_name)
-    )
+    if FLAGS.run_dir:
+        run_dir = os.path.abspath(FLAGS.run_dir)
+        exp_name = os.path.basename(run_dir)
+    else:
+        exp_name = get_exp_name(
+            FLAGS.seed,
+            env_name=str(config.env_name),
+            agent_name=f'pathbridger_triangleq_{config.endpoint_distribution}',
+        )
+        run_dir = os.path.abspath(
+            os.path.join(FLAGS.save_dir, 'pathbridger_triangleq', FLAGS.run_group, exp_name)
+        )
     checkpoint_dir = os.path.join(run_dir, 'checkpoints')
     os.makedirs(checkpoint_dir, exist_ok=True)
     _write_run_config(run_dir, config)
@@ -140,7 +154,7 @@ def main(_):
     wandb_run = None
     if FLAGS.use_wandb:
         wandb_run = setup_wandb(
-            project='PathBridger',
+            project='PathBridger-TriangleQ',
             group=FLAGS.run_group,
             name=exp_name,
             config={'flags': get_flag_dict(), 'agent': config.to_dict()},
@@ -152,42 +166,70 @@ def main(_):
     if FLAGS.use_tqdm:
         steps = tqdm.tqdm(steps, smoothing=0.1, dynamic_ncols=True)
 
-    train_logger = CsvLogger(os.path.join(run_dir, 'train.csv'))
-    eval_logger = CsvLogger(os.path.join(run_dir, 'eval.csv'))
-    start_time = time.time()
-    interval_start = start_time
-    prefetch_pool = (
-        ThreadPoolExecutor(max_workers=1, thread_name_prefix='train-prefetch')
+    train_logger = CsvLogger(
+        os.path.join(run_dir, 'train.csv'),
+        resume=bool(FLAGS.run_dir or FLAGS.restore_path),
+    )
+    batch_size = int(config.get('batch_size', _DEFAULT_BATCH_SIZE))
+    pool = (
+        ThreadPoolExecutor(max_workers=1, thread_name_prefix='pathbridger-prefetch')
         if FLAGS.async_prefetch
         else None
     )
 
-    def _submit_batch() -> Future:
-        return prefetch_pool.submit(dataset.sample, _BATCH_SIZE)
+    def submit_batch() -> Future:
+        return pool.submit(dataset.sample, batch_size)
 
-    next_batch_future = _submit_batch() if prefetch_pool is not None else None
+    next_batch = submit_batch() if pool is not None else None
+    start_time = time.time()
+    interval_start = start_time
+
+    # Soft-stop: finish current step, save checkpoint, then exit cleanly.
+    # SIGKILL / power-loss cannot be caught — rely on periodic save_interval.
+    stop_requested = {'flag': False, 'signum': None}
+
+    def _request_stop(signum, _frame):
+        if stop_requested['flag']:
+            return
+        stop_requested['flag'] = True
+        stop_requested['signum'] = int(signum)
+        print(
+            f'[signal] signum={signum} — will emergency-save after current step '
+            f'(checkpoint_dir={checkpoint_dir})',
+            flush=True,
+        )
+
+    signal.signal(signal.SIGTERM, _request_stop)
+    signal.signal(signal.SIGINT, _request_stop)
+    try:
+        signal.signal(signal.SIGHUP, _request_stop)
+    except (ValueError, OSError):
+        pass
 
     try:
         for step in steps:
-            if next_batch_future is None:
-                batch = dataset.sample(_BATCH_SIZE)
+            if next_batch is None:
+                batch = dataset.sample(batch_size)
             else:
-                batch = next_batch_future.result()
-                next_batch_future = None
+                batch = next_batch.result()
+                next_batch = None
 
             is_final = step == FLAGS.train_steps
-            do_save = is_final or (
-                FLAGS.save_interval > 0
-                and step % FLAGS.save_interval == 0
+            emergency_stop = bool(stop_requested['flag'])
+            do_log = step % FLAGS.log_interval == 0 or is_final or emergency_stop
+            do_save = (
+                is_final
+                or emergency_stop
+                or (FLAGS.save_interval > 0 and step % FLAGS.save_interval == 0)
             )
-            # Do not sample past a checkpoint before its NumPy RNG state is
-            # serialized. This preserves exact batch-stream resume semantics.
-            if prefetch_pool is not None and not do_save:
-                next_batch_future = _submit_batch()
+            if pool is not None and not do_save:
+                next_batch = submit_batch()
 
-            agent, update_info = agent.update(batch)
+            agent, update_info = agent.update(batch, full_metrics=do_log)
 
-            if step % FLAGS.log_interval == 0 or is_final:
+            emergency_stop = bool(stop_requested['flag'])
+            do_log = do_log or emergency_stop
+            if do_log:
                 train_metrics = _host_metrics(update_info)
                 train_metrics['time/interval_seconds'] = time.time() - interval_start
                 train_metrics['time/total_seconds'] = time.time() - start_time
@@ -196,31 +238,34 @@ def main(_):
                 if wandb_run is not None:
                     wandb_run.log({f'training/{key}': value for key, value in train_metrics.items()}, step=step)
 
-            do_eval = is_final or (FLAGS.eval_interval > 0 and step % FLAGS.eval_interval == 0)
-            if do_eval:
-                eval_info = evaluate(
-                    agent,
-                    env,
-                    task_ids=DEFAULT_TASK_IDS,
-                    episodes_per_task=FLAGS.eval_episodes,
-                    num_candidates=int(config.eval_num_candidates),
-                    temperature=float(config.eval_temperature),
-                    seed=FLAGS.seed,
-                )
-                eval_metrics = {f'evaluation/{key}': value for key, value in eval_info.items()}
-                eval_logger.log(eval_metrics, step=step)
-                if wandb_run is not None:
-                    wandb_run.log(eval_metrics, step=step)
-
+            do_save = (
+                is_final
+                or emergency_stop
+                or (FLAGS.save_interval > 0 and step % FLAGS.save_interval == 0)
+            )
             if do_save:
                 save_agent(agent, checkpoint_dir, step)
-                if prefetch_pool is not None and not is_final:
-                    next_batch_future = _submit_batch()
+                if pool is not None and not is_final and not emergency_stop:
+                    next_batch = submit_batch()
+                if emergency_stop:
+                    marker = os.path.join(run_dir, f'EMERGENCY_SAVE_step{step}')
+                    try:
+                        with open(marker, 'w', encoding='utf-8') as file:
+                            file.write(
+                                f'signal={stop_requested["signum"]} step={step}\n'
+                            )
+                    except OSError:
+                        pass
+                    print(
+                        f'[signal] emergency_save_done step={step} '
+                        f'signum={stop_requested["signum"]} checkpoint_dir={checkpoint_dir}',
+                        flush=True,
+                    )
+                    break
     finally:
-        if prefetch_pool is not None:
-            prefetch_pool.shutdown(wait=True)
+        if pool is not None:
+            pool.shutdown(wait=True)
         train_logger.close()
-        eval_logger.close()
         if wandb_run is not None:
             wandb_run.finish()
 

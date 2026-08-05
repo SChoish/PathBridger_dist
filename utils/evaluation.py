@@ -12,6 +12,16 @@ DEFAULT_TASK_IDS = (1, 2, 3, 4, 5)
 ACTION_CHUNK_HORIZON = 5
 
 
+def _action_chunk_horizon(agent: Any) -> int:
+    config = getattr(agent, 'config', None)
+    if isinstance(config, Mapping) and 'action_chunk_horizon' in config:
+        horizon = int(config['action_chunk_horizon'])
+        if horizon < 1:
+            raise ValueError(f'action_chunk_horizon must be >= 1, got {horizon}.')
+        return horizon
+    return ACTION_CHUNK_HORIZON
+
+
 def _max_episode_steps(env: Any) -> int:
     spec = getattr(env, 'spec', None)
     max_steps = getattr(spec, 'max_episode_steps', None)
@@ -41,6 +51,7 @@ def _sample_action_chunk(
     temperature: float,
     seed,
 ) -> np.ndarray:
+    chunk_horizon = _action_chunk_horizon(agent)
     action_chunks = agent.sample_action_chunks(
         observations=observation.reshape(1, -1),
         goals=goal.reshape(1, -1),
@@ -51,13 +62,14 @@ def _sample_action_chunk(
     action_chunks = np.asarray(jax.device_get(action_chunks), dtype=np.float32)
     if action_chunks.ndim != 3 or action_chunks.shape[0] != 1:
         raise ValueError(
-            'agent.sample_action_chunks must return shape [1, 5, action_dim], '
-            f'got {action_chunks.shape}.'
+            'agent.sample_action_chunks must return shape '
+            f'[1, {chunk_horizon}, action_dim], got {action_chunks.shape}.'
         )
     action_chunk = np.squeeze(action_chunks, axis=0)
-    if action_chunk.shape[0] != ACTION_CHUNK_HORIZON:
+    if action_chunk.shape[0] != chunk_horizon:
         raise ValueError(
-            f'PathBridger executes {ACTION_CHUNK_HORIZON}-step action chunks, got shape {action_chunk.shape}.'
+            f'Expected {chunk_horizon}-step action chunks '
+            f'(action_chunk_horizon), got shape {action_chunk.shape}.'
         )
     return action_chunk
 
@@ -117,11 +129,11 @@ def evaluate(
     temperature: float = 1.0,
     seed: int = 0,
 ) -> dict[str, float | int]:
-    """Evaluate PathBridger on OGBench tasks using five-step IDM chunks.
+    """Evaluate PathBridger-TriangleQ using PBF/bridge/IDM action chunks.
 
-    Each replanning call receives batched state and goal arrays and a fresh JAX
-    random key. An episode succeeds when the environment reports
-    ``info['success']`` on any step.
+    Chunk length follows ``agent.config['action_chunk_horizon']``. Each
+    replanning call receives batched state and goal arrays and a fresh JAX
+    random key. Success is the any-step aggregation of ``info['success']``.
     """
     task_ids = tuple(int(task_id) for task_id in task_ids)
     if not task_ids:

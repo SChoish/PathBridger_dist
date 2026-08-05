@@ -1,2 +1,1 @@
-"""PathBridger-Flow (PBF) paper configurations."""
-
+"""PBF endpoint configurations paired with Triangle-Q."""

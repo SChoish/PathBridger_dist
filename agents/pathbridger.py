@@ -1,12 +1,10 @@
-"""PathBridger's complete bridge policy in one agent.
+"""PBF PathBridger with PathFlower's triangular chunk-Q critic.
 
-The released agent deliberately contains no actor or action-conditioned
-critic.  It learns exactly four policy-side components:
-
-* a scalar transitive value with an EMA target,
-* a Gaussian or rectified-flow endpoint proposer,
-* an endpoint-pinned residual bridge, and
-* an inverse-dynamics model (IDM).
+The endpoint flow, endpoint-pinned state bridge, and inverse dynamics model
+are retained. The critic uses base chunk-Q regression, a triangular chunk-Q
+decomposition through an offline split state, and an expectile value backup.
+At inference, endpoint candidates are decoded into five-step IDM chunks and
+ranked directly by triangular Q.
 """
 
 from __future__ import annotations
@@ -32,40 +30,47 @@ from utils.networks import MLP
 
 # These are algorithm constants, not experiment options.
 _HIDDEN_DIMS = (512, 512, 512)
+_CRITIC_HIDDEN_DIMS = (512, 512, 512)
 _LAYER_NORM = True
 _LEARNING_RATE = 3e-4
 _ACTION_HORIZON = 5
-_BASE_HORIZON = 5
-_TAU_V = 0.7
-_TARGET_TAU = 0.005
 _ENDPOINT_WEIGHT_CAP = 5.0
 _FLOW_STEPS = 8
 _BRIDGE_ALPHA_POWER = 0.8
 _GAUSSIAN_LOG_STD_MIN = -5.0
 _GAUSSIAN_LOG_STD_MAX = 1.0
-_VALUE_EPS = 1e-6
+_Q_VALUE_EPS = 1e-6
 
 _REQUIRED_BATCH_KEYS = (
     'observations',
     'next_observations',
     'actions',
-    'bridge_targets',
+    'trajectory',
     'endpoint_goals',
     'endpoint_targets',
     'value_goals',
     'value_offsets',
-    'base_goals',
-    'base_offsets',
-    'transitive_subgoals',
-    'transitive_offsets',
-    'transitive_valids',
+    'action_chunk_actions',
+    'trl_base_goals',
+    'trl_base_offsets',
+    'trl_split_observations',
+    'trl_split_goals',
+    'trl_split_action_chunk_actions',
+    'trl_split_offsets',
+    'trl_valid_mask',
 )
 
 
-class ScalarTransitiveValue(nn.Module):
-    """A bounded state-goal value, returned as a logit."""
+def _bce_expectile_loss(logits, targets, tau):
+    probabilities = jax.nn.sigmoid(logits)
+    weights = jnp.where(targets >= probabilities, float(tau), 1.0 - float(tau))
+    return weights * optax.sigmoid_binary_cross_entropy(logits, targets)
 
-    hidden_dims: Sequence[int] = _HIDDEN_DIMS
+
+class ScalarValueNet(nn.Module):
+    """Implicit state-goal value used by endpoint weighting and Triangle-Q."""
+
+    hidden_dims: Sequence[int] = _CRITIC_HIDDEN_DIMS
 
     @nn.compact
     def __call__(self, observations: jnp.ndarray, goals: jnp.ndarray) -> jnp.ndarray:
@@ -76,6 +81,34 @@ class ScalarTransitiveValue(nn.Module):
             activate_final=False,
             layer_norm=_LAYER_NORM,
         )(inputs).squeeze(-1)
+
+
+class BinaryChunkCritic(nn.Module):
+    """Ensemble of bounded critics over a fixed-length action chunk."""
+
+    action_size: int
+    hidden_dims: Sequence[int] = _CRITIC_HIDDEN_DIMS
+    num_qs: int = 2
+
+    @nn.compact
+    def __call__(self, observations, goals, actions):
+        actions = jnp.asarray(actions)
+        if actions.ndim > 2:
+            actions = actions.reshape(actions.shape[0], -1)
+        if actions.shape[-1] != self.action_size:
+            raise ValueError(
+                f'Expected flattened action size {self.action_size}, got {actions.shape[-1]}.'
+            )
+        inputs = jnp.concatenate([
+            observations, goal_representation(goals, 'full'), actions,
+        ], axis=-1)
+        hidden = MLP(
+            tuple(self.hidden_dims), activate_final=True, layer_norm=_LAYER_NORM,
+        )(inputs)
+        return jnp.stack([
+            nn.Dense(1, name=f'q_head_{index}')(hidden).squeeze(-1)
+            for index in range(self.num_qs)
+        ], axis=0)
 
 
 class GaussianEndpointProposer(nn.Module):
@@ -203,17 +236,6 @@ class InverseDynamics(nn.Module):
         )(inputs)
 
 
-def _expectile_bce(
-    logits: jnp.ndarray,
-    targets: jnp.ndarray,
-) -> jnp.ndarray:
-    """Expectile-weighted BCE used by the transitive constituent target."""
-
-    predictions = jax.nn.sigmoid(logits)
-    weights = jnp.where(predictions > targets, 1.0 - _TAU_V, _TAU_V)
-    return weights * optax.sigmoid_binary_cross_entropy(logits, targets)
-
-
 def _replace_module_params(params: Any, module_name: str, value: Any) -> Any:
     """Replace one ModuleDict subtree without changing the container type."""
 
@@ -224,168 +246,154 @@ def _replace_module_params(params: Any, module_name: str, value: Any) -> Any:
 
 
 class PathBridgerAgent(flax.struct.PyTreeNode):
-    """Actor-free PathBridger training and evaluation state."""
+    """Joint PBF bridge/IDM and triangular-Q training state."""
 
     rng: Any
     network: TrainState
     config: Any = nonpytree_field()
 
-    def _distance_weight_from_values(
-        self,
-        target_values: jnp.ndarray,
-    ) -> tuple[jnp.ndarray, jnp.ndarray]:
-        """Compute the un-clipped TRL distance weight from the target value."""
+    def _aggregate_q(self, qs: jnp.ndarray) -> jnp.ndarray:
+        method = str(self.config['q_agg']).lower()
+        if method == 'min':
+            return jnp.min(qs, axis=0)
+        if method == 'mean':
+            return jnp.mean(qs, axis=0)
+        raise ValueError(f"q_agg must be 'min' or 'mean', got {method!r}")
 
-        target_values = jax.lax.stop_gradient(target_values)
-        safe_values = jnp.clip(target_values, _VALUE_EPS, 1.0)
-        distance = jnp.log(safe_values) / jnp.log(
-            jnp.asarray(self.config['discount'], dtype=jnp.float32)
-        )
-        weights = jnp.power(
-            1.0 + distance,
-            -jnp.asarray(
-                self.config['value_distance_weight_power'],
-                dtype=jnp.float32,
-            ),
-        )
-        return jax.lax.stop_gradient(weights), target_values
+    def _valid_mask(self, batch):
+        valids = batch.get('valids')
+        if valids is None:
+            return jnp.ones((batch['observations'].shape[0],), dtype=jnp.float32)
+        valids = jnp.asarray(valids, dtype=jnp.float32)
+        if valids.ndim == 1:
+            return valids
+        return valids.reshape(valids.shape[0], -1)[:, -1]
 
-    def value_loss(
+    @staticmethod
+    def _weighted_mean(values, weights):
+        return jnp.sum(values * weights) / jnp.maximum(jnp.sum(weights), 1e-6)
+
+    def triangle_q_loss(
         self,
         batch: dict[str, jnp.ndarray],
         grad_params: Any,
+        full_metrics: bool = True,
     ) -> tuple[jnp.ndarray, dict[str, jnp.ndarray]]:
-        """Self, base, and transitive scalar-value BCE losses."""
+        """PathFlower base-Q, triangular-Q, and expectile-V objectives."""
 
+        valid_mask = self._valid_mask(batch)
+        eps = float(self.config.get('q_value_eps', _Q_VALUE_EPS))
+        discount = float(self.config['discount'])
         observations = batch['observations']
-        discount = jnp.asarray(self.config['discount'], dtype=jnp.float32)
+        goals = batch['value_goals']
+        actions = batch['action_chunk_actions']
 
-        online_logits = self.network.select('value')(
-            jnp.concatenate([observations, observations, observations], axis=0),
-            jnp.concatenate(
-                [observations, batch['base_goals'], batch['value_goals']],
-                axis=0,
-            ),
+        base_logits = self.network.select('action_critic')(
+            observations, batch['trl_base_goals'], actions,
             params=grad_params,
         )
-        self_logits, base_logits, transitive_logits = jnp.split(
-            online_logits,
-            3,
-            axis=0,
-        )
-        self_targets = jnp.ones_like(self_logits)
-        self_loss = optax.sigmoid_binary_cross_entropy(
-            self_logits,
-            self_targets,
-        ).mean()
-
-        base_offsets = jnp.asarray(batch['base_offsets'], dtype=jnp.float32)
-        base_targets = jnp.power(discount, base_offsets)
-        base_bce = optax.sigmoid_binary_cross_entropy(
-            base_logits,
-            base_targets,
-        )
-
-        goals = batch['value_goals']
-        subgoals = batch['transitive_subgoals']
-        left_offsets = jnp.asarray(
-            batch['transitive_offsets'],
-            dtype=jnp.float32,
-        )
-        total_offsets = jnp.asarray(batch['value_offsets'], dtype=jnp.float32)
-        right_offsets = total_offsets - left_offsets
-
-        use_distance_weights = (
-            float(self.config['value_distance_weight_power']) != 0.0
-        )
-        target_states = [observations, subgoals]
-        target_goals = [subgoals, goals]
-        if use_distance_weights:
-            target_states.extend([observations, observations])
-            target_goals.extend([batch['base_goals'], goals])
-        target_logits = self.network.select('target_value')(
-            jnp.concatenate(target_states, axis=0),
-            jnp.concatenate(target_goals, axis=0),
-        )
-        target_values = jnp.split(
-            jax.nn.sigmoid(target_logits),
-            len(target_states),
-            axis=0,
-        )
-        target_left, target_right = target_values[:2]
-        if use_distance_weights:
-            base_distance_weights, base_target_values = (
-                self._distance_weight_from_values(target_values[2])
-            )
-            transitive_distance_weights, transitive_target_values = (
-                self._distance_weight_from_values(target_values[3])
-            )
-        else:
-            base_distance_weights = jnp.ones_like(base_bce)
-            transitive_distance_weights = jnp.ones_like(base_bce)
-        base_loss = jnp.mean(base_distance_weights * base_bce)
-
-        exact_left = jnp.power(discount, left_offsets)
-        exact_right = jnp.power(discount, right_offsets)
-        mixed_left = jnp.where(
-            left_offsets <= _BASE_HORIZON,
-            exact_left,
-            target_left,
-        )
-        mixed_right = jnp.where(
-            right_offsets <= _BASE_HORIZON,
-            exact_right,
-            target_right,
-        )
-        transitive_targets = jax.lax.stop_gradient(mixed_left * mixed_right)
-
-        transitive_bce = _expectile_bce(
-            transitive_logits,
-            transitive_targets,
-        )
-        transitive_valids = jnp.asarray(
-            batch['transitive_valids'],
-            dtype=jnp.float32,
-        )
-        if transitive_valids.ndim > 1:
-            transitive_valids = transitive_valids.reshape(
-                transitive_valids.shape[0],
-                -1,
-            )[:, 0]
-        transitive_numerator = jnp.sum(
-            transitive_valids
-            * transitive_distance_weights
-            * transitive_bce
-        )
-        transitive_loss = transitive_numerator / jnp.maximum(
-            jnp.sum(transitive_valids),
+        base_target = jnp.clip(
+            jnp.power(discount, jnp.asarray(batch['trl_base_offsets'], dtype=jnp.float32)),
+            eps,
             1.0,
         )
+        base_loss_per = jnp.mean(
+            optax.sigmoid_binary_cross_entropy(base_logits, base_target[None, :]),
+            axis=0,
+        )
+        base_loss = self._weighted_mean(base_loss_per, valid_mask)
 
-        loss = self_loss + base_loss + transitive_loss
-        info = {
-            'value/loss': loss,
-            'value/self_loss': self_loss,
-            'value/base_loss': base_loss,
-            'value/transitive_loss': transitive_loss,
-            'value/self_mean': jax.nn.sigmoid(self_logits).mean(),
-            'value/base_mean': jax.nn.sigmoid(base_logits).mean(),
-            'value/base_target_mean': base_targets.mean(),
-            'value/base_distance_weight_mean': base_distance_weights.mean(),
-            'value/transitive_mean': jax.nn.sigmoid(
-                transitive_logits
-            ).mean(),
-            'value/transitive_target_mean': transitive_targets.mean(),
-            'value/transitive_distance_weight_mean': (
-                transitive_distance_weights.mean()
-            ),
-            'value/transitive_valid_fraction': transitive_valids.mean(),
-        }
-        if use_distance_weights:
-            info['value/base_target_value_mean'] = base_target_values.mean()
-            info['value/transitive_target_value_mean'] = (
-                transitive_target_values.mean()
+        triangle_logits = self.network.select('action_critic')(
+            observations, goals, actions,
+            params=grad_params,
+        )
+        left_logits = self.network.select('target_action_critic')(
+            observations, batch['trl_split_goals'], actions,
+        )
+        left_q = jnp.clip(
+            self._aggregate_q(jax.nn.sigmoid(left_logits)), eps, 1.0,
+        )
+        right_logits = self.network.select('target_action_critic')(
+            batch['trl_split_observations'],
+            goals,
+            batch['trl_split_action_chunk_actions'],
+        )
+        right_q = jnp.clip(
+            self._aggregate_q(jax.nn.sigmoid(right_logits)), eps, 1.0,
+        )
+        triangle_target = jax.lax.stop_gradient(
+            jnp.clip(left_q * right_q, eps, 1.0)
+        )
+        triangle_valid = (
+            jnp.asarray(batch['trl_valid_mask'], dtype=jnp.float32) * valid_mask
+        )
+        distances = jnp.maximum(
+            jnp.asarray(batch['value_offsets'], dtype=jnp.float32), 0.0,
+        )
+        distance_weights = jax.lax.stop_gradient(
+            1.0 / jnp.power(
+                1.0 + distances,
+                float(self.config['value_distance_weight_power']),
             )
+        )
+        triangle_loss_per = jnp.mean(
+            _bce_expectile_loss(
+                triangle_logits,
+                triangle_target[None, :],
+                float(self.config['tau_q']),
+            ),
+            axis=0,
+        )
+        triangle_loss = self._weighted_mean(
+            triangle_loss_per,
+            triangle_valid * distance_weights,
+        )
+
+        value_logits = self.network.select('value')(
+            observations, goals, params=grad_params,
+        )
+        target_q_logits = self.network.select('target_action_critic')(
+            observations, goals, actions,
+        )
+        value_target = jax.lax.stop_gradient(jnp.clip(
+            self._aggregate_q(jax.nn.sigmoid(target_q_logits)), eps, 1.0,
+        ))
+        value_loss = self._weighted_mean(
+            _bce_expectile_loss(
+                value_logits,
+                value_target,
+                float(self.config['tau_v']),
+            ),
+            valid_mask,
+        )
+
+        loss = (
+            float(self.config['lambda_q_base']) * base_loss
+            + float(self.config['lambda_q_tri']) * triangle_loss
+            + float(self.config['lambda_v']) * value_loss
+        )
+        info = {
+            'triangle_q/loss': loss,
+            'triangle_q/base_loss': base_loss,
+            'triangle_q/triangle_loss': triangle_loss,
+            'triangle_q/value_loss': value_loss,
+        }
+        if full_metrics:
+            base_q = self._aggregate_q(jax.nn.sigmoid(base_logits))
+            triangle_q = self._aggregate_q(jax.nn.sigmoid(triangle_logits))
+            values = jax.nn.sigmoid(value_logits)
+            info.update({
+                'triangle_q/base_pred_mean': base_q.mean(),
+                'triangle_q/base_target_mean': base_target.mean(),
+                'triangle_q/pred_mean': triangle_q.mean(),
+                'triangle_q/target_mean': triangle_target.mean(),
+                'triangle_q/left_mean': left_q.mean(),
+                'triangle_q/right_mean': right_q.mean(),
+                'triangle_q/value_mean': values.mean(),
+                'triangle_q/value_target_mean': value_target.mean(),
+                'triangle_q/valid_fraction': triangle_valid.mean(),
+                'triangle_q/distance_weight_mean': distance_weights.mean(),
+            })
         return loss, info
 
     def _endpoint_weights(
@@ -394,14 +402,11 @@ class PathBridgerAgent(flax.struct.PyTreeNode):
         goals: jnp.ndarray,
         endpoint_targets: jnp.ndarray,
     ) -> tuple[jnp.ndarray, jnp.ndarray]:
-        value_logits = self.network.select('target_value')(
-            jnp.concatenate([observations, endpoint_targets], axis=0),
-            jnp.concatenate([goals, goals], axis=0),
+        current_values = jax.nn.sigmoid(
+            self.network.select('target_value')(observations, goals)
         )
-        current_values, endpoint_values = jnp.split(
-            jax.nn.sigmoid(value_logits),
-            2,
-            axis=0,
+        endpoint_values = jax.nn.sigmoid(
+            self.network.select('target_value')(endpoint_targets, goals)
         )
         value_gap = endpoint_values - current_values
         weights = jnp.minimum(
@@ -421,6 +426,7 @@ class PathBridgerAgent(flax.struct.PyTreeNode):
         batch: dict[str, jnp.ndarray],
         grad_params: Any,
         rng: jax.Array,
+        full_metrics: bool = True,
     ) -> tuple[jnp.ndarray, dict[str, jnp.ndarray]]:
         """Weighted PBG likelihood or PBF flow-matching loss."""
 
@@ -451,9 +457,10 @@ class PathBridgerAgent(flax.struct.PyTreeNode):
             loss = jnp.mean(weights * nll)
             info = {
                 'endpoint/loss': loss,
-                'endpoint/nll': nll.mean(),
-                'endpoint/std_mean': jnp.exp(log_stds).mean(),
             }
+            if full_metrics:
+                info['endpoint/nll'] = nll.mean()
+                info['endpoint/std_mean'] = jnp.exp(log_stds).mean()
         else:
             noise_rng, time_rng = jax.random.split(rng)
             noise = jax.random.normal(
@@ -484,33 +491,32 @@ class PathBridgerAgent(flax.struct.PyTreeNode):
             loss = jnp.mean(weights * flow_errors)
             info = {
                 'endpoint/loss': loss,
-                'endpoint/flow_matching_loss': flow_errors.mean(),
-                'endpoint/flow_time_mean': times.mean(),
             }
+            if full_metrics:
+                info['endpoint/flow_matching_loss'] = flow_errors.mean()
+                info['endpoint/flow_time_mean'] = times.mean()
 
-        info.update(
-            {
+        if full_metrics:
+            info.update({
                 'endpoint/weight_mean': weights.mean(),
                 'endpoint/weight_max': weights.max(),
                 'endpoint/value_gap_mean': value_gap.mean(),
-            }
-        )
+            })
         return loss, info
 
-    def _bridge_states_at_indices(
+    def _construct_bridge(
         self,
         observations: jnp.ndarray,
         endpoints: jnp.ndarray,
-        indices: jnp.ndarray,
         *,
         params: Any | None = None,
     ) -> jnp.ndarray:
         horizon = int(self.config['horizon'])
-        indices = jnp.asarray(indices, dtype=jnp.float32)
+        indices = jnp.arange(horizon + 1, dtype=jnp.float32)
         times = indices / jnp.asarray(horizon, dtype=jnp.float32)
         times = jnp.broadcast_to(
             times[None, :],
-            (observations.shape[0], indices.shape[0]),
+            (observations.shape[0], horizon + 1),
         )
         alphas = jnp.power(times, _BRIDGE_ALPHA_POWER)
         masks = (
@@ -528,45 +534,11 @@ class PathBridgerAgent(flax.struct.PyTreeNode):
             alphas[..., None] * endpoint_displacements[:, None, :]
             + masks[None, :, None] * residuals
         )
-        return observations[:, None, :] + displacements
-
-    def _construct_bridge(
-        self,
-        observations: jnp.ndarray,
-        endpoints: jnp.ndarray,
-        *,
-        params: Any | None = None,
-    ) -> jnp.ndarray:
-        horizon = int(self.config['horizon'])
-        bridge = self._bridge_states_at_indices(
-            observations,
-            endpoints,
-            jnp.arange(horizon + 1, dtype=jnp.float32),
-            params=params,
-        )
+        bridge = observations[:, None, :] + displacements
         # Preserve both pins exactly, including under finite-precision arithmetic.
         bridge = bridge.at[:, 0, :].set(observations)
         bridge = bridge.at[:, -1, :].set(endpoints)
         return bridge
-
-    def _construct_bridge_prefix(
-        self,
-        observations: jnp.ndarray,
-        endpoints: jnp.ndarray,
-        *,
-        params: Any | None = None,
-    ) -> jnp.ndarray:
-        """Construct only the six states consumed by the five-step IDM policy."""
-
-        future_states = self._bridge_states_at_indices(
-            observations,
-            endpoints,
-            jnp.arange(1, _ACTION_HORIZON + 1, dtype=jnp.float32),
-            params=params,
-        )
-        if int(self.config['horizon']) == _ACTION_HORIZON:
-            future_states = future_states.at[:, -1, :].set(endpoints)
-        return jnp.concatenate([observations[:, None, :], future_states], axis=1)
 
     @jax.jit
     def construct_bridge(
@@ -587,29 +559,37 @@ class PathBridgerAgent(flax.struct.PyTreeNode):
         self,
         batch: dict[str, jnp.ndarray],
         grad_params: Any,
+        full_metrics: bool = True,
     ) -> tuple[jnp.ndarray, dict[str, jnp.ndarray]]:
         """Mean L1 reconstruction for exactly bridge indices 1 through 5."""
 
-        predicted = self._construct_bridge_prefix(
+        trajectory = batch['trajectory']
+        predicted = self._construct_bridge(
             batch['observations'],
-            batch['endpoint_targets'],
+            trajectory[:, -1, :],
             params=grad_params,
         )
         prefix_errors = jnp.sum(
             jnp.abs(predicted[:, 1 : _ACTION_HORIZON + 1, :]
-                    - batch['bridge_targets']),
+                    - trajectory[:, 1 : _ACTION_HORIZON + 1, :]),
             axis=-1,
         )
         loss = prefix_errors.mean()
-        return loss, {
+        info = {
             'bridge/loss': loss,
-            'bridge/prefix_l1': prefix_errors.mean(),
         }
+        if full_metrics:
+            info['bridge/prefix_l1'] = loss
+            info['bridge/endpoint_error'] = jnp.mean(
+                jnp.abs(predicted[:, -1, :] - trajectory[:, -1, :])
+            )
+        return loss, info
 
     def idm_loss(
         self,
         batch: dict[str, jnp.ndarray],
         grad_params: Any,
+        full_metrics: bool = True,
     ) -> tuple[jnp.ndarray, dict[str, jnp.ndarray]]:
         """Adjacent-transition inverse-dynamics MSE."""
 
@@ -620,87 +600,99 @@ class PathBridgerAgent(flax.struct.PyTreeNode):
         )
         squared_errors = jnp.square(predicted_actions - batch['actions'])
         loss = jnp.sum(squared_errors, axis=-1).mean()
-        return loss, {
+        info = {
             'idm/loss': loss,
             'idm/squared_l2': loss,
-            'idm/action_mse': squared_errors.mean(),
         }
+        if full_metrics:
+            info['idm/action_mse'] = squared_errors.mean()
+        return loss, info
 
-    @jax.jit
+    @partial(jax.jit, static_argnames=('full_metrics',))
     def total_loss(
         self,
         batch: dict[str, jnp.ndarray],
         grad_params: Any,
         rng: jax.Array | None = None,
+        full_metrics: bool = True,
     ) -> tuple[jnp.ndarray, dict[str, jnp.ndarray]]:
-        """Sum all four fixed-coefficient PathBridger objectives."""
+        """Sum Triangle-Q, endpoint, bridge, and IDM objectives."""
 
         rng = self.rng if rng is None else rng
-        value_loss, value_info = self.value_loss(batch, grad_params)
+        critic_loss, critic_info = self.triangle_q_loss(
+            batch, grad_params, full_metrics,
+        )
         endpoint_loss, endpoint_info = self.endpoint_loss(
             batch,
             grad_params,
             rng,
+            full_metrics,
         )
-        bridge_loss, bridge_info = self.bridge_loss(batch, grad_params)
-        idm_loss, idm_info = self.idm_loss(batch, grad_params)
-        loss = value_loss + endpoint_loss + bridge_loss + idm_loss
+        bridge_loss, bridge_info = self.bridge_loss(
+            batch, grad_params, full_metrics,
+        )
+        idm_loss, idm_info = self.idm_loss(batch, grad_params, full_metrics)
+        loss = critic_loss + endpoint_loss + bridge_loss + idm_loss
         info = {
             'loss/total': loss,
-            **value_info,
+            **critic_info,
             **endpoint_info,
             **bridge_info,
             **idm_info,
         }
         return loss, info
 
-    def _ema_target_value(self, network: TrainState) -> TrainState:
-        online_params = network.params['modules_value']
-        target_params = network.params['modules_target_value']
-        updated_target = jax.tree_util.tree_map(
-            lambda online, target: (
-                _TARGET_TAU * online + (1.0 - _TARGET_TAU) * target
-            ),
-            online_params,
-            target_params,
+    def _ema_targets(self, network: TrainState) -> TrainState:
+        tau = float(self.config['tau'])
+        params = network.params
+        updated_q = jax.tree_util.tree_map(
+            lambda source, old: tau * source + (1.0 - tau) * old,
+            params['modules_action_critic'],
+            params['modules_target_action_critic'],
         )
-        return network.replace(
-            params=_replace_module_params(
-                network.params,
-                'target_value',
-                updated_target,
-            )
+        updated_v = jax.tree_util.tree_map(
+            lambda source, old: tau * source + (1.0 - tau) * old,
+            params['modules_value'],
+            params['modules_target_value'],
         )
+        params = _replace_module_params(params, 'target_action_critic', updated_q)
+        params = _replace_module_params(params, 'target_value', updated_v)
+        return network.replace(params=params)
 
     def update(
         self,
         batch: dict[str, jnp.ndarray],
+        full_metrics: bool = True,
     ) -> tuple['PathBridgerAgent', dict[str, jnp.ndarray]]:
-        """Apply one joint gradient update and one value-target EMA update."""
+        """Apply one joint gradient update and EMA updates for Q and V."""
 
         missing = [key for key in _REQUIRED_BATCH_KEYS if key not in batch]
         if missing:
             raise KeyError(f'PathBridger batch is missing keys: {missing}')
-        if int(batch['bridge_targets'].shape[1]) != _ACTION_HORIZON:
+        expected_length = int(self.config['horizon']) + 1
+        if int(batch['trajectory'].shape[1]) != expected_length:
             raise ValueError(
-                'bridge_targets must have shape [B, action_horizon, D]; '
-                f'expected length {_ACTION_HORIZON}, got '
-                f'{batch["bridge_targets"].shape[1]}.'
+                'trajectory must have shape [B, horizon + 1, D]; '
+                f'expected length {expected_length}, got '
+                f'{batch["trajectory"].shape[1]}.'
             )
-        return self._update_impl(batch)
+        return self._update_impl(batch, full_metrics=full_metrics)
 
-    @jax.jit
+    @partial(jax.jit, static_argnames=('full_metrics',))
     def _update_impl(
         self,
         batch: dict[str, jnp.ndarray],
+        full_metrics: bool = True,
     ) -> tuple['PathBridgerAgent', dict[str, jnp.ndarray]]:
         new_rng, loss_rng = jax.random.split(self.rng)
 
         def loss_fn(grad_params):
-            return self.total_loss(batch, grad_params, rng=loss_rng)
+            return self.total_loss(
+                batch, grad_params, rng=loss_rng, full_metrics=full_metrics,
+            )
 
         new_network, info = self.network.apply_loss_fn(loss_fn=loss_fn)
-        new_network = self._ema_target_value(new_network)
+        new_network = self._ema_targets(new_network)
         return self.replace(rng=new_rng, network=new_network), info
 
     def _flow_endpoint_samples(
@@ -788,7 +780,7 @@ class PathBridgerAgent(flax.struct.PyTreeNode):
         num_candidates: int | None = None,
         temperature: float | None = None,
     ) -> jnp.ndarray:
-        """Sample endpoints, select by online value product, and decode actions."""
+        """Sample PBF endpoints, decode five-step prefixes, and rank by Q."""
 
         if seed is None:
             seed = jax.random.PRNGKey(0)
@@ -814,55 +806,54 @@ class PathBridgerAgent(flax.struct.PyTreeNode):
             temperature=temperature,
         )
         batch_size, _, state_dim = candidates.shape
-        if num_candidates == 1:
-            selected_endpoints = candidates[:, 0, :]
-        else:
-            flat_observations = jnp.broadcast_to(
-                observations[:, None, :],
-                candidates.shape,
-            ).reshape(batch_size * num_candidates, state_dim)
-            flat_candidates = candidates.reshape(
-                batch_size * num_candidates,
-                state_dim,
-            )
-            flat_goals = jnp.broadcast_to(
-                goals[:, None, :],
-                (batch_size, num_candidates, goals.shape[-1]),
-            ).reshape(batch_size * num_candidates, goals.shape[-1])
-            value_logits = self.network.select('value')(
-                jnp.concatenate([flat_observations, flat_candidates], axis=0),
-                jnp.concatenate([flat_candidates, flat_goals], axis=0),
-            )
-            values_to_endpoint, values_to_goal = jnp.split(
-                jax.nn.sigmoid(value_logits),
-                2,
-                axis=0,
-            )
-            scores = (values_to_endpoint * values_to_goal).reshape(
-                batch_size,
-                num_candidates,
-            )
-            best_indices = jnp.argmax(scores, axis=1)
-            selected_endpoints = jnp.take_along_axis(
-                candidates,
-                best_indices[:, None, None],
-                axis=1,
-            )[:, 0, :]
-
-        prefix = self._construct_bridge_prefix(
-            observations,
-            selected_endpoints,
+        repeated_observations = jnp.broadcast_to(
+            observations[:, None, :],
+            candidates.shape,
         )
-        current_states = prefix[:, :-1, :].reshape(
-            batch_size * _ACTION_HORIZON,
+        repeated_goals = jnp.broadcast_to(
+            goals[:, None, :],
+            (batch_size, num_candidates, goals.shape[-1]),
+        )
+        flat_observations = repeated_observations.reshape(
+            batch_size * num_candidates,
             state_dim,
+        )
+        flat_candidates = candidates.reshape(
+            batch_size * num_candidates,
+            state_dim,
+        )
+        flat_goals = repeated_goals.reshape(
+            batch_size * num_candidates,
+            goals.shape[-1],
+        )
+        # Decode every proposed bridge through h, then let triangular Q select.
+        flat_bridges = self._construct_bridge(flat_observations, flat_candidates)
+        action_chunk_horizon = int(self.config['action_chunk_horizon'])
+        prefix = flat_bridges[:, : action_chunk_horizon + 1, :]
+        current_states = prefix[:, :-1, :].reshape(
+            batch_size * num_candidates * action_chunk_horizon, state_dim,
         )
         next_states = prefix[:, 1:, :].reshape(
-            batch_size * _ACTION_HORIZON,
-            state_dim,
+            batch_size * num_candidates * action_chunk_horizon, state_dim,
         )
-        actions = self.network.select('idm')(current_states, next_states)
-        actions = actions.reshape(batch_size, _ACTION_HORIZON, -1)
+        candidate_actions = self.network.select('idm')(current_states, next_states)
+        candidate_actions = candidate_actions.reshape(
+            batch_size, num_candidates, action_chunk_horizon, -1,
+        )
+        q_logits = self.network.select('action_critic')(
+            flat_observations,
+            flat_goals,
+            candidate_actions.reshape(batch_size * num_candidates, -1),
+        )
+        scores = self._aggregate_q(jax.nn.sigmoid(q_logits)).reshape(
+            batch_size, num_candidates,
+        )
+        best_indices = jnp.argmax(scores, axis=1)
+        actions = jnp.take_along_axis(
+            candidate_actions,
+            best_indices[:, None, None, None],
+            axis=1,
+        )[:, 0]
         return actions[0] if squeeze else actions
 
     @classmethod
@@ -887,6 +878,19 @@ class PathBridgerAgent(flax.struct.PyTreeNode):
         config['endpoint_distribution'] = endpoint_distribution
 
         horizon = int(config['horizon'])
+        action_chunk_horizon = int(config['action_chunk_horizon'])
+        sequence_horizon = int(config['sequence_horizon'])
+        if action_chunk_horizon != _ACTION_HORIZON:
+            raise ValueError(
+                f'Triangle-Q uses {_ACTION_HORIZON}-step chunks, got '
+                f'{action_chunk_horizon}.'
+            )
+        if sequence_horizon < action_chunk_horizon:
+            raise ValueError('sequence_horizon must cover the action chunk.')
+        if int(config['num_qs']) < 1:
+            raise ValueError('num_qs must be at least one.')
+        if str(config['q_agg']).lower() not in ('min', 'mean'):
+            raise ValueError("q_agg must be 'min' or 'mean'.")
         if horizon < _ACTION_HORIZON:
             raise ValueError(
                 f'horizon must be at least {_ACTION_HORIZON}, got {horizon}.'
@@ -920,8 +924,16 @@ class PathBridgerAgent(flax.struct.PyTreeNode):
             where='PathBridgerAgent.create (endpoint goal representation)',
             env_name=env_name,
         )
-        value_def = ScalarTransitiveValue()
-        target_value_def = ScalarTransitiveValue()
+        value_def = ScalarValueNet()
+        target_value_def = ScalarValueNet()
+        action_critic_def = BinaryChunkCritic(
+            action_size=action_chunk_horizon * action_dim,
+            num_qs=int(config['num_qs']),
+        )
+        target_action_critic_def = BinaryChunkCritic(
+            action_size=action_chunk_horizon * action_dim,
+            num_qs=int(config['num_qs']),
+        )
         if endpoint_distribution == 'gaussian':
             endpoint_def = GaussianEndpointProposer(
                 state_dim=state_dim,
@@ -959,6 +971,20 @@ class PathBridgerAgent(flax.struct.PyTreeNode):
                 target_value_def,
                 (observations, observations),
             ),
+            'action_critic': (
+                action_critic_def,
+                (observations, observations, jnp.zeros(
+                    (observations.shape[0], action_chunk_horizon * action_dim),
+                    dtype=jnp.float32,
+                )),
+            ),
+            'target_action_critic': (
+                target_action_critic_def,
+                (observations, observations, jnp.zeros(
+                    (observations.shape[0], action_chunk_horizon * action_dim),
+                    dtype=jnp.float32,
+                )),
+            ),
             'endpoint': (endpoint_def, endpoint_args),
             'bridge': (
                 bridge_def,
@@ -981,6 +1007,11 @@ class PathBridgerAgent(flax.struct.PyTreeNode):
         )['params']
         network_params = _replace_module_params(
             network_params,
+            'target_action_critic',
+            network_params['modules_action_critic'],
+        )
+        network_params = _replace_module_params(
+            network_params,
             'target_value',
             network_params['modules_value'],
         )
@@ -997,18 +1028,29 @@ class PathBridgerAgent(flax.struct.PyTreeNode):
 
 
 def get_config() -> ml_collections.ConfigDict:
-    """Return the paper's PBF AntMaze-medium settings as clean defaults."""
+    """Return PBF AntMaze-medium settings with PathFlower Triangle-Q."""
 
     return ml_collections.ConfigDict(
         dict(
             env_name='antmaze-medium-navigate-v0',
             endpoint_distribution='flow',
             horizon=25,
-            discount=0.99,
+            discount=0.999,
             actor_p=(0.0, 0.0, 1.0, 0.0),
-            critic_p=(0.0, 1.0, 0.0, 0.0),
-            endpoint_value_scale=10.0,
+            sequence_horizon=25,
+            action_chunk_horizon=5,
+            value_geom_sample=True,
+            num_qs=2,
+            q_agg='mean',
+            tau=0.005,
+            tau_q=0.7,
+            tau_v=0.7,
+            lambda_q_base=1.0,
+            lambda_q_tri=1.0,
+            lambda_v=1.0,
             value_distance_weight_power=0.0,
+            q_value_eps=1e-6,
+            endpoint_value_scale=10.0,
             eval_num_candidates=8,
             eval_temperature=0.25,
         )
@@ -1021,6 +1063,7 @@ __all__ = [
     'GaussianEndpointProposer',
     'InverseDynamics',
     'PathBridgerAgent',
-    'ScalarTransitiveValue',
+    'ScalarValueNet',
+    'BinaryChunkCritic',
     'get_config',
 ]
