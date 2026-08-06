@@ -33,6 +33,8 @@ def _online_batch():
         'behavior_goals': OBS + 0.4,
         'rewards': jnp.asarray([-1.0, 0.0], jnp.float32),
         'masks': jnp.asarray([1.0, 0.0], jnp.float32),
+        'behavior_rewards': jnp.asarray([-1.0, -1.0], jnp.float32),
+        'behavior_masks': jnp.asarray([1.0, 1.0], jnp.float32),
         'desired_next': OBS + 0.03,
     }
 
@@ -129,7 +131,11 @@ def test_mscp_afguide_and_oso_smoke():
     mcfg['hidden_dims'] = (8,)
     mscp = MSCPAgent.create(0, OBS, ACT.shape[-1], mcfg)
     mscp, _ = mscp.offline_update(_offline_batch())
-    mscp, _ = mscp.online_update(_online_batch())
+    before_online = mscp
+    mscp, base_info = mscp.online_update(_online_batch())
+    changed_command = {**_online_batch(), 'behavior_goals': OBS - 50.0}
+    _, changed_info = before_online.online_update(changed_command)
+    np.testing.assert_allclose(base_info['low/loss'], changed_info['low/loss'])
     assert mscp.sample_actions(OBS, OBS + 0.2, seed=jax.random.PRNGKey(2)).shape == ACT.shape
 
     acfg = afguide_config().to_dict()

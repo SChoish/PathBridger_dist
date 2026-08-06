@@ -35,6 +35,7 @@ from utils.af_data import (
     OnlineReplayBuffer,
 )
 from utils.af_evaluation import evaluate_policy
+from utils.af_exploration import collection_noise_std
 from utils.datasets import PathBridgerDataset, action_free_view, observation_state_scale
 from utils.evaluation import DEFAULT_TASK_IDS, _info_success, _max_episode_steps
 from utils.flax_utils import restore_agent, save_agent
@@ -42,7 +43,7 @@ from utils.log_utils import CsvLogger, get_exp_name
 
 
 FLAGS = flags.FLAGS
-PROTOCOL_VERSION = 'af_o2o_v2'
+PROTOCOL_VERSION = 'af_o2o_v3'
 _DEFAULT_PBF_CONFIG = str(
     Path(__file__).resolve().parent / 'configs' / 'pbf_af' / 'antmaze_medium.py'
 )
@@ -470,6 +471,13 @@ def main(_):
                 ),
                 dtype=np.float32,
             )
+            collection_noise = collection_noise_std(
+                name, step, FLAGS.random_steps, resolved_config
+            )
+            if collection_noise > 0.0:
+                action = action + exploration_rng.normal(
+                    0.0, collection_noise, size=action.shape
+                )
         action = np.clip(action, action_low, action_high).astype(np.float32)
         next_observation, _, terminated, truncated, info = env.step(action)
         next_observation = np.asarray(next_observation, dtype=np.float32)

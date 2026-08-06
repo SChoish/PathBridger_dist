@@ -4,9 +4,24 @@
     "paper": "https://arxiv.org/abs/2301.12876",
     "repository": "https://github.com/Vision-CAIR/AF-Guide"
   },
+  "apv": {
+    "commit": "3efa6218c58cad05479d8d50f173b1afb34664ae",
+    "paper": "https://proceedings.mlr.press/v162/seo22a.html",
+    "repository": "https://github.com/younggyoseo/apv"
+  },
+  "drqv2": {
+    "commit": "c0c650b76c6e5d22a7eb5f2edffd1440fe94f8ef",
+    "paper": "https://arxiv.org/abs/2107.09645",
+    "repository": "https://github.com/facebookresearch/drqv2"
+  },
   "hiql": {
     "paper": "https://papers.nips.cc/paper_files/paper/2023/hash/6d7c4a0727e089ed6cdd3151cbe8d8ba-Abstract-Conference.html",
     "repository": "https://seohong.me/projects/hiql/"
+  },
+  "lapo": {
+    "commit": "c3844f7e8c92e900bf7547a265f14089ac68b121",
+    "paper": "https://arxiv.org/abs/2312.10812",
+    "repository": "https://github.com/schmidtdominik/LAPO"
   },
   "mscp": {
     "commit": "81bc98f889ac058691dc67f8f585982140b559c1",
@@ -27,5 +42,10 @@
   "rlpd": {
     "paper": "https://arxiv.org/abs/2302.02948",
     "repository": "https://github.com/ikostrikov/rlpd"
+  },
+  "vip": {
+    "commit": "81b052014591bb157cfb036fc3bd0b213653e86b",
+    "paper": "https://arxiv.org/abs/2210.00030",
+    "repository": "https://github.com/facebookresearch/vip"
   }
 }

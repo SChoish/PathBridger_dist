@@ -342,9 +342,11 @@ class OnlineReplayBuffer:
         valid_slots = np.flatnonzero(self.episode_ids >= 0)
         indices = self.rng.choice(valid_slots, size=int(batch_size), replace=True)
         behavior_goals = self.goals[indices].copy()
+        behavior_rewards = self.rewards[indices].copy()
+        behavior_masks = self.masks[indices].copy()
         goals = behavior_goals.copy()
-        rewards = self.rewards[indices].copy()
-        masks = self.masks[indices].copy()
+        rewards = behavior_rewards.copy()
+        masks = behavior_masks.copy()
         commanded_success_fraction = np.mean(rewards >= 0.0, dtype=np.float32)
         relabel = self.rng.random(len(indices)) < float(her_probability)
         relabeled = np.zeros(len(indices), dtype=np.bool_)
@@ -396,6 +398,8 @@ class OnlineReplayBuffer:
             'behavior_goals': behavior_goals,
             'rewards': rewards,
             'masks': masks,
+            'behavior_rewards': behavior_rewards,
+            'behavior_masks': behavior_masks,
             'desired_next': self.desired_next[indices],
             'desired_next_valid': self.desired_next_valid[indices].astype(np.float32),
             'replay/her_relabel_fraction': np.asarray(

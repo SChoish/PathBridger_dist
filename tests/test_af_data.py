@@ -92,6 +92,8 @@ def test_her_includes_immediate_positive_anchor():
     np.testing.assert_array_equal(batch['goals'], np.ones((16, 1), np.float32))
     np.testing.assert_array_equal(batch['rewards'], np.zeros(16, np.float32))
     np.testing.assert_array_equal(batch['masks'], np.zeros(16, np.float32))
+    np.testing.assert_array_equal(batch['behavior_rewards'], -np.ones(16, np.float32))
+    np.testing.assert_array_equal(batch['behavior_masks'], np.ones(16, np.float32))
     assert batch['replay/her_success_fraction'] == pytest.approx(1.0)
 
 

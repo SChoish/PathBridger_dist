@@ -15,6 +15,7 @@ from scripts.make_af_manifest import ALGORITHMS as MAIN_ALGORITHMS
 from scripts.make_af_manifest import ENVIRONMENTS, EVAL_STEPS, SUITES
 from utils.af_data import FORBIDDEN_OFFLINE_FIELDS
 from utils.af_evaluation import evaluate_policy
+from utils.af_exploration import collection_noise_std
 
 
 def test_action_free_information_regimes_and_online_only_idm():
@@ -86,3 +87,17 @@ def test_score_matrix_rejects_duplicate_runs():
 def test_evaluation_rejects_empty_protocol():
     with pytest.raises(ValueError, match='episodes_per_task'):
         evaluate_policy(object(), None, episodes_per_task=0)
+
+
+def test_deterministic_collection_noise_schedule():
+    config = {
+        'collection_noise_initial': 0.2,
+        'collection_noise_final': 0.05,
+        'collection_noise_decay_steps': 100_000,
+    }
+    assert collection_noise_std('gc_sac', 10_001, 10_000, config) == 0.0
+    assert collection_noise_std('gc_td3', 10_000, 10_000, config) == pytest.approx(0.2)
+    assert collection_noise_std('gc_td3', 60_000, 10_000, config) == pytest.approx(0.125)
+    assert collection_noise_std(
+        'gc_oso_decqn_factorized', 110_000, 10_000, config
+    ) == pytest.approx(0.05)

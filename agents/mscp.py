@@ -117,8 +117,13 @@ class MSCPAgent(flax.struct.PyTreeNode):
                 slow,
                 params=params if tune_planners else None,
             )
+            # Ground actions with the transition they actually produced.  The
+            # planner's desired state is used only at inference (and for the
+            # optional planner realization loss), never as a false BC label.
             mean, log_std = self.network.select('low_policy')(
-                online_batch['observations'], desired_next, params=params
+                online_batch['observations'],
+                online_batch['next_observations'],
+                params=params,
             )
             actions = jnp.clip(online_batch['actions'], -0.999, 0.999)
             pre_tanh = jnp.arctanh(actions)
@@ -145,6 +150,13 @@ class MSCPAgent(flax.struct.PyTreeNode):
                 **online_info,
                 'value/offline_loss': offline_value,
                 'low/loss': low_loss,
+                'low/desired_realization_l2': jnp.sqrt(
+                    jnp.mean(
+                        jnp.square(
+                            desired_next - online_batch['next_observations']
+                        )
+                    )
+                ),
                 'planner/online_loss': planner_loss,
             }
 

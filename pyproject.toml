@@ -27,13 +27,17 @@ pathbridger-eval = "evaluate:run"
 pathbridger-af-train = "train_af:run"
 pathbridger-af-eval = "evaluate_af:run"
 pathbridger-af-aggregate = "aggregate_results:run"
+pathbridger-pixel-lapo-train = "train_pixel_lapo:run"
+pathbridger-pixel-lapo-eval = "evaluate_pixel_lapo:run"
+pathbridger-pixel-train = "train_pixel:run"
+pathbridger-pixel-eval = "evaluate_pixel:run"
 
 [project.optional-dependencies]
 tracking = ["wandb"]
 dev = ["pytest", "ruff"]
 
 [tool.setuptools]
-py-modules = ["main", "evaluate", "train_af", "evaluate_af", "aggregate_results"]
+py-modules = ["main", "evaluate", "train_af", "evaluate_af", "aggregate_results", "train_pixel_lapo", "evaluate_pixel_lapo", "train_pixel", "evaluate_pixel"]
 
 [tool.setuptools.packages.find]
 where = ["."]

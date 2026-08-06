@@ -73,6 +73,31 @@ The aggregate output keeps action-free, online-only, and full-action upper-bound
 groups separate.  Reference repositories and audited commits are pinned in
 `third_party_refs.json`.
 
+## Action-free pixel benchmark
+
+The isolated `pixel_o2o_v2` track currently implements `gc_pixel_lapo`, an
+online-only `gc_pixel_drqv2`, frozen and fine-tuned VIP-style representations
+with the same GC-DrQ-v2 controller, and `gc_pixel_apv`. These are controlled
+goal-image OGBench adaptations; metadata records their official reference
+repository, pinned commit, information boundary, and exact online-updated
+modules. Online learning is not globally restricted to an IDM.
+
+Run one method and generate the full five-method smoke manifest with:
+
+```bash
+python train_pixel.py \
+  --algorithm=vip_frozen_gc_drqv2 \
+  --env_name=visual-antmaze-medium-navigate-v0 \
+  --online_steps=250000 --seed=0
+python scripts/make_pixel_manifest.py \
+  --suite=p0_smoke --output=manifests/pixel_p0.csv
+```
+
+Visual offline data is never downloaded implicitly; pass
+`--allow_dataset_download=true` only when intended. See
+[`docs/pixel_benchmark_protocol.md`](docs/pixel_benchmark_protocol.md) for the
+five algorithms, budgets, run counts, and adaptation caveats.
+
 This is the compact, actor-free distribution of PathBridger for state-based
 offline goal-conditioned reinforcement learning on OGBench.
 

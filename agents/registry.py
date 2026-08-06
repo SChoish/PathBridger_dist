@@ -123,7 +123,7 @@ def algorithm_metadata(name: str) -> AlgorithmMetadata:
             official_repo_url='https://github.com/ChengjieWU/MSCP',
             official_repo_commit='81bc98f889ac058691dc67f8f585982140b559c1',
             online_modules_updated=('low_policy', 'value'),
-            implementation_notes='Simplified OGBench port of the multiscale-planner decomposition; not an official-code reproduction.',
+            implementation_notes='Simplified OGBench port; online low-level grounding is an actual-transition IDM objective, not self-BC on planner targets.',
         ),
         'hiql_endpoint_online': dict(
             port_kind='goal_conditioned_adaptation',
@@ -146,7 +146,7 @@ def algorithm_metadata(name: str) -> AlgorithmMetadata:
             official_repo_url=None,
             official_repo_commit=None,
             online_modules_updated=('td3', 'idm'),
-            implementation_notes='Goal-conditioned factorized three-bin state-delta port; joint delta support is not modeled.',
+            implementation_notes='Goal-conditioned factorized three-bin state-delta port; joint delta support is not modeled; online collection uses scheduled Gaussian exploration.',
         ),
         'gc_sac': dict(
             port_kind='online_only',
@@ -161,6 +161,7 @@ def algorithm_metadata(name: str) -> AlgorithmMetadata:
             official_repo_url=None,
             official_repo_commit=None,
             online_modules_updated=('actor', 'critic'),
+            implementation_notes='Goal-conditioned TD3 with scheduled Gaussian collection exploration after random warm-up.',
         ),
         'gc_sac_50_50': dict(
             port_kind='full_action',

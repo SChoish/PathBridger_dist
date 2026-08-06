@@ -1,8 +1,8 @@
-"""OGBench environment and compact state-dataset loading.
+"""OGBench environment and compact state/pixel dataset loading.
 
-PathBridger_dist deliberately supports only offline, state-vector OGBench data.
-Environment wrappers, pixels, frame stacks, replay buffers, and non-OGBench
-dataset adapters belong outside this distribution.
+The state and visual entry points are intentionally separate.  In particular,
+the visual loader drops actions and every non-whitelisted field before a pixel
+algorithm can receive the offline data.
 """
 
 from __future__ import annotations
@@ -29,14 +29,23 @@ def _is_validation_file(path: Path) -> bool:
     )
 
 
-def _merge_compact_shards(ogbench: Any, paths: Sequence[Path]) -> dict[str, np.ndarray]:
+def _merge_compact_shards(
+    ogbench: Any,
+    paths: Sequence[Path],
+    *,
+    observation_dtype: Any = np.float32,
+) -> dict[str, np.ndarray]:
     if not paths:
         raise ValueError('Cannot merge an empty shard list.')
 
     merged_parts: dict[str, list[np.ndarray]] = {}
     expected_keys: set[str] | None = None
     for path in paths:
-        raw = ogbench.load_dataset(str(path), compact_dataset=True)
+        raw = ogbench.load_dataset(
+            str(path),
+            ob_dtype=observation_dtype,
+            compact_dataset=True,
+        )
         if not isinstance(raw, Mapping):
             raise TypeError(f'OGBench shard {path} did not contain a dataset mapping.')
         keys = set(raw)
@@ -72,6 +81,69 @@ def _as_state_dataset(raw: Mapping[str, Any], *, split: str) -> Dataset:
     return dataset
 
 
+def _as_pixel_dataset(raw: Mapping[str, Any], *, split: str) -> Dataset:
+    """Build the strict offline pixel view before returning to an algorithm."""
+
+    if 'observations' not in raw or 'terminals' not in raw:
+        raise ValueError(
+            f'{split} visual data must contain observations and terminals.'
+        )
+    observations = np.asarray(raw['observations'])
+    terminals = np.asarray(raw['terminals'], dtype=np.float32).reshape(-1)
+    if observations.ndim != 4 or observations.shape[-1] != 3:
+        raise ValueError(
+            f'{split} visual observations must have shape [N, H, W, 3], '
+            f'got {observations.shape}.'
+        )
+    if observations.dtype != np.uint8:
+        raise ValueError(
+            f'{split} visual observations must be uint8, got {observations.dtype}.'
+        )
+    if len(observations) != len(terminals):
+        raise ValueError(
+            f'{split} visual observations and terminals have different lengths.'
+        )
+    # This is the action-free information boundary.  Do not pass `raw` to
+    # Dataset.create: it normally contains offline actions and rewards.
+    return Dataset.create(observations=observations, terminals=terminals)
+
+
+def _local_npz_paths(
+    dataset_name: str,
+    resolved_dir: Path | None,
+) -> list[Path]:
+    if resolved_dir is None or not resolved_dir.is_dir():
+        return []
+    npz_paths = sorted(path for path in resolved_dir.rglob('*.npz') if path.is_file())
+    name = str(dataset_name).lower()
+    named_paths = [
+        path
+        for path in npz_paths
+        if path.stem.lower() == name
+        or path.stem.lower().startswith(f'{name}-')
+        or path.stem.lower().startswith(f'{name}_')
+        or name in {parent.name.lower() for parent in path.parents}
+    ]
+    if named_paths:
+        return named_paths
+
+    conventional_roots = {'train', 'val', 'validation'}
+    relative_parts = [path.relative_to(resolved_dir).parts for path in npz_paths]
+    conventional_layout = all(
+        len(parts) == 1 or parts[0].lower() in conventional_roots
+        for parts in relative_parts
+    )
+    has_train_and_val = (
+        any(not _is_validation_file(path) for path in npz_paths)
+        and any(_is_validation_file(path) for path in npz_paths)
+    )
+    if resolved_dir.name.lower() == name or (
+        conventional_layout and has_train_and_val
+    ):
+        return npz_paths
+    return []
+
+
 def make_env_and_datasets(
     dataset_name: str,
     dataset_dir: str | Path | None = None,
@@ -101,46 +173,7 @@ def make_env_and_datasets(
     if dataset_dir is not None and str(dataset_dir).strip():
         resolved_dir = Path(dataset_dir).expanduser()
 
-    npz_paths: list[Path] = []
-    if resolved_dir is not None and resolved_dir.is_dir():
-        npz_paths = sorted(path for path in resolved_dir.rglob('*.npz') if path.is_file())
-        # A normal OGBench cache may contain many unrelated datasets.  Prefer
-        # files named for this dataset; fall back to all files only for a
-        # dedicated shard directory with generic train/val shard names.
-        name = str(dataset_name).lower()
-        named_paths = [
-            path
-            for path in npz_paths
-            if path.stem.lower() == name
-            or path.stem.lower().startswith(f'{name}-')
-            or path.stem.lower().startswith(f'{name}_')
-            or name in {parent.name.lower() for parent in path.parents}
-        ]
-        if named_paths:
-            npz_paths = named_paths
-        else:
-            # Generic shard names are accepted only in a directory dedicated
-            # to this dataset (or a conventional direct train/val layout).
-            conventional_roots = {'train', 'val', 'validation'}
-            relative_parts = [
-                path.relative_to(resolved_dir).parts for path in npz_paths
-            ]
-            conventional_layout = all(
-                len(parts) == 1 or parts[0].lower() in conventional_roots
-                for parts in relative_parts
-            )
-            has_train_and_val = (
-                any(not _is_validation_file(path) for path in npz_paths)
-                and any(_is_validation_file(path) for path in npz_paths)
-            )
-            use_generic_shards = (
-                resolved_dir.name.lower() == name
-                or (conventional_layout and has_train_and_val)
-            )
-            if not use_generic_shards:
-                # This looks like a shared cache with no files for
-                # dataset_name. Let OGBench resolve/download it normally.
-                npz_paths = []
+    npz_paths = _local_npz_paths(dataset_name, resolved_dir)
 
     if npz_paths:
         train_paths = [path for path in npz_paths if not _is_validation_file(path)]
@@ -168,4 +201,72 @@ def make_env_and_datasets(
     return env, train_dataset, val_dataset
 
 
-__all__ = ['make_env_and_datasets']
+def make_pixel_env_and_datasets(
+    dataset_name: str,
+    dataset_dir: str | Path | None = None,
+    *,
+    allow_download: bool = False,
+    **env_kwargs: Any,
+) -> tuple[Any, Dataset, Dataset]:
+    """Create an OGBench visual environment and strict action-free datasets.
+
+    This entry point accepts only ``visual-*`` OGBench tasks, keeps RGB arrays
+    as compact ``uint8`` values, and returns exactly ``observations`` and
+    ``terminals`` for both offline splits.
+    """
+
+    if 'visual-' not in str(dataset_name).lower():
+        raise ValueError(
+            'Pixel benchmarks require an official visual-* OGBench dataset name.'
+        )
+    try:
+        import ogbench
+    except ImportError as exc:
+        raise ImportError(
+            'OGBench is required to create visual environments and datasets.'
+        ) from exc
+
+    resolved_dir = None
+    if dataset_dir is not None and str(dataset_dir).strip():
+        resolved_dir = Path(dataset_dir).expanduser()
+    lookup_dir = resolved_dir or Path('~/.ogbench/data').expanduser()
+    npz_paths = _local_npz_paths(dataset_name, lookup_dir)
+    if npz_paths:
+        train_paths = [path for path in npz_paths if not _is_validation_file(path)]
+        val_paths = [path for path in npz_paths if _is_validation_file(path)]
+        if not train_paths or not val_paths:
+            raise ValueError(
+                f'dataset_dir={resolved_dir} must contain both train and validation '
+                f'NPZ files; found {len(train_paths)} train and {len(val_paths)} '
+                'validation files.'
+            )
+        env = ogbench.make_env_and_datasets(dataset_name, env_only=True, **env_kwargs)
+        train_raw = _merge_compact_shards(
+            ogbench, train_paths, observation_dtype=np.uint8
+        )
+        val_raw = _merge_compact_shards(
+            ogbench, val_paths, observation_dtype=np.uint8
+        )
+    elif allow_download:
+        load_kwargs = dict(env_kwargs)
+        if resolved_dir is not None:
+            load_kwargs['dataset_dir'] = str(resolved_dir)
+        env, train_raw, val_raw = ogbench.make_env_and_datasets(
+            dataset_name,
+            compact_dataset=True,
+            **load_kwargs,
+        )
+    else:
+        raise FileNotFoundError(
+            f'No local NPZ files found for {dataset_name!r} under {lookup_dir}. '
+            'Provision the visual dataset explicitly or pass '
+            '--allow_dataset_download=true.'
+        )
+    return (
+        env,
+        _as_pixel_dataset(train_raw, split='training'),
+        _as_pixel_dataset(val_raw, split='validation'),
+    )
+
+
+__all__ = ['make_env_and_datasets', 'make_pixel_env_and_datasets']

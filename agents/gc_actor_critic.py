@@ -347,6 +347,9 @@ def get_config(algorithm: str = 'sac') -> ml_collections.ConfigDict:
             policy_delay=2,
             target_noise=0.2,
             target_noise_clip=0.5,
+            collection_noise_initial=0.2,
+            collection_noise_final=0.05,
+            collection_noise_decay_steps=100_000,
             batch_size=256,
             her_probability=0.8,
         )

@@ -7,6 +7,8 @@ from agents.mscp import MSCPAgent
 from agents.online_idm import OnlineIDMAgent, PBFOnlineIDMPolicy
 from agents.oso_decqn import OSODecQNAgent
 from agents.passive_hiql import PassiveHIQLAgent
+from agents.pixel_lapo import PixelLAPOAgent
+from agents.pixel_drq import PixelDrQAgent
 
 
 __all__ = [
@@ -18,5 +20,7 @@ __all__ = [
     'PBFOnlineIDMPolicy',
     'PassiveHIQLAgent',
     'PathBridgerAgent',
+    'PixelLAPOAgent',
+    'PixelDrQAgent',
     'get_config',
 ]

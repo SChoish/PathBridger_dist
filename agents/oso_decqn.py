@@ -267,6 +267,9 @@ def get_config() -> ml_collections.ConfigDict:
             beta_min=0.0,
             beta_decrement=0.1,
             beta_interval=100_000,
+            collection_noise_initial=0.2,
+            collection_noise_final=0.05,
+            collection_noise_decay_steps=100_000,
             native_pseudo_action=False,
         )
     )

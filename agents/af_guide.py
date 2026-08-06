@@ -149,6 +149,7 @@ class AFGuideAgent(flax.struct.PyTreeNode):
             valid_count = jnp.maximum(jnp.sum(guide_valid), 1.0)
             valid_fraction = jnp.mean(guide_valid)
             behavior_goals = batch.get('behavior_goals', batch['goals'])
+            behavior_masks = batch.get('behavior_masks', batch['masks'])
             next_mean, next_log_std = self.network.select('actor')(
                 batch['next_observations'], batch['goals']
             )
@@ -192,7 +193,9 @@ class AFGuideAgent(flax.struct.PyTreeNode):
             )
             guide_target = jax.lax.stop_gradient(
                 guide_reward
-                + float(self.config['discount']) * batch['masks'] * target_guide
+                + float(self.config['discount'])
+                * behavior_masks
+                * target_guide
             )
             q1, q2 = self.network.select('critic')(
                 batch['observations'], batch['goals'], batch['actions'], params=params
