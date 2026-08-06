@@ -55,9 +55,12 @@ Its primary sample-efficiency statistic is AUC@250k; AUC@1M and Success@1M are
 reported separately.
 
 `train_af.py` writes `offline.csv`, `online.csv`, `eval.csv`, immutable
-provenance metadata, and component-wise checkpoints.  Evaluate one checkpoint
-with `evaluate_af.py --checkpoint=<step_*.pkl>`.  Generate the staged P0 smoke
-manifest and aggregate completed runs with:
+provenance metadata, and component-wise checkpoints.  Soft-stop
+(`SIGTERM`/`SIGINT`) emergency-saves after the current step; online ckpts
+default to `--save_replay` and can resume via `--af_restore_path` (see
+[`docs/action_free_o2o_protocol.md`](docs/action_free_o2o_protocol.md)).
+Evaluate one checkpoint with `evaluate_af.py --checkpoint=<step_*.pkl>`.
+Generate the staged P0 smoke manifest and aggregate completed runs with:
 
 ```bash
 python scripts/make_af_manifest.py --suite=p0_smoke --output=p0_smoke.csv

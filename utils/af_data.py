@@ -422,18 +422,51 @@ class OnlineReplayBuffer:
             'capacity': self.capacity,
             'pointer': self.pointer,
             'size': self.size,
-            'observations': self.observations,
-            'actions': self.actions,
-            'next_observations': self.next_observations,
-            'goals': self.goals,
-            'rewards': self.rewards,
-            'masks': self.masks,
-            'desired_next': self.desired_next,
-            'desired_next_valid': self.desired_next_valid,
-            'episode_ids': self.episode_ids,
-            'timesteps': self.timesteps,
+            'observations': self.observations.copy(),
+            'actions': self.actions.copy(),
+            'next_observations': self.next_observations.copy(),
+            'goals': self.goals.copy(),
+            'rewards': self.rewards.copy(),
+            'masks': self.masks.copy(),
+            'desired_next': self.desired_next.copy(),
+            'desired_next_valid': self.desired_next_valid.copy(),
+            'episode_ids': self.episode_ids.copy(),
+            'timesteps': self.timesteps.copy(),
             'rng_state': self.rng.bit_generator.state,
         }
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        if int(state['capacity']) != self.capacity:
+            raise ValueError(
+                f'Replay capacity mismatch: ckpt={state["capacity"]} vs '
+                f'buffer={self.capacity}.'
+            )
+        for key in (
+            'observations',
+            'actions',
+            'next_observations',
+            'goals',
+            'rewards',
+            'masks',
+            'desired_next',
+            'desired_next_valid',
+            'episode_ids',
+            'timesteps',
+        ):
+            getattr(self, key)[:] = state[key]
+        self.pointer = int(state['pointer'])
+        self.size = int(state['size'])
+        self.rng.bit_generator.state = state['rng_state']
+        self._episode_slots = defaultdict(list)
+        occupied = self.capacity if self.size >= self.capacity else self.size
+        for slot in range(occupied):
+            episode_id = int(self.episode_ids[slot])
+            if episode_id < 0:
+                continue
+            bisect.insort(
+                self._episode_slots[episode_id],
+                (int(self.timesteps[slot]), slot),
+            )
 
 
 __all__ = [

@@ -150,6 +150,7 @@ launch_one() {
     --replay_capacity=1000000
     --eval_steps="$EVAL_STEPS"
     --eval_episodes=10
+    --save_replay
     --nouse_tqdm
     --save_dir=exp/
   )
