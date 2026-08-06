@@ -373,8 +373,12 @@ class PixelLAPOAgent(flax.struct.PyTreeNode):
     ) -> 'PixelLAPOAgent':
         config = dict(config)
         images = jnp.asarray(example_images, dtype=jnp.uint8)
-        if images.ndim != 4 or images.shape[-1] != 3:
-            raise ValueError('Pixel LAPO examples must have shape [B, H, W, 3].')
+        expected_channels = 3 * int(config['frame_stack'])
+        if images.ndim != 4 or images.shape[-1] != expected_channels:
+            raise ValueError(
+                'Pixel LAPO examples must have shape [B, H, W, '
+                f'{expected_channels}] for frame_stack={config["frame_stack"]}.'
+            )
         image_shape = tuple(int(value) for value in images.shape[1:])
         if image_shape[0] % 16 or image_shape[1] % 16:
             raise ValueError('Image height and width must be divisible by 16.')
@@ -454,6 +458,7 @@ def get_config() -> ml_collections.ConfigDict:
             stage2_steps=60_000,
             offline_batch_size=128,
             online_batch_size=128,
+            frame_stack=3,
         )
     )
 

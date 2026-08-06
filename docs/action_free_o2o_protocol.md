@@ -164,21 +164,43 @@ runs with `python aggregate_results.py --root=<experiment-root>`.
 step, writing a checkpoint, then exiting.  Markers are
 `EMERGENCY_SAVE_{offline|online}_step{N}` under the run directory.
 
-Online checkpoints (`checkpoints/step_{N}.pkl`, format version 2) include agent
-weights, optional frozen planner, replay arrays when `--save_replay` (default
-true), and runtime RNG / episode counters.  Resume with:
+Online checkpoints use two storage tiers:
+
+- `checkpoints/step_{N}.pkl` contains the agent, optional frozen planner, and
+  metadata for evaluation. It deliberately omits replay and runtime state.
+- `checkpoints/resume_step_{N}.pkl` additionally contains compact replay and
+  runtime/RNG state. Replay serialization stores valid slots only. These files
+  are written every `--resume_interval=50000` steps by default, and only the
+  newest `--resume_keep=2` are retained.
+
+Emergency soft-stop always writes a replay-bearing resume checkpoint. Resume
+with:
 
 ```bash
 python train_af.py \
   --algorithm=pbf_online_idm \
   --pbf=configs/pbf_af/antmaze_large.py \
   --af_restore_path=exp/pbf_af_o2o/<run_group>/<exp>/checkpoints \
+  --af_restore_step=-1 \
   --online_steps=250000 \
+  --resume_in_place \
   --save_replay
 ```
 
-`--af_restore_step=-1` (default) picks the newest `step_*.pkl` or
-`offline_step_*.pkl`.  Online resume skips offline and continues from
-`step+1`.  Mid-episode physics is not restored (OGBench limitation); agent,
-replay, and RNGs are restored and a fresh episode is opened.  Offline PBF
-resume continues to use `--pbf_restore_path` / `--pbf_restore_step`.
+`--af_restore_step=-1` (default) picks the newest eval, resume, or offline
+checkpoint; periodic resume files are written after same-step eval files.
+When an explicit step is requested, `resume_step_{N}.pkl` is preferred.
+
+Benchmark-safe resume defaults to `--resume_in_place`. It requires a
+replay-bearing checkpoint, appends the original `online.csv` and `eval.csv`,
+preserves the original protocol/config/offline-step metadata, and records the
+parent checkpoint plus every resume event. The aggregator rejects non-in-place
+partial runs. Before training, in-place resume also rejects non-monotonic logs
+or a checkpoint older than the last existing CSV step. Aggregation also rejects
+curves without step 0, duplicate/non-increasing evaluation steps, and
+interrupted curves that do not reach their declared budget.
+
+Mid-episode physics is not restored (OGBench limitation). Agent, replay, and
+RNGs are restored and a fresh episode is opened under a new episode ID, so HER
+cannot cross the discontinuity. Offline PBF resume continues to use
+`--pbf_restore_path` / `--pbf_restore_step`.

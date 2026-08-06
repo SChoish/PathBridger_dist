@@ -9,6 +9,7 @@ from agents.oso_decqn import OSODecQNAgent
 from agents.passive_hiql import PassiveHIQLAgent
 from agents.pixel_lapo import PixelLAPOAgent
 from agents.pixel_drq import PixelDrQAgent
+from agents.pixel_pathbridger import PixelPathBridgerAgent
 
 
 __all__ = [
@@ -22,5 +23,6 @@ __all__ = [
     'PathBridgerAgent',
     'PixelLAPOAgent',
     'PixelDrQAgent',
+    'PixelPathBridgerAgent',
     'get_config',
 ]

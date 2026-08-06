@@ -23,16 +23,21 @@ from envs.env_utils import make_pixel_env_and_datasets
 from utils.af_checkpoints import save_af_checkpoint
 from utils.evaluation import DEFAULT_TASK_IDS, _info_success, _max_episode_steps
 from utils.log_utils import CsvLogger, get_exp_name
-from utils.pixel_data import ActionFreePixelTrajectoryData, PixelReplayBuffer
+from utils.pixel_data import (
+    ActionFreePixelTrajectoryData,
+    PixelReplayBuffer,
+    repeat_pixel_frame,
+    stack_pixel_history,
+)
 from utils.pixel_evaluation import evaluate_pixel_policy
 
 
 FLAGS = flags.FLAGS
-PROTOCOL_VERSION = 'pixel_o2o_v2'
+PROTOCOL_VERSION = 'pixel_o2o_v3'
 
 flags.DEFINE_enum(
     'algorithm',
-    'gc_pixel_lapo',
+    'pixel_pathbridger_online_idm',
     PIXEL_ALGORITHMS,
     'Visual algorithm. Adaptation status is recorded in metadata.json.',
 )
@@ -74,7 +79,9 @@ flags.DEFINE_string(
 flags.DEFINE_integer('online_steps', 1_000_000, 'Primitive online environment steps.')
 flags.DEFINE_integer('random_steps', 10_000, 'Uniform-random bootstrap steps.')
 flags.DEFINE_integer('update_start', 1_000, 'Replay size at the first online update.')
-flags.DEFINE_integer('replay_capacity', 20_000, 'Number of uint8 visual transitions.')
+flags.DEFINE_integer('replay_capacity', 50_000, 'Number of indexed visual transitions.')
+flags.DEFINE_integer('frame_stack', 3, 'Consecutive RGB frames per policy observation.')
+flags.DEFINE_float('her_probability', 0.8, 'Future-image HER relabel probability.')
 flags.DEFINE_integer('log_interval', 1_000, 'CSV logging interval.')
 flags.DEFINE_string(
     'eval_steps',
@@ -119,19 +126,23 @@ def _write_metadata(path: Path, payload: dict) -> None:
 
 
 def _offline_module_names(algorithm: str) -> tuple[str, ...]:
-    if algorithm == 'gc_pixel_lapo':
+    if algorithm == 'pixel_pathbridger_online_idm':
+        return ('encoder', 'bridge', 'world_decoder')
+    if algorithm == 'gc_pixel_lapo_decoder':
         return ('latent_model', 'latent_policy')
     if algorithm.startswith('vip_'):
         return ('encoder',)
-    if algorithm == 'gc_pixel_apv':
+    if algorithm == 'gc_pixel_apv_style_drq':
         return ('encoder', 'video_predictor', 'world_decoder')
     return ()
 
 
 def _frozen_module_names(algorithm: str) -> tuple[str, ...]:
-    if algorithm == 'gc_pixel_lapo':
+    if algorithm == 'pixel_pathbridger_online_idm':
+        return ('encoder', 'target_encoder', 'bridge', 'world_decoder')
+    if algorithm == 'gc_pixel_lapo_decoder':
         return ('latent_model', 'latent_policy')
-    if algorithm == 'vip_frozen_gc_drqv2':
+    if algorithm == 'vip_style_frozen_gc_drqv2':
         return ('encoder', 'target_encoder')
     return ()
 
@@ -148,8 +159,12 @@ def _make_env_and_data(algorithm: str):
             dataset_dir=FLAGS.dataset_dir or None,
             allow_download=FLAGS.allow_dataset_download,
         )
-        data = ActionFreePixelTrajectoryData(train_dataset, seed=FLAGS.seed)
-        return env, data, data.observations[:2]
+        data = ActionFreePixelTrajectoryData(
+            train_dataset,
+            seed=FLAGS.seed,
+            frame_stack=FLAGS.frame_stack,
+        )
+        return env, data, data.example_images
 
     import ogbench
 
@@ -160,7 +175,12 @@ def _make_env_and_data(algorithm: str):
     )
     observation = _frame(observation, name='observation')
     goal = _frame(info['goal'], name='goal')
-    return env, None, np.stack([observation, goal])
+    return env, None, np.stack(
+        [
+            repeat_pixel_frame(observation, FLAGS.frame_stack),
+            repeat_pixel_frame(goal, FLAGS.frame_stack),
+        ]
+    )
 
 
 def main(_):
@@ -172,6 +192,10 @@ def main(_):
         raise ValueError('Require replay_capacity >= update_start >= 1.')
     if FLAGS.eval_episodes < 0:
         raise ValueError('eval_episodes cannot be negative.')
+    if FLAGS.frame_stack < 1:
+        raise ValueError('frame_stack must be positive.')
+    if not 0.0 <= FLAGS.her_probability <= 1.0:
+        raise ValueError('her_probability must lie in [0, 1].')
 
     random.seed(FLAGS.seed)
     np.random.seed(FLAGS.seed)
@@ -191,6 +215,7 @@ def main(_):
     overrides = json.loads(FLAGS.config_json) if FLAGS.config_json else {}
     if not isinstance(overrides, dict):
         raise ValueError('config_json must decode to a JSON object.')
+    overrides.setdefault('frame_stack', int(FLAGS.frame_stack))
     agent, config = create_pixel_algorithm(
         algorithm,
         seed=FLAGS.seed,
@@ -214,9 +239,9 @@ def main(_):
     )
     if min(offline_steps, stage1_steps, stage2_steps) < 0:
         raise ValueError('Offline training steps cannot be negative.')
-    if algorithm != 'gc_pixel_lapo' and (stage1_steps or stage2_steps):
+    if algorithm != 'gc_pixel_lapo_decoder' and (stage1_steps or stage2_steps):
         stage1_steps = stage2_steps = 0
-    if algorithm == 'gc_pixel_lapo':
+    if algorithm == 'gc_pixel_lapo_decoder':
         offline_steps = stage1_steps + stage2_steps
     if pixel_data is None and offline_steps:
         raise ValueError(f'{algorithm} is online-only and cannot use offline_steps.')
@@ -231,7 +256,7 @@ def main(_):
     checkpoint_dir = run_dir / 'checkpoints'
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-    if algorithm == 'gc_pixel_lapo':
+    if algorithm == 'gc_pixel_lapo_decoder':
         for stage, steps in ((1, stage1_steps), (2, stage2_steps)):
             logger = CsvLogger(run_dir / f'offline_stage{stage}.csv')
             iterator = range(1, steps + 1)
@@ -240,7 +265,13 @@ def main(_):
                     iterator, desc=f'{algorithm}-stage{stage}', dynamic_ncols=True
                 )
             for step in iterator:
-                agent, info = agent.offline_update(pixel_data.sample(batch_size), stage=stage)
+                agent, info = agent.offline_update(
+                    pixel_data.sample(
+                        batch_size,
+                        path_horizon=int(config.get('path_horizon', 5)),
+                    ),
+                    stage=stage,
+                )
                 if step % FLAGS.log_interval == 0 or step == steps:
                     logger.log(_host_metrics(info), step)
             logger.close()
@@ -250,7 +281,12 @@ def main(_):
         if FLAGS.use_tqdm:
             iterator = tqdm.tqdm(iterator, desc=f'{algorithm}-offline', dynamic_ncols=True)
         for step in iterator:
-            agent, info = agent.offline_update(pixel_data.sample(batch_size))
+            agent, info = agent.offline_update(
+                pixel_data.sample(
+                    batch_size,
+                    path_horizon=int(config.get('path_horizon', 5)),
+                )
+            )
             if step % FLAGS.log_interval == 0 or step == offline_steps:
                 logger.log(_host_metrics(info), step)
         logger.close()
@@ -269,6 +305,8 @@ def main(_):
         'random_steps': int(FLAGS.random_steps),
         'update_start': int(FLAGS.update_start),
         'replay_capacity': int(FLAGS.replay_capacity),
+        'frame_stack': int(FLAGS.frame_stack),
+        'her_probability': float(FLAGS.her_probability),
         'eval_steps': list(eval_steps),
         'eval_episodes_per_task': int(FLAGS.eval_episodes),
         'evaluation_task_ids': list(DEFAULT_TASK_IDS),
@@ -312,6 +350,8 @@ def main(_):
         'random_steps': int(FLAGS.random_steps),
         'update_start': int(FLAGS.update_start),
         'replay_capacity': int(FLAGS.replay_capacity),
+        'frame_stack': int(FLAGS.frame_stack),
+        'her_probability': float(FLAGS.her_probability),
         'eval_steps': list(eval_steps),
         'eval_episodes_per_task': int(FLAGS.eval_episodes),
         'evaluation_task_ids': list(DEFAULT_TASK_IDS),
@@ -325,9 +365,10 @@ def main(_):
 
     replay = PixelReplayBuffer(
         FLAGS.replay_capacity,
-        image_shape,
+        tuple(int(value) for value in env.observation_space.shape),
         action_shape,
         seed=FLAGS.seed,
+        frame_stack=FLAGS.frame_stack,
     )
     run_metadata['replay_allocated_bytes'] = replay.allocated_bytes
     _write_metadata(run_dir / 'metadata.json', run_metadata)
@@ -340,6 +381,7 @@ def main(_):
     online_logger = CsvLogger(run_dir / 'online.csv')
     eval_logger = CsvLogger(run_dir / 'eval.csv')
     max_episode_steps = _max_episode_steps(env)
+    episode_id = 0
     timestep = 0
     task_id = int(task_rng.choice(DEFAULT_TASK_IDS))
     observation, reset_info = env.reset(
@@ -347,6 +389,7 @@ def main(_):
     )
     observation = _frame(observation, name='observation')
     goal = _frame(reset_info['goal'], name='goal')
+    frame_history = [observation.copy()]
     start_time = time.time()
     last_info = {}
 
@@ -392,14 +435,16 @@ def main(_):
     if FLAGS.use_tqdm and FLAGS.online_steps:
         iterator = tqdm.tqdm(iterator, desc=f'{algorithm}-online', dynamic_ncols=True)
     for step in iterator:
+        policy_observation = stack_pixel_history(frame_history, FLAGS.frame_stack)
+        policy_goal = repeat_pixel_frame(goal, FLAGS.frame_stack)
         if step <= FLAGS.random_steps:
             action = exploration_rng.uniform(action_low, action_high).astype(np.float32)
         else:
             action = np.asarray(
                 jax.device_get(
                     agent.sample_actions(
-                        observation[None, ...],
-                        goal[None, ...],
+                        policy_observation[None, ...],
+                        policy_goal[None, ...],
                         seed=jax.random.PRNGKey(FLAGS.seed * 1_000_003 + step),
                         temperature=1.0,
                     )[0]
@@ -417,16 +462,28 @@ def main(_):
             goal=goal,
             reward=0.0 if success else -1.0,
             mask=0.0 if success or bool(terminated) else 1.0,
+            episode_id=episode_id,
+            timestep=timestep,
         )
+        frame_history.append(next_observation.copy())
         observation = next_observation
         timestep += 1
 
         if replay.size >= FLAGS.update_start:
-            agent, last_info = agent.online_update(
-                replay.sample(int(config['online_batch_size']))
+            online_batch = replay.sample(
+                int(config['online_batch_size']),
+                her_probability=float(FLAGS.her_probability),
             )
+            replay_info = {
+                key: online_batch.pop(key)
+                for key in tuple(online_batch)
+                if key.startswith('replay/')
+            }
+            agent, last_info = agent.online_update(online_batch)
+            last_info = {**last_info, **replay_info}
 
         if terminated or truncated or timestep >= max_episode_steps:
+            episode_id += 1
             timestep = 0
             task_id = int(task_rng.choice(DEFAULT_TASK_IDS))
             observation, reset_info = env.reset(
@@ -434,6 +491,7 @@ def main(_):
             )
             observation = _frame(observation, name='observation')
             goal = _frame(reset_info['goal'], name='goal')
+            frame_history = [observation.copy()]
 
         if step % FLAGS.log_interval == 0 or step == FLAGS.online_steps:
             metrics = _host_metrics(last_info)

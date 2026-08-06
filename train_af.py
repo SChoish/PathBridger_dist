@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import csv
 import dataclasses
 import hashlib
 import json
@@ -76,7 +77,22 @@ flags.DEFINE_integer('eval_episodes', 10, 'Episodes per task at intermediate eva
 flags.DEFINE_bool(
     'save_replay',
     True,
-    'Include replay arrays in online checkpoints (needed for exact online resume).',
+    'Write compact rotating resume checkpoints with replay and runtime.',
+)
+flags.DEFINE_bool(
+    'resume_in_place',
+    True,
+    'Append logs and metadata in the checkpoint run directory when restoring.',
+)
+flags.DEFINE_integer(
+    'resume_interval',
+    50_000,
+    'Primitive steps between replay-bearing resume checkpoints; zero disables.',
+)
+flags.DEFINE_integer(
+    'resume_keep',
+    2,
+    'Number of newest replay-bearing resume checkpoints to retain.',
 )
 flags.DEFINE_bool('use_tqdm', True, 'Display progress bars.')
 flags.DEFINE_string('pbf_restore_path', '', 'Optional pretrained action-free PBF checkpoint.')
@@ -126,17 +142,22 @@ def _resolve_af_restore_path(path: str, step: int) -> tuple[str | None, int | No
     candidate = Path(path)
     if candidate.is_dir():
         if step >= 0:
+            resume = candidate / f'resume_step_{step}.pkl'
             online = candidate / f'step_{step}.pkl'
             offline = candidate / f'offline_step_{step}.pkl'
+            if resume.is_file():
+                return str(resume), step
             if online.is_file():
                 return str(online), step
             if offline.is_file():
                 return str(offline), step
             raise FileNotFoundError(
-                f'No step_{step}.pkl or offline_step_{step}.pkl under {candidate}'
+                f'No resume_step_{step}.pkl, step_{step}.pkl, or '
+                f'offline_step_{step}.pkl under {candidate}'
             )
         matches = sorted(
             list(candidate.glob('step_*.pkl'))
+            + list(candidate.glob('resume_step_*.pkl'))
             + list(candidate.glob('offline_step_*.pkl')),
             key=lambda item: item.stat().st_mtime,
         )
@@ -149,12 +170,58 @@ def _resolve_af_restore_path(path: str, step: int) -> tuple[str | None, int | No
     if candidate.is_file():
         if step < 0:
             stem = candidate.stem
-            if stem.startswith('step_') or stem.startswith('offline_step_'):
+            if stem.startswith(
+                ('step_', 'resume_step_', 'offline_step_')
+            ):
                 step = int(stem.rsplit('_', 1)[-1])
             else:
                 step = 0
         return str(candidate), step
     raise FileNotFoundError(path)
+
+
+def _checkpoint_run_dir(path: str | os.PathLike[str]) -> Path:
+    checkpoint = Path(path).resolve()
+    if checkpoint.parent.name not in {'checkpoints', 'pbf_checkpoints'}:
+        raise ValueError(
+            'In-place resume requires a checkpoint under a run '
+            f'checkpoints directory, got {checkpoint}.'
+        )
+    return checkpoint.parent.parent
+
+
+def _rotate_resume_checkpoints(checkpoint_dir: str | os.PathLike[str], keep: int) -> None:
+    if keep < 1:
+        raise ValueError('resume_keep must be positive when resume saving is enabled.')
+    paths = sorted(
+        Path(checkpoint_dir).glob('resume_step_*.pkl'),
+        key=lambda path: int(path.stem.rsplit('_', 1)[-1]),
+    )
+    for path in paths[:-keep]:
+        path.unlink()
+
+
+def _validate_resume_log(
+    path: str | os.PathLike[str], checkpoint_step: int
+) -> None:
+    path = Path(path)
+    if not path.is_file() or not path.stat().st_size:
+        return
+    with path.open(newline='', encoding='utf-8') as file:
+        steps = [
+            int(row['step'])
+            for row in csv.DictReader(file)
+            if row.get('step', '') != ''
+        ]
+    if any(right <= left for left, right in zip(steps, steps[1:])):
+        raise ValueError(
+            f'Cannot resume into a non-monotonic existing log: {path}.'
+        )
+    if steps and steps[-1] > int(checkpoint_step):
+        raise ValueError(
+            f'Cannot resume checkpoint step {checkpoint_step} into {path}; '
+            f'the existing log already reaches step {steps[-1]}.'
+        )
 
 
 def _write_emergency_marker(run_dir: str, step: int, signum: int | None, phase: str) -> None:
@@ -255,6 +322,10 @@ def main(_):
         raise ValueError('random_steps cannot exceed online_steps.')
     if FLAGS.pbf_execute_horizon not in (1, 5):
         raise ValueError('pbf_execute_horizon must be 1 or 5.')
+    if FLAGS.resume_interval < 0:
+        raise ValueError('resume_interval cannot be negative.')
+    if FLAGS.resume_keep < 1:
+        raise ValueError('resume_keep must be positive.')
     random.seed(FLAGS.seed)
     np.random.seed(FLAGS.seed)
     task_rng = np.random.default_rng(FLAGS.seed + 17_003)
@@ -277,14 +348,6 @@ def main(_):
     metadata = algorithm_metadata(name)
     full_action_data = train_data if name == 'gc_sac_50_50' else None
 
-    exp_name = get_exp_name(FLAGS.seed, env_name=env_name, agent_name=name)
-    run_dir = os.path.abspath(
-        os.path.join(FLAGS.save_dir, 'pbf_af_o2o', FLAGS.run_group, exp_name)
-    )
-    checkpoint_dir = os.path.join(run_dir, 'checkpoints')
-    os.makedirs(checkpoint_dir, exist_ok=True)
-    stop_requested = {'flag': False, 'signum': None}
-    _install_soft_stop(stop_requested)
     af_restore_file, af_restore_step = _resolve_af_restore_path(
         FLAGS.af_restore_path, int(FLAGS.af_restore_step)
     )
@@ -292,6 +355,7 @@ def main(_):
     skip_offline = False
     online_start_step = 1
     offline_start_step = 1
+    resume_in_place = bool(af_restore_file and FLAGS.resume_in_place)
     if af_restore_file is not None:
         af_payload = load_af_checkpoint(af_restore_file)
         if str(af_payload.get('algorithm')) != name:
@@ -317,6 +381,57 @@ def main(_):
             )
         else:
             raise ValueError(f'Unsupported AF checkpoint phase={phase!r}')
+
+        if (
+            phase == 'online'
+            and resume_in_place
+            and af_payload.get('replay') is None
+        ):
+            raise ValueError(
+                'Benchmark-safe in-place resume requires a replay-bearing '
+                'resume_step_*.pkl checkpoint; lightweight eval checkpoints '
+                'cannot continue an aggregation-eligible run.'
+            )
+
+        checkpoint_metadata = af_payload.get('metadata') or {}
+        expected = {
+            'env_name': env_name,
+            'seed': int(FLAGS.seed),
+            'online_steps': int(FLAGS.online_steps),
+            'random_steps': int(FLAGS.random_steps),
+            'update_start': int(FLAGS.update_start),
+            'replay_capacity': int(FLAGS.replay_capacity),
+        }
+        mismatches = {
+            key: (checkpoint_metadata[key], value)
+            for key, value in expected.items()
+            if key in checkpoint_metadata and checkpoint_metadata[key] != value
+        }
+        if mismatches:
+            raise ValueError(
+                f'Resume changes benchmark-critical settings: {mismatches}.'
+            )
+
+    if resume_in_place:
+        run_dir = str(_checkpoint_run_dir(af_restore_file))
+        resume_logs = (
+            ('online.csv', 'eval.csv')
+            if str(af_payload.get('phase', 'online')) == 'online'
+            else ('offline.csv',)
+        )
+        for filename in resume_logs:
+            _validate_resume_log(
+                Path(run_dir, filename), int(af_payload['step'])
+            )
+    else:
+        exp_name = get_exp_name(FLAGS.seed, env_name=env_name, agent_name=name)
+        run_dir = os.path.abspath(
+            os.path.join(FLAGS.save_dir, 'pbf_af_o2o', FLAGS.run_group, exp_name)
+        )
+    checkpoint_dir = os.path.join(run_dir, 'checkpoints')
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    stop_requested = {'flag': False, 'signum': None}
+    _install_soft_stop(stop_requested)
 
     planner = None
     planner_config = None
@@ -347,7 +462,10 @@ def main(_):
         )
         if skip_offline:
             resolved_offline_steps = 0
-        offline_logger = CsvLogger(os.path.join(run_dir, 'offline.csv'))
+        offline_logger = CsvLogger(
+            os.path.join(run_dir, 'offline.csv'),
+            resume=resume_in_place and offline_start_step > 1,
+        )
         offline_start = offline_start_step
         if FLAGS.pbf_restore_path and FLAGS.pbf_restore_step > 0 and not skip_offline:
             offline_start = max(offline_start, int(FLAGS.pbf_restore_step) + 1)
@@ -401,7 +519,10 @@ def main(_):
             and not skip_offline
         ):
             agent = restore_af_agent(agent, af_payload)
-        offline_logger = CsvLogger(os.path.join(run_dir, 'offline.csv'))
+        offline_logger = CsvLogger(
+            os.path.join(run_dir, 'offline.csv'),
+            resume=resume_in_place and offline_start_step > 1,
+        )
         batch_size = int(
             resolved_config.get(
                 'offline_batch_size', resolved_config.get('batch_size', 1024)
@@ -486,6 +607,40 @@ def main(_):
         pbf_config=planner_config,
         planner_initial_digest=planner_digest,
     )
+    if af_payload is not None:
+        parent_metadata = dict(af_payload.get('metadata') or {})
+        metadata_path = Path(run_dir, 'metadata.json')
+        if resume_in_place and metadata_path.is_file():
+            parent_metadata.update(json.loads(metadata_path.read_text()))
+        for key in (
+            'protocol_version',
+            'protocol_id',
+            'protocol_suite',
+            'run_group',
+            'config_hash',
+            'offline_steps',
+        ):
+            if key in parent_metadata:
+                run_metadata[key] = parent_metadata[key]
+        resume_events = list(parent_metadata.get('resume_events', []))
+        resume_events.append(
+            {
+                'checkpoint': str(Path(af_restore_file).resolve()),
+                'resume_step': int(af_payload['step']),
+                'in_place': resume_in_place,
+                'timestamp': int(time.time()),
+            }
+        )
+        run_metadata.update(
+            parent_run_dir=str(_checkpoint_run_dir(af_restore_file)),
+            resume_step=int(af_payload['step']),
+            resume_checkpoint=str(Path(af_restore_file).resolve()),
+            resume_in_place=resume_in_place,
+            resume_events=resume_events,
+            aggregation_eligible=resume_in_place,
+        )
+    else:
+        run_metadata['aggregation_eligible'] = True
     Path(run_dir, 'metadata.json').write_text(
         json.dumps(run_metadata, indent=2, sort_keys=True) + '\n'
     )
@@ -498,8 +653,14 @@ def main(_):
     )
     eval_env = _make_eval_env(env_name) if FLAGS.eval_episodes > 0 else None
     eval_steps = _parse_eval_steps(FLAGS.eval_steps, FLAGS.online_steps)
-    online_logger = CsvLogger(os.path.join(run_dir, 'online.csv'))
-    eval_logger = CsvLogger(os.path.join(run_dir, 'eval.csv'))
+    online_logger = CsvLogger(
+        os.path.join(run_dir, 'online.csv'),
+        resume=resume_in_place and online_start_step > 1,
+    )
+    eval_logger = CsvLogger(
+        os.path.join(run_dir, 'eval.csv'),
+        resume=resume_in_place and online_start_step > 1,
+    )
     max_episode_steps = _max_episode_steps(env)
     episode_id = 0
     timestep = 0
@@ -583,8 +744,8 @@ def main(_):
             'exploration_rng_state': exploration_rng.bit_generator.state,
         }
 
-    def evaluate_and_save(step, *, force_replay: bool = False):
-        if eval_env is not None and not force_replay:
+    def evaluate_and_save(step):
+        if eval_env is not None:
             metrics = evaluate_policy(
                 current_policy(),
                 eval_env,
@@ -597,9 +758,6 @@ def main(_):
                 ),
             )
             eval_logger.log(metrics, step)
-        elif eval_env is not None and force_replay:
-            # Soft-stop: skip expensive eval; still persist weights/replay/runtime.
-            pass
         save_af_checkpoint(
             os.path.join(checkpoint_dir, f'step_{step}.pkl'),
             algorithm=name,
@@ -609,14 +767,26 @@ def main(_):
             metadata=run_metadata,
             planner=planner,
             planner_config=planner_config,
-            replay_state=(
-                replay.state_dict()
-                if (FLAGS.save_replay or force_replay)
-                else None
-            ),
+            replay_state=None,
+            runtime=None,
+            phase='online',
+        )
+
+    def save_resume_checkpoint(step):
+        save_af_checkpoint(
+            os.path.join(checkpoint_dir, f'resume_step_{step}.pkl'),
+            algorithm=name,
+            agent=agent,
+            step=step,
+            config=resolved_config,
+            metadata=run_metadata,
+            planner=planner,
+            planner_config=planner_config,
+            replay_state=replay.state_dict(),
             runtime=_runtime_state(step),
             phase='online',
         )
+        _rotate_resume_checkpoints(checkpoint_dir, int(FLAGS.resume_keep))
 
     if 0 in eval_steps and online_start_step <= 1 and af_payload is None:
         evaluate_and_save(0)
@@ -815,8 +985,16 @@ def main(_):
         emergency = bool(stop_requested['flag'])
         if step in eval_steps:
             evaluate_and_save(step)
-        elif emergency:
-            evaluate_and_save(step, force_replay=True)
+        periodic_resume = bool(
+            FLAGS.save_replay
+            and FLAGS.resume_interval > 0
+            and (
+                step % int(FLAGS.resume_interval) == 0
+                or step == FLAGS.online_steps
+            )
+        )
+        if periodic_resume or emergency:
+            save_resume_checkpoint(step)
         if emergency:
             _write_emergency_marker(
                 run_dir, step, stop_requested['signum'], 'online'

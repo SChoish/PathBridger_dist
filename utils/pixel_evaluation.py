@@ -9,6 +9,7 @@ import jax
 import numpy as np
 
 from utils.evaluation import DEFAULT_TASK_IDS, _info_success, _max_episode_steps
+from utils.pixel_data import repeat_pixel_frame, stack_pixel_history
 
 
 def _frame(value: Any, *, name: str) -> np.ndarray:
@@ -38,6 +39,10 @@ def evaluate_pixel_policy(
     action_low = np.asarray(env.action_space.low, dtype=np.float32)
     action_high = np.asarray(env.action_space.high, dtype=np.float32)
     max_steps = _max_episode_steps(env)
+    config = getattr(policy, 'config', {})
+    frame_stack = int(config.get('frame_stack', 1))
+    if frame_stack < 1:
+        raise ValueError('Pixel policy frame_stack must be positive.')
     rng = jax.random.PRNGKey(int(seed))
     metrics: dict[str, float | int] = {}
     task_rates = []
@@ -52,14 +57,17 @@ def evaluate_pixel_policy(
                 raise RuntimeError('Visual OGBench reset must provide info["goal"].')
             observation = _frame(observation, name='observation')
             goal = _frame(reset_info['goal'], name='goal')
+            history = [observation.copy()]
+            policy_goal = repeat_pixel_frame(goal, frame_stack)
             success = False
             terminated = truncated = False
             step = 0
             while step < max_steps and not (terminated or truncated):
                 rng, action_rng = jax.random.split(rng)
+                policy_observation = stack_pixel_history(history, frame_stack)
                 action = policy.sample_actions(
-                    observation[None, ...],
-                    goal[None, ...],
+                    policy_observation[None, ...],
+                    policy_goal[None, ...],
                     seed=action_rng,
                     temperature=0.0,
                 )
@@ -73,6 +81,7 @@ def evaluate_pixel_policy(
                     np.clip(action[0], action_low, action_high)
                 )
                 observation = _frame(observation, name='observation')
+                history.append(observation.copy())
                 success = success or _info_success(info)
                 step += 1
             successes.append(float(success))

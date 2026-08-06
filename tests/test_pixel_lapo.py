@@ -29,6 +29,7 @@ def _config():
         code_dim=4,
         offline_batch_size=2,
         online_batch_size=2,
+        frame_stack=1,
     )
     return config
 
@@ -55,6 +56,8 @@ def test_pixel_loader_and_sampler_enforce_action_free_uint8_boundary():
         'masks',
         'indices',
         'goal_indices',
+        'path_indices',
+        'path_observations',
     }
     assert np.all(batch['goal_indices'] > batch['indices'])
     assert np.all(
@@ -97,31 +100,77 @@ def test_pixel_loader_does_not_download_without_explicit_opt_in(tmp_path):
 
 
 def test_pixel_replay_preserves_compact_storage_and_samples():
-    replay = PixelReplayBuffer(3, (32, 32, 3), (2,), seed=0)
-    frame = _pixels()[0]
+    replay = PixelReplayBuffer(3, (32, 32, 3), (2,), seed=0, frame_stack=3)
+    frames = _pixels()
     replay.add(
-        observation=frame,
+        observation=frames[0],
         action=np.array([0.1, -0.2], np.float32),
-        next_observation=frame,
-        goal=frame,
+        next_observation=frames[1],
+        goal=frames[5],
         reward=-1.0,
         mask=1.0,
+        episode_id=0,
+        timestep=0,
     )
-    assert replay.observations.dtype == np.uint8
-    assert replay.allocated_bytes == sum(
-        array.nbytes
-        for array in (
-            replay.observations,
-            replay.next_observations,
-            replay.goals,
-            replay.actions,
-            replay.rewards,
-            replay.masks,
-        )
+    before = replay.allocated_bytes
+    replay.add(
+        observation=frames[1],
+        action=np.array([0.0, 0.1], np.float32),
+        next_observation=frames[2],
+        goal=frames[5],
+        reward=-1.0,
+        mask=1.0,
+        episode_id=0,
+        timestep=1,
     )
-    batch = replay.sample(2)
-    assert batch['observations'].shape == (2, 32, 32, 3)
-    assert batch['actions'].shape == (2, 2)
+    # A consecutive transition adds only its new next frame; observation and
+    # episode goal are referenced by frame ID rather than copied again.
+    assert replay.allocated_bytes - before < 2 * frames[0].nbytes
+    batch = replay.sample(64, her_probability=1.0)
+    assert batch['observations'].shape == (64, 32, 32, 9)
+    assert batch['actions'].shape == (64, 2)
+    assert batch['replay/her_relabel_fraction'] == pytest.approx(1.0)
+    assert batch['replay/her_success_fraction'] > 0.0
+
+
+def test_pixel_replay_history_and_her_never_cross_episode_boundaries():
+    replay = PixelReplayBuffer(8, (32, 32, 3), (2,), seed=2, frame_stack=3)
+    zero = np.zeros((32, 32, 3), np.uint8)
+    one = np.ones((32, 32, 3), np.uint8)
+    two = np.full((32, 32, 3), 2, np.uint8)
+    nine = np.full((32, 32, 3), 9, np.uint8)
+    replay.add(
+        observation=zero,
+        action=np.zeros(2, np.float32),
+        next_observation=one,
+        goal=two,
+        reward=-1.0,
+        mask=1.0,
+        episode_id=0,
+        timestep=0,
+    )
+    replay.add(
+        observation=nine,
+        action=np.zeros(2, np.float32),
+        next_observation=two,
+        goal=zero,
+        reward=-1.0,
+        mask=1.0,
+        episode_id=1,
+        timestep=0,
+    )
+    second_slot = np.array([1], np.int64)
+    stacked = replay._stack_slots(second_slot, next_state=False)
+    np.testing.assert_array_equal(
+        stacked, np.concatenate([nine] * 3, axis=-1)[None]
+    )
+    for _ in range(20):
+        batch = replay.sample(64, her_probability=1.0)
+        for episode, goal in zip(
+            replay.episode_ids[batch['indices']], batch['goals']
+        ):
+            values = set(np.unique(goal).tolist())
+            assert values <= ({1} if episode == 0 else {2})
 
 
 def test_pixel_lapo_updates_only_the_declared_stage_module():
@@ -210,7 +259,7 @@ def test_pixel_manifest_is_isolated_and_has_locked_dimensions(tmp_path):
     for name, count in expected.items():
         rows = build_rows(root=tmp_path, python='python', suite_name=name)
         assert len(rows) == count
-        assert {row['algorithm'] for row in rows} == {'gc_pixel_lapo'}
+        assert {row['algorithm'] for row in rows} == {'gc_pixel_lapo_decoder'}
         assert all('train_pixel_lapo.py' in row['command'] for row in rows)
         assert all('train_af.py' not in row['command'] for row in rows)
     assert len(ENVIRONMENTS) == 8

@@ -8,8 +8,13 @@ from pathlib import Path
 import numpy as np
 from absl import app, flags
 
-from agents.pixel_registry import PIXEL_ALGORITHMS, create_pixel_algorithm
+from agents.pixel_registry import (
+    PIXEL_ALGORITHMS,
+    canonical_pixel_algorithm,
+    create_pixel_algorithm,
+)
 from utils.af_checkpoints import load_af_checkpoint, restore_af_agent
+from utils.pixel_data import repeat_pixel_frame
 from utils.pixel_evaluation import evaluate_pixel_policy
 
 
@@ -26,9 +31,12 @@ def main(_):
     if FLAGS.episodes < 1:
         raise ValueError('--episodes must be positive.')
     payload = load_af_checkpoint(FLAGS.checkpoint)
-    algorithm = str(payload['algorithm'])
+    checkpoint_algorithm = str(payload['algorithm'])
+    algorithm = canonical_pixel_algorithm(checkpoint_algorithm)
     if algorithm not in PIXEL_ALGORITHMS:
-        raise ValueError(f'Checkpoint algorithm {algorithm!r} is not a pixel algorithm.')
+        raise ValueError(
+            f'Checkpoint algorithm {checkpoint_algorithm!r} is not a pixel algorithm.'
+        )
     metadata = payload['metadata']
     if metadata.get('observation_modality') != 'rgb_uint8':
         raise ValueError('Checkpoint does not declare the RGB uint8 pixel protocol.')
@@ -39,8 +47,12 @@ def main(_):
     observation, info = env.reset(
         seed=FLAGS.seed, options={'task_id': 1, 'render_goal': False}
     )
+    frame_stack = int(payload['config'].get('frame_stack', 1))
     examples = np.stack(
-        [np.asarray(observation, dtype=np.uint8), np.asarray(info['goal'], dtype=np.uint8)]
+        [
+            repeat_pixel_frame(np.asarray(observation, dtype=np.uint8), frame_stack),
+            repeat_pixel_frame(np.asarray(info['goal'], dtype=np.uint8), frame_stack),
+        ]
     )
     template, _ = create_pixel_algorithm(
         algorithm,

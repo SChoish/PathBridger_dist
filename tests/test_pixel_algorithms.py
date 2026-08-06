@@ -31,6 +31,17 @@ def _data(seed=0):
     )
 
 
+def _stacked_data(seed=0):
+    return ActionFreePixelTrajectoryData(
+        {
+            'observations': _pixels(seed),
+            'terminals': np.array([0, 0, 1, 0, 0, 1], np.float32),
+        },
+        seed=seed,
+        frame_stack=3,
+    )
+
+
 def _config(name):
     config = get_pixel_config(name)
     config.update(
@@ -39,8 +50,9 @@ def _config(name):
         offline_batch_size=2,
         online_batch_size=2,
         offline_steps=1,
+        frame_stack=1,
     )
-    if name == 'gc_pixel_lapo':
+    if name == 'gc_pixel_lapo_decoder':
         config.update(num_codebooks=2, num_codes=8, code_dim=4)
     return config
 
@@ -55,35 +67,93 @@ def _online_batch(data):
 
 def test_pixel_registry_declares_information_and_online_update_boundaries():
     assert PIXEL_ALGORITHMS == (
-        'gc_pixel_lapo',
+        'pixel_pathbridger_online_idm',
+        'gc_pixel_lapo_decoder',
         'gc_pixel_drqv2',
-        'vip_frozen_gc_drqv2',
-        'vip_finetuned_gc_drqv2',
-        'gc_pixel_apv',
+        'vip_style_frozen_gc_drqv2',
+        'vip_style_finetuned_gc_drqv2',
+        'gc_pixel_apv_style_drq',
     )
     assert pixel_algorithm_metadata('gc_pixel_drqv2').offline_fields_seen == ()
-    assert pixel_algorithm_metadata('gc_pixel_lapo').online_modules_updated == (
+    assert pixel_algorithm_metadata('gc_pixel_lapo_decoder').online_modules_updated == (
         'decoder',
     )
     assert pixel_algorithm_metadata(
-        'vip_frozen_gc_drqv2'
+        'vip_style_frozen_gc_drqv2'
     ).online_modules_updated == ('actor', 'critic')
     assert 'action_dynamics' in pixel_algorithm_metadata(
-        'gc_pixel_apv'
+        'gc_pixel_apv_style_drq'
     ).online_modules_updated
     for name in PIXEL_ALGORITHMS:
         assert pixel_algorithm_metadata(name).port_kind in {
             'online_only',
             'goal_conditioned_adaptation',
+            'proposed',
         }
+
+
+def test_pixel_registry_keeps_legacy_names_as_honest_aliases():
+    assert pixel_algorithm_metadata('gc_pixel_lapo').algorithm == (
+        'gc_pixel_lapo_decoder'
+    )
+    assert pixel_algorithm_metadata('gc_pixel_apv').algorithm == (
+        'gc_pixel_apv_style_drq'
+    )
+
+
+def test_pixel_pathbridger_freezes_offline_path_and_updates_only_idm_online():
+    name = 'pixel_pathbridger_online_idm'
+    data = _stacked_data()
+    config = _config(name)
+    config.update(idm_hidden_dims=(16,), path_horizon=5, frame_stack=3)
+    agent, _ = create_pixel_algorithm(
+        name,
+        seed=0,
+        example_images=data.example_images,
+        action_dim=2,
+        config=config,
+    )
+    offline_names = ('encoder', 'bridge', 'world_decoder')
+    offline_before = {
+        module: parameter_digest(agent.network.params[f'modules_{module}'])
+        for module in offline_names
+    }
+    idm_before = parameter_digest(agent.network.params['modules_idm'])
+    agent, offline_info = agent.offline_update(data.sample(2, path_horizon=5))
+    assert np.isfinite(float(offline_info['loss/total']))
+    assert any(
+        parameter_digest(agent.network.params[f'modules_{module}'])
+        != offline_before[module]
+        for module in offline_names
+    )
+    assert parameter_digest(agent.network.params['modules_idm']) == idm_before
+
+    frozen_before_online = {
+        module: parameter_digest(agent.network.params[f'modules_{module}'])
+        for module in (*offline_names, 'target_encoder')
+    }
+    batch = data.sample(2, path_horizon=5)
+    batch['actions'] = np.array([[0.2, -0.3], [0.1, -0.4]], np.float32)
+    agent, online_info = agent.online_update(batch)
+    assert np.isfinite(float(online_info['loss/total']))
+    assert parameter_digest(agent.network.params['modules_idm']) != idm_before
+    for module, digest in frozen_before_online.items():
+        assert parameter_digest(agent.network.params[f'modules_{module}']) == digest
+    actions = agent.sample_actions(
+        batch['observations'],
+        batch['goals'],
+        seed=jax.random.PRNGKey(3),
+        temperature=0.0,
+    )
+    assert actions.shape == (2, 2)
 
 
 def test_vip_frozen_and_finetuned_have_distinct_online_encoder_behavior():
     data = _data()
     images = data.observations[:2]
     for name, should_change in (
-        ('vip_frozen_gc_drqv2', False),
-        ('vip_finetuned_gc_drqv2', True),
+        ('vip_style_frozen_gc_drqv2', False),
+        ('vip_style_finetuned_gc_drqv2', True),
     ):
         agent, _ = create_pixel_algorithm(
             name,
@@ -102,7 +172,7 @@ def test_vip_frozen_and_finetuned_have_distinct_online_encoder_behavior():
 
 
 def test_apv_pretrains_video_modules_and_learns_action_dynamics_online():
-    name = 'gc_pixel_apv'
+    name = 'gc_pixel_apv_style_drq'
     data = _data()
     agent, _ = create_pixel_algorithm(
         name,
@@ -165,7 +235,7 @@ def test_generic_pixel_checkpoint_round_trip(tmp_path):
 
 
 def test_pixel_manifest_matches_all_algorithms_and_locked_dimensions(tmp_path):
-    expected = {'p0_smoke': 15, 'pilot': 60, 'screening': 200}
+    expected = {'p0_smoke': 18, 'pilot': 72, 'screening': 240}
     for name, count in expected.items():
         rows = build_rows(root=tmp_path, python='python', suite_name=name)
         assert len(rows) == count

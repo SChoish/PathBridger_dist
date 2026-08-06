@@ -113,6 +113,9 @@ def test_replay_state_dict_round_trip():
             desired_next_valid=True,
         )
     state = replay.state_dict()
+    assert state['format_version'] == 2
+    assert len(state['slots']) == replay.size
+    assert len(state['observations']) == replay.size
     restored = OnlineReplayBuffer(4, (2,), (1,), seed=0)
     restored.load_state_dict(state)
     assert restored.size == 3

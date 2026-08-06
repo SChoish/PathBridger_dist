@@ -368,8 +368,12 @@ class PixelDrQAgent(flax.struct.PyTreeNode):
     def create(cls, seed, example_images, action_dim, config):
         config = dict(config)
         images = jnp.asarray(example_images, dtype=jnp.uint8)
-        if images.ndim != 4 or images.shape[-1] != 3:
-            raise ValueError('Pixel DrQ examples must have shape [B, H, W, 3].')
+        expected_channels = 3 * int(config['frame_stack'])
+        if images.ndim != 4 or images.shape[-1] != expected_channels:
+            raise ValueError(
+                'Pixel DrQ examples must have shape [B, H, W, '
+                f'{expected_channels}] for frame_stack={config["frame_stack"]}.'
+            )
         image_shape = tuple(int(value) for value in images.shape[1:])
         feature_dim = int(config['feature_dim'])
         hidden_dims = tuple(config['hidden_dims'])
@@ -457,6 +461,7 @@ def get_config(pretraining='none', *, freeze_encoder_online=False):
             augmentation_padding=4,
             offline_batch_size=128,
             online_batch_size=256,
+            frame_stack=3,
             offline_steps=100_000 if pretraining != 'none' else 0,
             vip_discount=0.98,
             vip_anchor_weight=1.0,

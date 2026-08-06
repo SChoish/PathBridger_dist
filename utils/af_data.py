@@ -422,20 +422,23 @@ class OnlineReplayBuffer:
         }
 
     def state_dict(self) -> dict[str, Any]:
+        slots = np.flatnonzero(self.episode_ids >= 0).astype(np.int64)
         return {
+            'format_version': 2,
             'capacity': self.capacity,
             'pointer': self.pointer,
             'size': self.size,
-            'observations': self.observations.copy(),
-            'actions': self.actions.copy(),
-            'next_observations': self.next_observations.copy(),
-            'goals': self.goals.copy(),
-            'rewards': self.rewards.copy(),
-            'masks': self.masks.copy(),
-            'desired_next': self.desired_next.copy(),
-            'desired_next_valid': self.desired_next_valid.copy(),
-            'episode_ids': self.episode_ids.copy(),
-            'timesteps': self.timesteps.copy(),
+            'slots': slots,
+            'observations': self.observations[slots].copy(),
+            'actions': self.actions[slots].copy(),
+            'next_observations': self.next_observations[slots].copy(),
+            'goals': self.goals[slots].copy(),
+            'rewards': self.rewards[slots].copy(),
+            'masks': self.masks[slots].copy(),
+            'desired_next': self.desired_next[slots].copy(),
+            'desired_next_valid': self.desired_next_valid[slots].copy(),
+            'episode_ids': self.episode_ids[slots].copy(),
+            'timesteps': self.timesteps[slots].copy(),
             'rng_state': self.rng.bit_generator.state,
         }
 
@@ -445,6 +448,30 @@ class OnlineReplayBuffer:
                 f'Replay capacity mismatch: ckpt={state["capacity"]} vs '
                 f'buffer={self.capacity}.'
             )
+        slots = state.get('slots')
+        legacy_full_arrays = slots is None
+        if legacy_full_arrays:
+            # Checkpoint v1 stored every capacity slot.
+            slots = np.flatnonzero(
+                np.asarray(state['episode_ids'], dtype=np.int64) >= 0
+            )
+        else:
+            slots = np.asarray(slots, dtype=np.int64)
+        if len(slots) != int(state['size']):
+            raise ValueError(
+                f'Compact replay slot count {len(slots)} does not match '
+                f'size {state["size"]}.'
+            )
+        self.observations.fill(0.0)
+        self.actions.fill(0.0)
+        self.next_observations.fill(0.0)
+        self.goals.fill(0.0)
+        self.rewards.fill(0.0)
+        self.masks.fill(1.0)
+        self.desired_next.fill(0.0)
+        self.desired_next_valid.fill(False)
+        self.episode_ids.fill(-1)
+        self.timesteps.fill(-1)
         for key in (
             'observations',
             'actions',
@@ -457,13 +484,20 @@ class OnlineReplayBuffer:
             'episode_ids',
             'timesteps',
         ):
-            getattr(self, key)[:] = state[key]
+            values = np.asarray(state[key])
+            if legacy_full_arrays:
+                values = values[slots]
+            if len(values) != len(slots):
+                raise ValueError(
+                    f'Replay field {key!r} has {len(values)} entries for '
+                    f'{len(slots)} slots.'
+                )
+            getattr(self, key)[slots] = values
         self.pointer = int(state['pointer'])
         self.size = int(state['size'])
         self.rng.bit_generator.state = state['rng_state']
         self._episode_slots = defaultdict(list)
-        occupied = self.capacity if self.size >= self.capacity else self.size
-        for slot in range(occupied):
+        for slot in slots:
             episode_id = int(self.episode_ids[slot])
             if episode_id < 0:
                 continue

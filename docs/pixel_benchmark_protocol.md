@@ -1,18 +1,19 @@
 # Action-free pixel offline-to-online benchmark
 
 This track is isolated from the state-vector `af_o2o_v3` benchmark. Pixel
-results use protocol family `pixel_o2o_v2`, a separate output root, manifests,
+results use protocol family `pixel_o2o_v3`, a separate output root, manifests,
 checkpoints, and aggregate tables.
 
 ## Implemented comparison set
 
 | Registry name | Offline input | Offline training | Online updates | Status |
 | --- | --- | --- | --- | --- |
+| `pixel_pathbridger_online_idm` | RGB, terminals | endpoint-pinned latent path bridge and visual encoder/decoder | IDM only | proposed visual PathBridger |
 | `gc_pixel_drqv2` | none | none | encoder, actor, critic | goal-image OGBench adaptation of DrQ-v2 |
-| `vip_frozen_gc_drqv2` | RGB, terminals | VIP-style temporal value encoder | actor, critic | controlled adaptation; encoder frozen online |
-| `vip_finetuned_gc_drqv2` | RGB, terminals | VIP-style temporal value encoder | encoder, actor, critic | controlled adaptation; encoder fine-tuned online |
-| `gc_pixel_lapo` | RGB, terminals | VQ latent action model and goal-conditioned latent policy | action decoder | controlled continuous-action LAPO adaptation |
-| `gc_pixel_apv` | RGB, terminals | next-latent video prediction and pixel reconstruction | encoder, actor, critic, action-conditioned dynamics | APV-style JAX adaptation, not native DreamerV2 APV |
+| `vip_style_frozen_gc_drqv2` | RGB, terminals | VIP-style temporal value encoder | actor, critic | controlled adaptation; encoder frozen online |
+| `vip_style_finetuned_gc_drqv2` | RGB, terminals | VIP-style temporal value encoder | encoder, actor, critic | controlled adaptation; encoder fine-tuned online |
+| `gc_pixel_lapo_decoder` | RGB, terminals | VQ latent action model and goal-conditioned latent policy | action decoder | controlled LAPO-Decoder adaptation, not native online PPO |
+| `gc_pixel_apv_style_drq` | RGB, terminals | next-latent video prediction and pixel reconstruction | encoder, actor, critic, action-conditioned dynamics | APV-style + GC-DrQ, not native DreamerV2 APV |
 
 Online learning is not globally restricted to an IDM. Each method may update
 the modules required by its declared algorithm. The exact module list is part
@@ -28,6 +29,13 @@ and APV-style uses the shared JAX goal-conditioned DrQ controller rather than
 the official TensorFlow DreamerV2 stack. Native ports, if added, must receive
 different registry names and a separate result block.
 
+The proposed entry learns a five-state latent path from action-free frame
+sequences. Its encoder, target encoder, bridge, and world decoder are frozen
+for the complete online phase. Only a separately initialized inverse dynamics
+model is grounded with newly executed RGB/action/RGB transitions. The registry
+and checkpoint metadata expose this module boundary, and training hash-checks
+the frozen modules.
+
 ## Information boundary
 
 For every strict action-free method, the offline loader constructs an immutable
@@ -38,9 +46,13 @@ derived solely from episode order. `gc_pixel_drqv2` does not open an offline
 dataset at all.
 
 New actions and environment success enter only after online interaction begins.
-The online replay contains RGB observation, next observation, goal image,
-executed action, sparse reward, and mask. This is an interaction-grounded
-regime and must not be pooled with offline-action or mixed-data upper bounds.
+The online replay stores each raw RGB frame once and transitions refer to frame
+IDs. It also records episode ID, timestep, behavior-goal frame ID, executed
+action, sparse reward, and mask. Sampling constructs three-frame histories and
+applies episode-local future-image HER without crossing reset boundaries.
+Behavior goals, rewards, and masks remain separately available for methods that
+need the commanded transition. This is an interaction-grounded regime and must
+not be pooled with offline-action or mixed-data upper bounds.
 
 ## Locked online protocol
 
@@ -54,8 +66,11 @@ regime and must not be pooled with offline-action or mixed-data upper bounds.
   the suite budget reaches them.
 - Exploration bootstrap: 10k shared uniform-random steps, followed by each
   declared policy's action noise.
-- Replay: 20k transitions stored as `uint8` RGB; all methods receive the same
-  replay capacity and update start.
+- Observation history: three consecutive RGB frames, channel-stacked; history
+  is left-padded with the episode's first available frame.
+- Replay: 50k frame-indexed transitions with shared raw `uint8` frames.
+- Goal relabeling: episode-aware future-image HER with probability 0.8. Replay
+  logs relabel, relabeled-success, and commanded-success fractions.
 
 The default offline update counts are algorithm-specific and are recorded in
 metadata rather than counted against online environment steps. Offline compute
@@ -63,11 +78,11 @@ should additionally be reported as updates and wall-clock time in final tables.
 
 ## Suites and run counts
 
-The unified manifest includes all five registry entries:
+The unified manifest includes all six registry entries:
 
-- `p0_smoke`: 5 algorithms x 3 environments x 1 seed = 15 runs.
-- `pilot`: 5 algorithms x 4 environments x 3 seeds = 60 runs.
-- `screening`: 5 algorithms x 8 environments x 5 seeds = 200 runs.
+- `p0_smoke`: 6 algorithms x 3 environments x 1 seed = 18 runs.
+- `pilot`: 6 algorithms x 4 environments x 3 seeds = 72 runs.
+- `screening`: 6 algorithms x 8 environments x 5 seeds = 240 runs.
 
 Manifest generation never launches training or downloads datasets:
 
@@ -84,10 +99,10 @@ Example development smoke:
 
 ```bash
 python train_pixel.py \
-  --algorithm=vip_frozen_gc_drqv2 \
+  --algorithm=pixel_pathbridger_online_idm \
   --env_name=visual-antmaze-medium-navigate-v0 \
   --offline_steps=2 --online_steps=10 --random_steps=10 \
-  --update_start=2 --replay_capacity=20 \
+  --update_start=2 --replay_capacity=50 --frame_stack=3 \
   --eval_episodes=0 --eval_steps=10 --use_tqdm=false
 ```
 
@@ -96,6 +111,11 @@ Evaluate a saved checkpoint with:
 ```bash
 python evaluate_pixel.py --checkpoint=/exact/path/to/step_10.pkl
 ```
+
+Promotion beyond P0 requires finite losses, non-degenerate actions, positive
+HER success rate, nonzero critic/IDM learning signals as applicable, and no
+frozen-module hash violation. Commanded success is reported separately so HER
+positives cannot be mistaken for environment success.
 
 ## Deferred methods
 

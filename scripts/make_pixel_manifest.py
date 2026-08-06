@@ -18,11 +18,12 @@ ENVIRONMENTS = (
     'visual-scene-play-v0',
 )
 PIXEL_ALGORITHMS = (
-    'gc_pixel_lapo',
+    'pixel_pathbridger_online_idm',
+    'gc_pixel_lapo_decoder',
     'gc_pixel_drqv2',
-    'vip_frozen_gc_drqv2',
-    'vip_finetuned_gc_drqv2',
-    'gc_pixel_apv',
+    'vip_style_frozen_gc_drqv2',
+    'vip_style_finetuned_gc_drqv2',
+    'gc_pixel_apv_style_drq',
 )
 EVAL_STEPS = '0,10000,25000,50000,100000,250000,500000,1000000'
 SUITES = {
@@ -79,7 +80,9 @@ def build_rows(*, root: Path, python: str, suite_name: str, run_group: str = '')
                     f'--protocol_suite={suite_name}',
                     f'--online_steps={suite["online_steps"]}',
                     '--random_steps=10000',
-                    '--replay_capacity=20000',
+                    '--replay_capacity=50000',
+                    '--frame_stack=3',
+                    '--her_probability=0.8',
                     f'--eval_steps={suite["eval_steps"]}',
                     '--eval_episodes=10',
                 ]

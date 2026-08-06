@@ -96,8 +96,8 @@ a_t\sim\pi_{\mathrm{DrQ}}(a_t\mid e_t,e_g).
 권장 비교는 두 개입니다.
 
 ```text
-vip_frozen_gc_drq
-vip_finetuned_gc_drq
+vip_style_frozen_gc_drqv2
+vip_style_finetuned_gc_drqv2
 ```
 
 메인 controlled comparison에서는 환경 sparse reward만 사용하고, VIP dense reward를 사용하는 변형은 native-style 추가 결과로 분리해야 합니다. 그래야 representation 효과와 reward shaping 효과가 섞이지 않습니다.

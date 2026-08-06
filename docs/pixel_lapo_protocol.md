@@ -7,7 +7,7 @@ in `docs/pixel_benchmark_protocol.md`.
 
 ## Method status
 
-`gc_pixel_lapo` is a controlled continuous-control OGBench adaptation of
+`gc_pixel_lapo_decoder` is a controlled continuous-control OGBench adaptation of
 [Learning to Act without Actions](https://arxiv.org/abs/2312.10812). It is not
 an official reproduction of the Procgen experiments in the
 [LAPO repository](https://github.com/schmidtdominik/LAPO).
@@ -22,7 +22,7 @@ that causal information flow but makes two declared changes:
 The original stage-3 PPO policy update is deliberately omitted in this
 controlled variant. Only its latent-to-action decoder is updated online; the
 visual latent model and latent policy remain frozen and are hash-checked at
-every checkpoint. This is an algorithm-specific choice for `gc_pixel_lapo`,
+every checkpoint. This is an algorithm-specific choice for `gc_pixel_lapo_decoder`,
 not a global restriction on the pixel benchmark. Other registered methods may
 fine-tune their encoder, policy, critic, or action-conditioned dynamics online
 when required by their declared update rule.
@@ -65,19 +65,20 @@ No generated pixel manifest is consumed by the existing state queue scripts.
 ## Defaults and resource notes
 
 The LAPO-aligned defaults are two VQ codebooks, 64 entries per codebook,
-16-dimensional codes, 50k stage-1 updates, and 60k stage-2 updates. RGB replay
-is stored as `uint8`. The default 20k replay allocates roughly 0.74 GB for three
-64x64 RGB arrays before action/scalar storage. The official visual datasets are
-large and should be provisioned explicitly. Training refuses to download a
-missing dataset by default; opt in only with `--allow_dataset_download=true`.
-The manifest generator never starts training or downloads data.
+16-dimensional codes, 50k stage-1 updates, and 60k stage-2 updates. The unified
+`pixel_o2o_v3` runner uses three-frame histories and a 50k transition replay
+whose transitions reference shared raw `uint8` frames. This replaces the old
+three-full-image-per-transition layout. The official visual datasets are large
+and should be provisioned explicitly. Training refuses to download a missing
+dataset by default; opt in only with `--allow_dataset_download=true`. The
+manifest generator never starts training or downloads data.
 
 Example development smoke after datasets are available:
 
 ```bash
 python train_pixel_lapo.py \
   --env_name=visual-antmaze-medium-navigate-v0 \
-  --stage1_steps=2 --stage2_steps=2 --online_steps=10 \
+  --lapo_stage1_steps=2 --lapo_stage2_steps=2 --online_steps=10 \
   --random_steps=10 --update_start=2 --replay_capacity=20 \
   --eval_episodes=0 --eval_steps=10 --use_tqdm=false
 ```

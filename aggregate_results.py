@@ -31,7 +31,11 @@ def _read_curve(path: Path):
     for row in rows:
         if row.get('step', '') and row.get('overall_success', ''):
             points.append((int(row['step']), float(row['overall_success'])))
-    points.sort()
+    steps = [point[0] for point in points]
+    if any(right <= left for left, right in zip(steps, steps[1:])):
+        raise ValueError(
+            f'Evaluation steps must be strictly increasing without duplicates: {path}.'
+        )
     return points
 
 
@@ -155,6 +159,11 @@ def main(_):
         if not eval_path.is_file():
             continue
         metadata = json.loads(metadata_path.read_text())
+        if not bool(metadata.get('aggregation_eligible', True)):
+            raise ValueError(
+                f'{metadata_path} is marked aggregation_eligible=false; '
+                'resume it in place or merge its parent curve explicitly.'
+            )
         missing_fields = sorted(required_protocol_fields - set(metadata))
         if missing_fields:
             raise ValueError(
@@ -164,6 +173,11 @@ def main(_):
         points = _read_curve(eval_path)
         if not points:
             continue
+        if points[0][0] != 0:
+            raise ValueError(
+                f'{eval_path} starts at step {points[0][0]} instead of step 0; '
+                'standalone resumed curves cannot be used for AUC.'
+            )
         budget = int(metadata.get('online_steps', points[-1][0]))
         # Never turn an interrupted run into an apparently complete curve by
         # carrying its last score forward to the requested budget.

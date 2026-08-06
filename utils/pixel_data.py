@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import bisect
 import dataclasses
+from collections import defaultdict
 from collections.abc import Mapping
 from typing import Any
 
@@ -65,6 +67,18 @@ def _validate_pixels(array: Any, *, where: str) -> np.ndarray:
     return pixels
 
 
+def repeat_pixel_frame(frame: np.ndarray, count: int) -> np.ndarray:
+    return np.concatenate([frame] * int(count), axis=-1)
+
+
+def stack_pixel_history(frames: list[np.ndarray], count: int) -> np.ndarray:
+    if not frames:
+        raise ValueError('Pixel frame history cannot be empty.')
+    selected = list(frames[-int(count) :])
+    selected = [selected[0]] * (int(count) - len(selected)) + selected
+    return np.concatenate(selected, axis=-1)
+
+
 class ActionFreePixelTrajectoryData:
     """Offline visual trajectories exposing only pixels and terminals.
 
@@ -72,7 +86,13 @@ class ActionFreePixelTrajectoryData:
     never retains actions, rewards, simulator state, or privileged metadata.
     """
 
-    def __init__(self, dataset: Mapping[str, Any], *, seed: int = 0):
+    def __init__(
+        self,
+        dataset: Mapping[str, Any],
+        *,
+        seed: int = 0,
+        frame_stack: int = 1,
+    ):
         source_keys = {str(key).lower(): key for key in dataset}
         if not {'observations', 'terminals'} <= set(source_keys):
             raise ValueError('Pixel trajectories require observations and terminals.')
@@ -90,13 +110,40 @@ class ActionFreePixelTrajectoryData:
         self.terminals.setflags(write=False)
         self.episodes = PixelEpisodeIndex.from_terminals(terminals)
         self.rng = np.random.default_rng(int(seed))
+        self.frame_stack = int(frame_stack)
+        if self.frame_stack < 1:
+            raise ValueError('frame_stack must be positive.')
         self.offline_fields_seen = ('observations', 'terminals')
 
     @property
     def image_shape(self) -> tuple[int, int, int]:
-        return tuple(int(value) for value in self.observations.shape[1:])
+        height, width, channels = self.observations.shape[1:]
+        return int(height), int(width), int(channels) * self.frame_stack
 
-    def sample(self, batch_size: int) -> dict[str, np.ndarray]:
+    def stack_indices(self, indices: Any) -> np.ndarray:
+        indices = np.asarray(indices, dtype=np.int64).reshape(-1)
+        initials = self.episodes.initial_for_state[indices]
+        offsets = np.arange(self.frame_stack - 1, -1, -1, dtype=np.int64)
+        history = np.maximum(indices[:, None] - offsets[None, :], initials[:, None])
+        frames = self.observations[history]
+        return np.concatenate(
+            [frames[:, position] for position in range(self.frame_stack)],
+            axis=-1,
+        )
+
+    @property
+    def example_images(self) -> np.ndarray:
+        indices = self.episodes.transition_indices[:2]
+        if len(indices) < 2:
+            indices = np.repeat(indices, 2)
+        return self.stack_indices(indices)
+
+    def sample(
+        self,
+        batch_size: int,
+        *,
+        path_horizon: int = 5,
+    ) -> dict[str, np.ndarray]:
         choices = self.rng.integers(
             0, len(self.episodes.transition_indices), size=int(batch_size)
         )
@@ -106,20 +153,38 @@ class ActionFreePixelTrajectoryData:
             self.rng.random(len(indices)) * (finals - indices)
         ).astype(np.int64)
         goal_indices = indices + offsets
+        path_horizon = int(path_horizon)
+        if path_horizon < 1:
+            raise ValueError('path_horizon must be positive.')
+        fractions = np.arange(1, path_horizon + 1, dtype=np.float64)
+        fractions /= float(path_horizon)
+        path_indices = indices[:, None] + np.ceil(
+            (goal_indices - indices)[:, None] * fractions[None, :]
+        ).astype(np.int64)
+        path_observations = self.stack_indices(path_indices.reshape(-1)).reshape(
+            len(indices), path_horizon, *self.image_shape
+        )
         successes = goal_indices == indices + 1
         return {
-            'observations': self.observations[indices],
-            'next_observations': self.observations[indices + 1],
-            'goals': self.observations[goal_indices],
+            'observations': self.stack_indices(indices),
+            'next_observations': self.stack_indices(indices + 1),
+            'goals': np.stack(
+                [
+                    repeat_pixel_frame(self.observations[index], self.frame_stack)
+                    for index in goal_indices
+                ]
+            ),
             'rewards': successes.astype(np.float32) - 1.0,
             'masks': 1.0 - successes.astype(np.float32),
             'indices': indices,
             'goal_indices': goal_indices,
+            'path_indices': path_indices,
+            'path_observations': path_observations,
         }
 
 
 class PixelReplayBuffer:
-    """Memory-conscious uint8 replay for continuous-action visual control."""
+    """Episode-aware indexed raw-frame replay with future-image HER."""
 
     def __init__(
         self,
@@ -128,33 +193,136 @@ class PixelReplayBuffer:
         action_shape: tuple[int, ...],
         *,
         seed: int = 0,
+        frame_stack: int = 1,
     ):
         self.capacity = int(capacity)
         if self.capacity < 1:
             raise ValueError('Replay capacity must be positive.')
-        image_shape = tuple(int(value) for value in image_shape)
+        self.raw_image_shape = tuple(int(value) for value in image_shape)
         _validate_pixels(
-            np.empty((1, *image_shape), dtype=np.uint8), where='image_shape'
+            np.empty((1, *self.raw_image_shape), dtype=np.uint8),
+            where='image_shape',
         )
-        self.observations = np.empty((self.capacity, *image_shape), np.uint8)
-        self.next_observations = np.empty_like(self.observations)
-        self.goals = np.empty_like(self.observations)
+        self.frame_stack = int(frame_stack)
+        if self.frame_stack < 1:
+            raise ValueError('frame_stack must be positive.')
+        self.observation_frame_ids = np.full(self.capacity, -1, np.int64)
+        self.next_frame_ids = np.full(self.capacity, -1, np.int64)
+        self.behavior_goal_frame_ids = np.full(self.capacity, -1, np.int64)
         self.actions = np.empty((self.capacity, *action_shape), np.float32)
         self.rewards = np.empty((self.capacity,), np.float32)
         self.masks = np.empty((self.capacity,), np.float32)
+        self.episode_ids = np.full(self.capacity, -1, np.int64)
+        self.timesteps = np.full(self.capacity, -1, np.int64)
         self.pointer = 0
         self.size = 0
         self.rng = np.random.default_rng(int(seed))
+        self._frames: dict[int, np.ndarray] = {}
+        self._frame_references: dict[int, int] = {}
+        self._next_frame_id = 0
+        self._episode_slots: dict[int, list[tuple[int, int]]] = defaultdict(list)
+        self._episode_goal_ids: dict[int, int] = {}
+
+    @property
+    def image_shape(self) -> tuple[int, int, int]:
+        height, width, channels = self.raw_image_shape
+        return height, width, channels * self.frame_stack
+
+    def _new_frame(self, value: Any, *, where: str) -> int:
+        frame = np.asarray(value)
+        if frame.shape != self.raw_image_shape or frame.dtype != np.uint8:
+            raise ValueError(
+                f'{where} must be {self.raw_image_shape} uint8, '
+                f'got {frame.shape}/{frame.dtype}.'
+            )
+        frame_id = self._next_frame_id
+        self._next_frame_id += 1
+        self._frames[frame_id] = frame.copy()
+        self._frame_references[frame_id] = 0
+        return frame_id
+
+    def _retain(self, frame_id: int) -> None:
+        self._frame_references[frame_id] += 1
+
+    def _release(self, frame_id: int) -> None:
+        if frame_id < 0:
+            return
+        references = self._frame_references[frame_id] - 1
+        if references <= 0:
+            del self._frame_references[frame_id]
+            del self._frames[frame_id]
+        else:
+            self._frame_references[frame_id] = references
+
+    def _remove_old_slot(self, slot: int) -> None:
+        episode = int(self.episode_ids[slot])
+        if episode < 0:
+            return
+        entries = self._episode_slots[episode]
+        old = (int(self.timesteps[slot]), slot)
+        position = bisect.bisect_left(entries, old)
+        if position < len(entries) and entries[position] == old:
+            entries.pop(position)
+        for frame_id in (
+            int(self.observation_frame_ids[slot]),
+            int(self.next_frame_ids[slot]),
+            int(self.behavior_goal_frame_ids[slot]),
+        ):
+            self._release(frame_id)
+        if not entries:
+            del self._episode_slots[episode]
+            self._episode_goal_ids.pop(episode, None)
+
+    def _history_frame_ids(self, slot: int, *, next_state: bool) -> list[int]:
+        episode = int(self.episode_ids[slot])
+        timestep = int(self.timesteps[slot])
+        entries = self._episode_slots[episode]
+        earliest_slot = entries[0][1]
+        earliest_id = int(self.observation_frame_ids[earliest_slot])
+        end = timestep + int(next_state)
+        result = []
+        for state_time in range(end - self.frame_stack + 1, end + 1):
+            if next_state and state_time == timestep + 1:
+                result.append(int(self.next_frame_ids[slot]))
+                continue
+            position = bisect.bisect_right(entries, (state_time, self.capacity)) - 1
+            if position < 0:
+                result.append(earliest_id)
+            else:
+                result.append(int(self.observation_frame_ids[entries[position][1]]))
+        return result
+
+    def _stack_slots(self, slots: np.ndarray, *, next_state: bool) -> np.ndarray:
+        return np.stack(
+            [
+                np.concatenate(
+                    [self._frames[index] for index in self._history_frame_ids(int(slot), next_state=next_state)],
+                    axis=-1,
+                )
+                for slot in slots
+            ]
+        )
+
+    def _stack_goal_ids(self, frame_ids: np.ndarray) -> np.ndarray:
+        return np.stack(
+            [
+                repeat_pixel_frame(self._frames[int(frame_id)], self.frame_stack)
+                for frame_id in frame_ids
+            ]
+        )
 
     @property
     def allocated_bytes(self) -> int:
         return int(
-            self.observations.nbytes
-            + self.next_observations.nbytes
-            + self.goals.nbytes
+            sum(frame.nbytes for frame in self._frames.values())
+            + self.observation_frame_ids.nbytes
+            + self.next_frame_ids.nbytes
+            + self.behavior_goal_frame_ids.nbytes
             + self.actions.nbytes
             + self.rewards.nbytes
             + self.masks.nbytes
+            + self.episode_ids.nbytes
+            + self.timesteps.nbytes
         )
 
     def add(
@@ -166,28 +334,99 @@ class PixelReplayBuffer:
         goal: Any,
         reward: float,
         mask: float,
+        episode_id: int,
+        timestep: int,
     ) -> None:
         slot = self.pointer
-        self.observations[slot] = observation
+        self._remove_old_slot(slot)
+        episode_id = int(episode_id)
+        timestep = int(timestep)
+        entries = self._episode_slots[episode_id]
+        if any(existing_timestep == timestep for existing_timestep, _ in entries):
+            raise ValueError(
+                f'Duplicate timestep {timestep} in pixel episode {episode_id}.'
+            )
+        observation_id = None
+        if entries and entries[-1][0] == timestep - 1:
+            previous_id = int(self.next_frame_ids[entries[-1][1]])
+            if np.array_equal(self._frames[previous_id], np.asarray(observation)):
+                observation_id = previous_id
+        if observation_id is None:
+            observation_id = self._new_frame(observation, where='observation')
+        next_id = self._new_frame(next_observation, where='next_observation')
+        goal_id = self._episode_goal_ids.get(episode_id)
+        if goal_id is None:
+            goal_id = self._new_frame(goal, where='goal')
+            self._episode_goal_ids[episode_id] = goal_id
+        elif not np.array_equal(self._frames[goal_id], np.asarray(goal)):
+            raise ValueError('The behavior goal changed within one pixel episode.')
+        for frame_id in (observation_id, next_id, goal_id):
+            self._retain(frame_id)
+        self.observation_frame_ids[slot] = observation_id
+        self.next_frame_ids[slot] = next_id
+        self.behavior_goal_frame_ids[slot] = goal_id
         self.actions[slot] = action
-        self.next_observations[slot] = next_observation
-        self.goals[slot] = goal
         self.rewards[slot] = reward
         self.masks[slot] = mask
+        self.episode_ids[slot] = episode_id
+        self.timesteps[slot] = timestep
+        bisect.insort(entries, (timestep, slot))
         self.pointer = (slot + 1) % self.capacity
         self.size = min(self.size + 1, self.capacity)
 
-    def sample(self, batch_size: int) -> dict[str, np.ndarray]:
+    def sample(
+        self,
+        batch_size: int,
+        *,
+        her_probability: float = 0.8,
+    ) -> dict[str, np.ndarray]:
         if self.size < 1:
             raise ValueError('Cannot sample an empty pixel replay.')
-        indices = self.rng.integers(0, self.size, size=int(batch_size))
+        valid_slots = np.flatnonzero(self.episode_ids >= 0)
+        indices = self.rng.choice(valid_slots, size=int(batch_size), replace=True)
+        behavior_goal_ids = self.behavior_goal_frame_ids[indices].copy()
+        goal_ids = behavior_goal_ids.copy()
+        rewards = self.rewards[indices].copy()
+        masks = self.masks[indices].copy()
+        relabeled = np.zeros(len(indices), dtype=np.bool_)
+        successes = np.zeros(len(indices), dtype=np.bool_)
+        requested = self.rng.random(len(indices)) < float(her_probability)
+        for row in np.flatnonzero(requested):
+            slot = int(indices[row])
+            entries = self._episode_slots[int(self.episode_ids[slot])]
+            position = bisect.bisect_left(
+                entries, (int(self.timesteps[slot]), -1)
+            )
+            if position >= len(entries):
+                continue
+            _, future_slot = entries[int(self.rng.integers(position, len(entries)))]
+            relabeled[row] = True
+            goal_ids[row] = self.next_frame_ids[future_slot]
+            success = future_slot == slot
+            successes[row] = success
+            rewards[row] = 0.0 if success else -1.0
+            masks[row] = 0.0 if success else 1.0
+        relabeled_count = max(int(np.sum(relabeled)), 1)
         return {
-            'observations': self.observations[indices],
+            'observations': self._stack_slots(indices, next_state=False),
             'actions': self.actions[indices],
-            'next_observations': self.next_observations[indices],
-            'goals': self.goals[indices],
-            'rewards': self.rewards[indices],
-            'masks': self.masks[indices],
+            'next_observations': self._stack_slots(indices, next_state=True),
+            'goals': self._stack_goal_ids(goal_ids),
+            'behavior_goals': self._stack_goal_ids(behavior_goal_ids),
+            'rewards': rewards,
+            'masks': masks,
+            'behavior_rewards': self.rewards[indices].copy(),
+            'behavior_masks': self.masks[indices].copy(),
+            'indices': indices,
+            'replay/her_relabel_fraction': np.asarray(
+                np.mean(relabeled), dtype=np.float32
+            ),
+            'replay/her_success_fraction': np.asarray(
+                np.sum(successes) / relabeled_count, dtype=np.float32
+            ),
+            'replay/commanded_success_fraction': np.asarray(
+                np.mean(self.rewards[indices] >= 0.0), dtype=np.float32
+            ),
         }
 
 
@@ -195,4 +434,6 @@ __all__ = [
     'ActionFreePixelTrajectoryData',
     'PixelEpisodeIndex',
     'PixelReplayBuffer',
+    'repeat_pixel_frame',
+    'stack_pixel_history',
 ]

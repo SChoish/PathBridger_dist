@@ -56,8 +56,11 @@ reported separately.
 
 `train_af.py` writes `offline.csv`, `online.csv`, `eval.csv`, immutable
 provenance metadata, and component-wise checkpoints.  Soft-stop
-(`SIGTERM`/`SIGINT`) emergency-saves after the current step; online ckpts
-default to `--save_replay` and can resume via `--af_restore_path` (see
+(`SIGTERM`/`SIGINT`) emergency-saves after the current step. Lightweight
+`step_*.pkl` files are for evaluation, while compact replay-bearing
+`resume_step_*.pkl` files rotate for exact training continuation. In-place
+resume appends the original curves; standalone partial curves are rejected by
+aggregation (see
 [`docs/action_free_o2o_protocol.md`](docs/action_free_o2o_protocol.md)).
 Evaluate one checkpoint with `evaluate_af.py --checkpoint=<step_*.pkl>`.
 Generate the staged P0 smoke manifest and aggregate completed runs with:
@@ -78,18 +81,22 @@ groups separate.  Reference repositories and audited commits are pinned in
 
 ## Action-free pixel benchmark
 
-The isolated `pixel_o2o_v2` track currently implements `gc_pixel_lapo`, an
-online-only `gc_pixel_drqv2`, frozen and fine-tuned VIP-style representations
-with the same GC-DrQ-v2 controller, and `gc_pixel_apv`. These are controlled
-goal-image OGBench adaptations; metadata records their official reference
-repository, pinned commit, information boundary, and exact online-updated
-modules. Online learning is not globally restricted to an IDM.
+The isolated `pixel_o2o_v3` track implements the proposed
+`pixel_pathbridger_online_idm`, `gc_pixel_lapo_decoder`, online-only
+`gc_pixel_drqv2`, frozen and fine-tuned VIP-style GC-DrQ-v2 adaptations, and
+`gc_pixel_apv_style_drq`. All methods use episode-safe three-frame histories
+and a frame-indexed replay with future-image HER. Baseline names deliberately
+distinguish the controlled OGBench adaptations from native LAPO PPO and
+DreamerV2 APV reproductions. Metadata records provenance, information
+boundaries, and exact online-updated modules. Online learning is not globally
+restricted to an IDM; only the proposed entry freezes its visual path prior and
+updates a separately initialized IDM.
 
-Run one method and generate the full five-method smoke manifest with:
+Run one method and generate the full six-method smoke manifest with:
 
 ```bash
 python train_pixel.py \
-  --algorithm=vip_frozen_gc_drqv2 \
+  --algorithm=pixel_pathbridger_online_idm \
   --env_name=visual-antmaze-medium-navigate-v0 \
   --online_steps=250000 --seed=0
 python scripts/make_pixel_manifest.py \
@@ -99,7 +106,7 @@ python scripts/make_pixel_manifest.py \
 Visual offline data is never downloaded implicitly; pass
 `--allow_dataset_download=true` only when intended. See
 [`docs/pixel_benchmark_protocol.md`](docs/pixel_benchmark_protocol.md) for the
-five algorithms, budgets, run counts, and adaptation caveats.
+six algorithms, budgets, run counts, and adaptation caveats.
 
 This is the compact, actor-free distribution of PathBridger for state-based
 offline goal-conditioned reinforcement learning on OGBench.

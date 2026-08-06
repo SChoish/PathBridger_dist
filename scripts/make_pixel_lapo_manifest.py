@@ -18,7 +18,7 @@ ENVIRONMENTS = (
     'visual-puzzle-4x4-play-v0',
     'visual-scene-play-v0',
 )
-ALGORITHM = 'gc_pixel_lapo'
+ALGORITHM = 'gc_pixel_lapo_decoder'
 EVAL_STEPS = '0,10000,25000,50000,100000,250000,500000,1000000'
 SUITES = {
     'p0_smoke': {
