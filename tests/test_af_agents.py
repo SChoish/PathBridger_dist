@@ -30,10 +30,19 @@ def _online_batch():
         'next_observations': OBS + 0.02,
         'actions': ACT,
         'goals': OBS + 0.2,
+        'behavior_goals': OBS + 0.4,
         'rewards': jnp.asarray([-1.0, 0.0], jnp.float32),
         'masks': jnp.asarray([1.0, 0.0], jnp.float32),
         'desired_next': OBS + 0.03,
     }
+
+
+def _assert_tree_equal(left, right):
+    left_leaves = jax.tree_util.tree_leaves(left)
+    right_leaves = jax.tree_util.tree_leaves(right)
+    assert len(left_leaves) == len(right_leaves)
+    for left_leaf, right_leaf in zip(left_leaves, right_leaves):
+        np.testing.assert_array_equal(left_leaf, right_leaf)
 
 
 def _offline_batch():
@@ -54,14 +63,57 @@ def test_gc_sac_and_td3_update_and_act():
         assert agent.sample_actions(OBS, OBS + 0.2, seed=jax.random.PRNGKey(1)).shape == ACT.shape
 
 
+def test_td3_delay_keeps_actor_params_target_and_optimizer_bitwise_frozen():
+    config = gc_config('td3').to_dict()
+    config.update(hidden_dims=(8,), policy_delay=2)
+    agent = GoalConditionedActorCritic.create(0, OBS, ACT, config)
+    actor_before = agent.network.params['modules_actor']
+    target_before = agent.network.params['modules_target_actor']
+    optimizer_before = agent.network.opt_state['actor']
+    critic_before = agent.network.params['modules_critic']
+
+    delayed_agent, delayed_info = agent.update(_online_batch())
+    assert float(delayed_info['actor/updated']) == 0.0
+    _assert_tree_equal(actor_before, delayed_agent.network.params['modules_actor'])
+    _assert_tree_equal(
+        target_before, delayed_agent.network.params['modules_target_actor']
+    )
+    _assert_tree_equal(optimizer_before, delayed_agent.network.opt_state['actor'])
+    assert any(
+        not np.array_equal(left, right)
+        for left, right in zip(
+            jax.tree_util.tree_leaves(critic_before),
+            jax.tree_util.tree_leaves(
+                delayed_agent.network.params['modules_critic']
+            ),
+        )
+    )
+
+    updated_agent, updated_info = delayed_agent.update(_online_batch())
+    assert float(updated_info['actor/updated']) == 1.0
+    assert any(
+        not np.array_equal(left, right)
+        for left, right in zip(
+            jax.tree_util.tree_leaves(actor_before),
+            jax.tree_util.tree_leaves(
+                updated_agent.network.params['modules_actor']
+            ),
+        )
+    )
+
+
 def test_passive_hiql_low_policy_changes_only_online():
     config = hiql_config().to_dict()
     config['hidden_dims'] = (8,)
     agent = PassiveHIQLAgent.create(0, OBS, ACT.shape[-1], config)
     low_before = agent.network.params['modules_low_policy']
+    low_optimizer_before = agent.network.opt_state['low_policy']
     offline_agent, _ = agent.offline_update(_offline_batch())
     for left, right in zip(jax.tree_util.tree_leaves(low_before), jax.tree_util.tree_leaves(offline_agent.network.params['modules_low_policy'])):
         np.testing.assert_array_equal(left, right)
+    _assert_tree_equal(
+        low_optimizer_before, offline_agent.network.opt_state['low_policy']
+    )
     online_agent, _ = offline_agent.online_update(_online_batch())
     assert any(
         not np.array_equal(left, right)
@@ -83,6 +135,7 @@ def test_mscp_afguide_and_oso_smoke():
     acfg = afguide_config().to_dict()
     acfg.update(context_length=3, embed_dim=8, num_blocks=1, hidden_dims=(8,))
     guide = AFGuideAgent.create(0, OBS, ACT.shape[-1], jnp.ones(OBS.shape[-1]), acfg)
+    actor_optimizer_before = guide.network.opt_state['actor']
     sequence_batch = {
         'histories': jnp.broadcast_to(OBS[:, None, :], (2, 3, 4)),
         'history_masks': jnp.ones((2, 3)),
@@ -91,6 +144,8 @@ def test_mscp_afguide_and_oso_smoke():
         'target_deltas': jnp.ones_like(OBS) * 0.02,
     }
     guide, _ = guide.offline_update(sequence_batch)
+    _assert_tree_equal(actor_optimizer_before, guide.network.opt_state['actor'])
+    afdt_before_online = guide.network.params['modules_afdt']
     guide_critic_before = guide.network.params['modules_guide_critic']
     invalid_guide_batch = {
         **_online_batch(),
@@ -98,6 +153,8 @@ def test_mscp_afguide_and_oso_smoke():
     }
     guide, invalid_info = guide.online_update(invalid_guide_batch)
     assert float(invalid_info['guide/valid_target_fraction']) == 0.0
+    assert float(invalid_info['guide/actor_loss']) == 0.0
+    _assert_tree_equal(afdt_before_online, guide.network.params['modules_afdt'])
     for left, right in zip(
         jax.tree_util.tree_leaves(guide_critic_before),
         jax.tree_util.tree_leaves(guide.network.params['modules_guide_critic']),

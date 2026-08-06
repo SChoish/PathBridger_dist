@@ -16,7 +16,7 @@ dependencies = [
     "jax>=0.4.26",
     "ml-collections",
     "numpy>=1.26",
-    "ogbench==1.1.0",
+    "ogbench>=1.1.0,<1.3",
     "optax",
     "tqdm",
 ]
@@ -30,7 +30,7 @@ pathbridger-af-aggregate = "aggregate_results:run"
 
 [project.optional-dependencies]
 tracking = ["wandb"]
-dev = ["ruff"]
+dev = ["pytest", "ruff"]
 
 [tool.setuptools]
 py-modules = ["main", "evaluate", "train_af", "evaluate_af", "aggregate_results"]

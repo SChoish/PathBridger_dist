@@ -106,7 +106,7 @@ The diagram is the method overview bundled with the PathBridger paper source.
 ## Layout
 
 ```text
-Pathbridger_dist/
+PathBridger_AF/
 ├── agents/
 │   ├── pathbridger.py       # TransV, endpoint, bridge, IDM, and orchestration.
 │   └── prefix_generators.py # Joint Gaussian and flow prefix distributions.
@@ -137,11 +137,15 @@ responsibility as FQL.
 Python 3.10 or newer is required.
 
 ```bash
-cd Pathbridger_dist
+cd PathBridger_AF
 python -m venv .venv
 source .venv/bin/activate
 pip install -e .
 ```
+
+The versions exercised by the repository test suite are recorded in
+`constraints-tested.txt`; pass it with `pip install -c constraints-tested.txt`
+when reproducing the validated environment.
 
 Install the JAX build appropriate for the host accelerator before training.
 Weights & Biases is optional:

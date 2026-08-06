@@ -10,13 +10,13 @@ from __future__ import annotations
 import bisect
 import dataclasses
 from collections import defaultdict
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import Any
 
 import numpy as np
 
 from utils.datasets import Dataset
-from utils.goal_representation import infer_phi_goal_obs_indices
+from utils.goal_representation import goal_representation_np
 
 
 FORBIDDEN_OFFLINE_FIELDS = frozenset(
@@ -100,11 +100,15 @@ class ActionFreeTrajectoryData:
         self.discount = float(discount)
         self.rng = np.random.default_rng(int(seed))
         self.size = len(observations)
-        self.phi_indices = np.asarray(
-            infer_phi_goal_obs_indices(self.env_name, observations.shape[-1]),
-            dtype=np.int64,
-        )
         self.offline_fields_seen = ('observations', 'terminals')
+
+    def project_goals(self, states: Any) -> np.ndarray:
+        """Project compact states into the environment's achieved-goal space."""
+
+        return np.asarray(
+            goal_representation_np(states, mode='phi', env_name=self.env_name),
+            dtype=np.float32,
+        )
 
     def _sample_transition_indices(self, batch_size: int) -> np.ndarray:
         choices = self.rng.integers(
@@ -232,7 +236,11 @@ class ActionFreeTrajectoryData:
             histories[row, -len(sequence) :] = sequence
             histories[row, : context_length - len(sequence)] = sequence[0]
             history_masks[row, -len(sequence) :] = 1.0
-        remaining = np.maximum(goal_indices - indices, 0).astype(np.float32)
+        # Match online inference: this token is the remaining episode horizon,
+        # while the sampled goal is already supplied as a separate token.
+        remaining = (
+            self.episodes.terminal_for_state[indices] - indices
+        ).astype(np.float32)
         return {
             'histories': histories,
             'history_masks': history_masks,
@@ -240,6 +248,8 @@ class ActionFreeTrajectoryData:
             'goals': self.observations[goal_indices],
             'remaining': remaining,
             'target_deltas': self.observations[indices + 1] - self.observations[indices],
+            'indices': indices,
+            'goal_indices': goal_indices,
         }
 
 
@@ -324,14 +334,15 @@ class OnlineReplayBuffer:
         batch_size: int,
         *,
         her_probability: float = 0.0,
-        goal_indices: np.ndarray | None = None,
+        goal_projector: Callable[[Any], np.ndarray] | None = None,
         success_tolerance: float = 1e-5,
     ) -> dict[str, np.ndarray]:
         if self.size < 1:
             raise ValueError('Cannot sample an empty replay buffer.')
         valid_slots = np.flatnonzero(self.episode_ids >= 0)
         indices = self.rng.choice(valid_slots, size=int(batch_size), replace=True)
-        goals = self.goals[indices].copy()
+        behavior_goals = self.goals[indices].copy()
+        goals = behavior_goals.copy()
         rewards = self.rewards[indices].copy()
         masks = self.masks[indices].copy()
         commanded_success_fraction = np.mean(rewards >= 0.0, dtype=np.float32)
@@ -356,11 +367,17 @@ class OnlineReplayBuffer:
             relabeled[row] = True
             goals[row] = self.next_observations[future_slot]
             achieved = self.next_observations[slot]
-            if goal_indices is not None:
-                achieved = achieved[goal_indices]
-                target = goals[row][goal_indices]
-            else:
-                target = goals[row]
+            target = goals[row]
+            if goal_projector is not None:
+                achieved = np.asarray(goal_projector(achieved), dtype=np.float32)
+                target = np.asarray(goal_projector(target), dtype=np.float32)
+                if achieved.size == 0 or target.size == 0:
+                    raise ValueError('Goal projector returned an empty representation.')
+                if achieved.shape != target.shape:
+                    raise ValueError(
+                        'Goal projector returned mismatched achieved/target shapes: '
+                        f'{achieved.shape} versus {target.shape}.'
+                    )
             success = bool(np.linalg.norm(achieved - target) <= success_tolerance)
             her_successes[row] = success
             rewards[row] = 0.0 if success else -1.0
@@ -376,6 +393,7 @@ class OnlineReplayBuffer:
             'actions': self.actions[indices],
             'next_observations': self.next_observations[indices],
             'goals': goals,
+            'behavior_goals': behavior_goals,
             'rewards': rewards,
             'masks': masks,
             'desired_next': self.desired_next[indices],

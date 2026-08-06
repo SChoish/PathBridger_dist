@@ -33,7 +33,7 @@ def test_action_free_information_regimes_and_online_only_idm():
 def test_locked_main_manifest_dimensions_and_schedule():
     assert len(MAIN_ALGORITHMS) * len(ENVIRONMENTS) * 5 == 280
     assert EVAL_STEPS == '0,10000,25000,50000,100000,250000,500000,1000000'
-    assert len(MAIN_ALGORITHMS) * len(SUITES['p0_smoke']['environments']) == 14
+    assert len(MAIN_ALGORITHMS) * len(SUITES['p0_smoke']['environments']) == 21
     assert (
         len(MAIN_ALGORITHMS)
         * len(SUITES['pilot']['environments'])
@@ -71,6 +71,15 @@ def test_score_matrix_rejects_unbalanced_runs():
         {'seed': 1, 'env_name': 'a', 'score': 1.0},
     ]
     with pytest.raises(ValueError, match='Unbalanced'):
+        _score_matrix(rows, 'score')
+
+
+def test_score_matrix_rejects_duplicate_runs():
+    rows = [
+        {'seed': 0, 'env_name': 'a', 'score': 1.0},
+        {'seed': 0, 'env_name': 'a', 'score': 2.0},
+    ]
+    with pytest.raises(ValueError, match='Duplicate'):
         _score_matrix(rows, 'score')
 
 

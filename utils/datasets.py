@@ -455,9 +455,13 @@ class PathBridgerDataset:
 def action_free_view(dataset: Dataset) -> Dataset:
     """Return an immutable offline view with action/reward supervision removed."""
 
-    forbidden = {'actions', 'rewards', 'returns', 'return_to_go', 'rtg'}
-    fields = {key: dataset[key] for key in dataset if key.lower() not in forbidden}
-    return Dataset.create(**fields)
+    source_keys = {key.lower(): key for key in dataset}
+    if not {'observations', 'terminals'} <= set(source_keys):
+        raise ValueError('Action-free view requires observations and terminals.')
+    return Dataset.create(
+        observations=dataset[source_keys['observations']],
+        terminals=dataset[source_keys['terminals']],
+    )
 
 
 __all__ = [

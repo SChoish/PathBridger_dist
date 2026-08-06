@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
 import os
 import random
@@ -41,6 +42,7 @@ from utils.log_utils import CsvLogger, get_exp_name
 
 
 FLAGS = flags.FLAGS
+PROTOCOL_VERSION = 'af_o2o_v2'
 _DEFAULT_PBF_CONFIG = str(
     Path(__file__).resolve().parent / 'configs' / 'pbf_af' / 'antmaze_medium.py'
 )
@@ -51,6 +53,7 @@ flags.DEFINE_string('dataset_dir', '', 'Optional OGBench dataset/cache directory
 flags.DEFINE_integer('seed', 0, 'Pipeline seed.')
 flags.DEFINE_string('save_dir', 'exp/', 'Experiment root.')
 flags.DEFINE_string('run_group', 'af_main', 'Experiment group.')
+flags.DEFINE_string('protocol_suite', 'adhoc', 'Benchmark suite recorded in metadata.')
 flags.DEFINE_integer('offline_steps', -1, 'Offline updates; -1 uses the algorithm-faithful default.')
 flags.DEFINE_integer('online_steps', 1_000_000, 'Primitive online environment steps.')
 flags.DEFINE_integer('random_steps', 10_000, 'Random bootstrap steps included in the online budget.')
@@ -90,6 +93,15 @@ def _parse_eval_steps(value: str, maximum: int) -> tuple[int, ...]:
     if any(step < 0 for step in steps):
         raise ValueError('eval_steps cannot contain negative values.')
     return tuple(step for step in steps if step <= maximum)
+
+
+def _stable_hash(payload) -> str:
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(',', ':'),
+    ).encode('utf-8')
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _delta_scale(data: ActionFreeTrajectoryData) -> np.ndarray:
@@ -271,8 +283,35 @@ def main(_):
                 offline_logger.log(_host_metrics(info), step)
         offline_logger.close()
 
+    eval_step_list = list(_parse_eval_steps(FLAGS.eval_steps, FLAGS.online_steps))
+    protocol_payload = {
+        'protocol_version': PROTOCOL_VERSION,
+        'suite': str(FLAGS.protocol_suite),
+        'run_group': str(FLAGS.run_group),
+        'online_steps': int(FLAGS.online_steps),
+        'random_steps': int(FLAGS.random_steps),
+        'update_start': int(FLAGS.update_start),
+        'replay_capacity': int(FLAGS.replay_capacity),
+        'eval_steps': eval_step_list,
+        'eval_episodes_per_task': int(FLAGS.eval_episodes),
+        'evaluation_task_ids': list(DEFAULT_TASK_IDS),
+    }
+    protocol_id = f'{PROTOCOL_VERSION}:{_stable_hash(protocol_payload)[:16]}'
+    config_payload = {
+        **protocol_payload,
+        'algorithm': name,
+        'env_name': env_name,
+        'offline_steps': int(resolved_offline_steps),
+        'config': resolved_config,
+        'pbf_config': planner_config,
+    }
     run_metadata = metadata.to_dict()
     run_metadata.update(
+        protocol_version=PROTOCOL_VERSION,
+        protocol_id=protocol_id,
+        protocol_suite=str(FLAGS.protocol_suite),
+        run_group=str(FLAGS.run_group),
+        config_hash=_stable_hash(config_payload),
         env_name=env_name,
         seed=int(FLAGS.seed),
         offline_steps=int(resolved_offline_steps),
@@ -280,7 +319,7 @@ def main(_):
         random_steps=int(FLAGS.random_steps),
         update_start=int(FLAGS.update_start),
         replay_capacity=int(FLAGS.replay_capacity),
-        eval_steps=list(_parse_eval_steps(FLAGS.eval_steps, FLAGS.online_steps)),
+        eval_steps=eval_step_list,
         eval_episodes_per_task=int(FLAGS.eval_episodes),
         evaluation_task_ids=list(DEFAULT_TASK_IDS),
         online_goal_distribution='uniform_over_official_task_ids_per_episode',
@@ -464,7 +503,7 @@ def main(_):
                     if name == 'pbf_online_idm'
                     else float(resolved_config.get('her_probability', 0.8))
                 ),
-                goal_indices=af_data.phi_indices,
+                goal_projector=af_data.project_goals,
             )
             replay_metrics = {
                 key: online_batch.pop(key) for key in REPLAY_METRIC_KEYS

@@ -8,3 +8,4 @@ build/
 dist/
 exp/
 wandb/
+nohup_logs/

@@ -63,16 +63,27 @@ class TrainState(flax.struct.PyTreeNode):
         cls,
         model_def: nn.Module,
         params: Any,
-        tx: optax.GradientTransformation | None = None,
+        tx: optax.GradientTransformation | Mapping[str, optax.GradientTransformation] | None = None,
         **kwargs,
     ):
+        if isinstance(tx, Mapping):
+            opt_state = {}
+            for module_name, transform in tx.items():
+                key = f'modules_{module_name}'
+                if key not in params:
+                    raise ValueError(
+                        f'Optimizer module {module_name!r} has no parameter subtree {key!r}.'
+                    )
+                opt_state[module_name] = transform.init(params[key])
+        else:
+            opt_state = None if tx is None else tx.init(params)
         return cls(
             step=1,
             apply_fn=model_def.apply,
             model_def=model_def,
             params=params,
             tx=tx,
-            opt_state=None if tx is None else tx.init(params),
+            opt_state=opt_state,
             **kwargs,
         )
 
@@ -88,14 +99,53 @@ class TrainState(flax.struct.PyTreeNode):
     def apply_gradients(self, grads, **kwargs):
         if self.tx is None:
             raise ValueError('Cannot apply gradients without an optimizer.')
+        if isinstance(self.tx, Mapping):
+            raise ValueError(
+                'Module optimizers require apply_loss_fn(..., trainable_modules=...).'
+            )
         updates, opt_state = self.tx.update(grads, self.opt_state, self.params)
         params = optax.apply_updates(self.params, updates)
         return self.replace(step=self.step + 1, params=params, opt_state=opt_state, **kwargs)
 
-    def apply_loss_fn(self, loss_fn):
-        """Differentiate ``loss_fn(params)`` and apply one optimizer update."""
+    def apply_loss_fn(self, loss_fn, *, trainable_modules: Sequence[str] | None = None):
+        """Differentiate ``loss_fn`` and update only explicitly selected modules.
+
+        A mapping of module name to optimizer gives every trainable subtree its
+        own Adam counter and moments.  Optimizers for omitted modules are not
+        called, so both their parameters and optimizer states remain bitwise
+        unchanged across phase boundaries and delayed-policy steps.
+        """
         grads, info = jax.grad(loss_fn, has_aux=True)(self.params)
-        return self.apply_gradients(grads), info
+        if not isinstance(self.tx, Mapping):
+            if trainable_modules is not None:
+                raise ValueError('trainable_modules requires module optimizers.')
+            return self.apply_gradients(grads), info
+        if not trainable_modules:
+            raise ValueError('At least one trainable module must be selected.')
+
+        names = tuple(str(name) for name in trainable_modules)
+        if len(set(names)) != len(names):
+            raise ValueError(f'Duplicate trainable modules: {names}.')
+        frozen_params = isinstance(self.params, flax.core.FrozenDict)
+        params = flax.core.unfreeze(self.params) if frozen_params else dict(self.params)
+        opt_state = dict(self.opt_state)
+        for module_name in names:
+            if module_name not in self.tx:
+                raise ValueError(f'No optimizer configured for module {module_name!r}.')
+            key = f'modules_{module_name}'
+            transform = self.tx[module_name]
+            updates, module_opt_state = transform.update(
+                grads[key], self.opt_state[module_name], params[key]
+            )
+            params[key] = optax.apply_updates(params[key], updates)
+            opt_state[module_name] = module_opt_state
+        if frozen_params:
+            params = flax.core.freeze(params)
+        return self.replace(
+            step=self.step + 1,
+            params=params,
+            opt_state=opt_state,
+        ), info
 
 
 _CHECKPOINT_NAME = re.compile(r'^params_(\d+)\.pkl$')

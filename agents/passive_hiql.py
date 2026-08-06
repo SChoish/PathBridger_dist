@@ -105,7 +105,9 @@ class PassiveHIQLAgent(flax.struct.PyTreeNode):
                 'high/weight_mean': weights.mean(),
             }
 
-        network, info = self.network.apply_loss_fn(loss_fn)
+        network, info = self.network.apply_loss_fn(
+            loss_fn, trainable_modules=('value', 'high_policy')
+        )
         network = self._update_target(network)
         return self.replace(rng=new_rng, network=network), info
 
@@ -117,8 +119,9 @@ class PassiveHIQLAgent(flax.struct.PyTreeNode):
 
         def loss_fn(params):
             value_loss, info = self._value_loss(batch, params)
+            behavior_goals = batch.get('behavior_goals', batch['goals'])
             subgoals = self.network.select('high_policy')(
-                batch['observations'], batch['goals']
+                batch['observations'], behavior_goals
             )
             mean, log_std = self.network.select('low_policy')(
                 batch['observations'], subgoals, params=params
@@ -161,7 +164,9 @@ class PassiveHIQLAgent(flax.struct.PyTreeNode):
                 'low/weight_mean': weights.mean(),
             }
 
-        network, info = self.network.apply_loss_fn(loss_fn)
+        network, info = self.network.apply_loss_fn(
+            loss_fn, trainable_modules=('value', 'low_policy')
+        )
         network = self._update_target(network)
         return self.replace(rng=new_rng, network=network), info
 
@@ -212,8 +217,14 @@ class PassiveHIQLAgent(flax.struct.PyTreeNode):
             low_policy=(observations, goals),
         )['params']
         params = _replace_subtree(params, 'target_value', params['modules_value'])
+        learning_rate = float(config['learning_rate'])
         network = TrainState.create(
-            model, params, tx=optax.adam(float(config['learning_rate']))
+            model,
+            params,
+            tx={
+                name: optax.adam(learning_rate)
+                for name in ('value', 'high_policy', 'low_policy')
+            },
         )
         return cls(rng=rng, network=network, config=flax.core.FrozenDict(config))
 

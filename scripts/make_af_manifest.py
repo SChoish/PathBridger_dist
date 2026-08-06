@@ -34,6 +34,7 @@ SUITES = {
         'environments': (
             'antmaze-medium-navigate-v0',
             'cube-double-play-v0',
+            'scene-play-v0',
         ),
         'seeds': (0,),
         'online_steps': 50_000,
@@ -86,6 +87,7 @@ def main():
                     f'--algorithm={algorithm}',
                     f'--seed={seed}',
                     f'--run_group={run_group}',
+                    f'--protocol_suite={args.suite}',
                     f'--online_steps={suite["online_steps"]}',
                     '--random_steps=10000',
                     '--replay_capacity=1000000',

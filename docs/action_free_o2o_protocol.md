@@ -29,7 +29,10 @@ PBF tree changes.
 The default `--pbf_execute_horizon=1` replans every primitive step.
 `--pbf_execute_horizon=5` uses a real collection-time action queue: all five
 decoded primitive transitions are executed and stored before replanning.  This
-is deterministic PBF prefix execution, not a stochastic PathFlower claim.
+is deterministic PBF prefix execution, not a stochastic PathFlower claim.  The
+five actions are decoded from the planned state pairs before execution, so this
+setting is explicitly **open-loop**; feedback decoding is reserved for a later
+ablation and is not conflated with the main method.
 
 ## Main methods and provenance
 
@@ -111,7 +114,8 @@ within each environment, and also reports pairwise probability of improvement.
 
 ## Locked runs
 
-Start with the required 14-run P0 gate (7 methods x 2 environments x 1 seed):
+Start with the required 21-run P0 gate (7 methods x 3 environments x 1 seed),
+including Scene to exercise its non-indexable oracle goal projection:
 
 ```bash
 python scripts/make_af_manifest.py --suite=p0_smoke --output=p0_smoke.csv

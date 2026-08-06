@@ -90,7 +90,10 @@ class MSCPAgent(flax.struct.PyTreeNode):
                 'fast/pessimism': pessimism,
             }
 
-        network, info = self.network.apply_loss_fn(loss_fn)
+        network, info = self.network.apply_loss_fn(
+            loss_fn,
+            trainable_modules=('value', 'slow_planner', 'fast_planner'),
+        )
         network = self._update_target(network)
         return self.replace(network=network), info
 
@@ -101,11 +104,18 @@ class MSCPAgent(flax.struct.PyTreeNode):
         def loss_fn(params):
             online_value, online_info = self._value_loss(online_batch, params)
             offline_value, _ = self._value_loss(offline_batch, params)
+            behavior_goals = online_batch.get(
+                'behavior_goals', online_batch['goals']
+            )
             slow = self.network.select('slow_planner')(
-                online_batch['observations'], online_batch['goals']
+                online_batch['observations'],
+                behavior_goals,
+                params=params if tune_planners else None,
             )
             desired_next = self.network.select('fast_planner')(
-                online_batch['observations'], slow
+                online_batch['observations'],
+                slow,
+                params=params if tune_planners else None,
             )
             mean, log_std = self.network.select('low_policy')(
                 online_batch['observations'], desired_next, params=params
@@ -120,11 +130,13 @@ class MSCPAgent(flax.struct.PyTreeNode):
             low_loss = -jnp.sum(log_prob, axis=-1).mean()
             planner_loss = jnp.zeros((), dtype=low_loss.dtype)
             if tune_planners:
-                fast_online = self.network.select('fast_planner')(
-                    online_batch['observations'], online_batch['goals'], params=params
-                )
                 planner_loss = jnp.mean(
-                    jnp.sum(jnp.square(fast_online - online_batch['next_observations']), axis=-1)
+                    jnp.sum(
+                        jnp.square(
+                            desired_next - online_batch['next_observations']
+                        ),
+                        axis=-1,
+                    )
                 )
             value_loss = 0.5 * (online_value + offline_value)
             total = value_loss + low_loss + planner_loss
@@ -136,7 +148,12 @@ class MSCPAgent(flax.struct.PyTreeNode):
                 'planner/online_loss': planner_loss,
             }
 
-        network, info = self.network.apply_loss_fn(loss_fn)
+        trainable_modules = ('value', 'low_policy')
+        if tune_planners:
+            trainable_modules += ('slow_planner', 'fast_planner')
+        network, info = self.network.apply_loss_fn(
+            loss_fn, trainable_modules=trainable_modules
+        )
         network = self._update_target(network)
         return self.replace(network=network), info
 
@@ -200,8 +217,19 @@ class MSCPAgent(flax.struct.PyTreeNode):
             low_policy=(observations, observations),
         )['params']
         params = _replace_subtree(params, 'target_value', params['modules_value'])
+        learning_rate = float(config['learning_rate'])
         network = TrainState.create(
-            model, params, tx=optax.adam(float(config['learning_rate']))
+            model,
+            params,
+            tx={
+                name: optax.adam(learning_rate)
+                for name in (
+                    'value',
+                    'slow_planner',
+                    'fast_planner',
+                    'low_policy',
+                )
+            },
         )
         return cls(rng=rng, network=network, config=flax.core.FrozenDict(config))
 

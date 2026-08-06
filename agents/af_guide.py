@@ -31,14 +31,14 @@ class TransformerBlock(nn.Module):
     num_heads: int
 
     @nn.compact
-    def __call__(self, inputs):
+    def __call__(self, inputs, attention_mask=None):
         normalized = nn.LayerNorm()(inputs)
         attended = nn.SelfAttention(
             num_heads=self.num_heads,
             qkv_features=self.embed_dim,
             out_features=self.embed_dim,
             dropout_rate=0.0,
-        )(normalized)
+        )(normalized, mask=attention_mask)
         hidden = inputs + attended
         feed_forward = MLP((4 * self.embed_dim, self.embed_dim))(
             nn.LayerNorm()(hidden)
@@ -77,12 +77,19 @@ class GoalConditionedAFDT(nn.Module):
             + horizon_token[:, None, :]
             + positions[None, :, :]
         )
-        if history_masks is not None:
-            tokens = tokens * history_masks[..., None]
+        if history_masks is None:
+            history_masks = jnp.ones(
+                histories.shape[:2], dtype=histories.dtype
+            )
+        tokens = tokens * history_masks[..., None]
+        attention_mask = nn.make_attention_mask(
+            history_masks > 0,
+            history_masks > 0,
+        )
         for block in range(self.num_blocks):
             tokens = TransformerBlock(
                 self.embed_dim, self.num_heads, name=f'block_{block}'
-            )(tokens)
+            )(tokens, attention_mask)
         return nn.Dense(self.state_dim, name='delta_head')(
             nn.LayerNorm()(tokens[:, -1, :])
         )
@@ -116,12 +123,20 @@ class AFGuideAgent(flax.struct.PyTreeNode):
                 'afdt/delta_rms': jnp.sqrt(jnp.mean(jnp.square(predictions))),
             }
 
-        network, info = self.network.apply_loss_fn(loss_fn)
+        network, info = self.network.apply_loss_fn(
+            loss_fn, trainable_modules=('afdt',)
+        )
         return self.replace(network=network), info
 
     @partial(jax.jit, static_argnames=())
     def online_update(self, batch):
-        new_rng, next_seed, actor_seed = jax.random.split(self.rng, 3)
+        (
+            new_rng,
+            next_env_seed,
+            next_guide_seed,
+            actor_env_seed,
+            actor_guide_seed,
+        ) = jax.random.split(self.rng, 5)
 
         def loss_fn(params):
             guide_valid = jnp.asarray(
@@ -133,11 +148,12 @@ class AFGuideAgent(flax.struct.PyTreeNode):
             )
             valid_count = jnp.maximum(jnp.sum(guide_valid), 1.0)
             valid_fraction = jnp.mean(guide_valid)
+            behavior_goals = batch.get('behavior_goals', batch['goals'])
             next_mean, next_log_std = self.network.select('actor')(
                 batch['next_observations'], batch['goals']
             )
             next_actions, next_log_prob = _sample_tanh_gaussian(
-                next_mean, next_log_std, next_seed, 1.0
+                next_mean, next_log_std, next_env_seed, 1.0
             )
             target_q = jnp.minimum(
                 *self.network.select('target_critic')(
@@ -158,9 +174,20 @@ class AFGuideAgent(flax.struct.PyTreeNode):
                 )
                 + 1e-6
             )
+            next_guide_mean, next_guide_log_std = self.network.select('actor')(
+                batch['next_observations'], behavior_goals
+            )
+            next_guide_actions, _ = _sample_tanh_gaussian(
+                next_guide_mean,
+                next_guide_log_std,
+                next_guide_seed,
+                1.0,
+            )
             target_guide = jnp.minimum(
                 *self.network.select('target_guide_critic')(
-                    batch['next_observations'], batch['goals'], next_actions
+                    batch['next_observations'],
+                    behavior_goals,
+                    next_guide_actions,
                 )
             )
             guide_target = jax.lax.stop_gradient(
@@ -171,7 +198,10 @@ class AFGuideAgent(flax.struct.PyTreeNode):
                 batch['observations'], batch['goals'], batch['actions'], params=params
             )
             g1, g2 = self.network.select('guide_critic')(
-                batch['observations'], batch['goals'], batch['actions'], params=params
+                batch['observations'],
+                behavior_goals,
+                batch['actions'],
+                params=params,
             )
             env_critic_loss = jnp.mean(
                 jnp.square(q1 - env_target) + jnp.square(q2 - env_target)
@@ -185,25 +215,34 @@ class AFGuideAgent(flax.struct.PyTreeNode):
                 batch['observations'], batch['goals'], params=params
             )
             actions, log_prob = _sample_tanh_gaussian(
-                mean, log_std, actor_seed, 1.0
+                mean, log_std, actor_env_seed, 1.0
             )
             actor_q = jnp.minimum(
                 *self.network.select('critic')(
                     batch['observations'], batch['goals'], actions
                 )
             )
+            guide_mean, guide_log_std = self.network.select('actor')(
+                batch['observations'], behavior_goals, params=params
+            )
+            guide_actions, _ = _sample_tanh_gaussian(
+                guide_mean,
+                guide_log_std,
+                actor_guide_seed,
+                1.0,
+            )
             actor_guide = jnp.minimum(
                 *self.network.select('guide_critic')(
-                    batch['observations'], batch['goals'], actions
+                    batch['observations'], behavior_goals, guide_actions
                 )
             )
-            actor_loss = jnp.mean(
-                float(self.config['entropy_coefficient']) * log_prob
-                - actor_q
-                - float(self.config['guide_weight'])
-                * valid_fraction
-                * actor_guide
+            env_actor_loss = jnp.mean(
+                float(self.config['entropy_coefficient']) * log_prob - actor_q
             )
+            guide_actor_loss = -float(self.config['guide_weight']) * jnp.sum(
+                guide_valid * actor_guide
+            ) / valid_count
+            actor_loss = env_actor_loss + guide_actor_loss
             total = critic_loss + actor_loss
             return total, {
                 'loss/total': total,
@@ -211,13 +250,17 @@ class AFGuideAgent(flax.struct.PyTreeNode):
                 'critic/q_mean': 0.5 * (q1.mean() + q2.mean()),
                 'critic/q_std': jnp.stack([q1, q2]).std(),
                 'actor/loss': actor_loss,
+                'guide/actor_loss': guide_actor_loss,
                 'guide/reward': jnp.sum(guide_valid * guide_reward) / valid_count,
                 'guide/q_mean': 0.5 * (g1.mean() + g2.mean()),
                 'guide/critic_loss': guide_critic_loss,
                 'guide/valid_target_fraction': valid_fraction,
             }
 
-        network, info = self.network.apply_loss_fn(loss_fn)
+        network, info = self.network.apply_loss_fn(
+            loss_fn,
+            trainable_modules=('actor', 'critic', 'guide_critic'),
+        )
         network = self._update_targets(network)
         return self.replace(rng=new_rng, network=network), info
 
@@ -303,8 +346,14 @@ class AFGuideAgent(flax.struct.PyTreeNode):
         params = _replace_subtree(
             params, 'target_guide_critic', params['modules_guide_critic']
         )
+        learning_rate = float(config['learning_rate'])
         network = TrainState.create(
-            model, params, tx=optax.adam(float(config['learning_rate']))
+            model,
+            params,
+            tx={
+                name: optax.adam(learning_rate)
+                for name in ('afdt', 'actor', 'critic', 'guide_critic')
+            },
         )
         scale = jnp.asarray(state_scale, dtype=jnp.float32)
         return cls(

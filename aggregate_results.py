@@ -65,9 +65,14 @@ def _iqm(values):
 def _score_matrix(rows, metric):
     envs = sorted({row['env_name'] for row in rows})
     seeds = sorted({int(row['seed']) for row in rows})
-    values = {
-        (int(row['seed']), row['env_name']): float(row[metric]) for row in rows
-    }
+    values = {}
+    for row in rows:
+        key = (int(row['seed']), row['env_name'])
+        if key in values:
+            raise ValueError(
+                f'Duplicate seed x environment entry for {metric}: {key}.'
+            )
+        values[key] = float(row[metric])
     missing = [
         (seed, env) for seed in seeds for env in envs if (seed, env) not in values
     ]
@@ -134,12 +139,28 @@ def main(_):
     output_dir = Path(FLAGS.output_dir) if FLAGS.output_dir else root / 'aggregate'
     output_dir.mkdir(parents=True, exist_ok=True)
     records = []
+    seen_runs = {}
+    required_protocol_fields = {
+        'protocol_version',
+        'protocol_id',
+        'protocol_suite',
+        'run_group',
+        'config_hash',
+        'offline_steps',
+        'online_steps',
+    }
     for metadata_path in root.rglob('metadata.json'):
         run_dir = metadata_path.parent
         eval_path = run_dir / 'eval.csv'
         if not eval_path.is_file():
             continue
         metadata = json.loads(metadata_path.read_text())
+        missing_fields = sorted(required_protocol_fields - set(metadata))
+        if missing_fields:
+            raise ValueError(
+                f'{metadata_path} predates the isolated aggregation protocol; '
+                f'missing {missing_fields}.'
+            )
         points = _read_curve(eval_path)
         if not points:
             continue
@@ -148,13 +169,32 @@ def main(_):
         # carrying its last score forward to the requested budget.
         if points[-1][0] < budget:
             continue
+        run_key = (
+            metadata['protocol_id'],
+            metadata['algorithm'],
+            int(metadata['seed']),
+            metadata['env_name'],
+        )
+        if run_key in seen_runs:
+            raise ValueError(
+                'Duplicate (protocol_id, algorithm, seed, env) result: '
+                f'{run_key} in {seen_runs[run_key]} and {run_dir}.'
+            )
+        seen_runs[run_key] = str(run_dir)
         records.append(
             {
+                'protocol_version': metadata['protocol_version'],
+                'protocol_id': metadata['protocol_id'],
+                'protocol_suite': metadata['protocol_suite'],
+                'run_group': metadata['run_group'],
+                'config_hash': metadata['config_hash'],
                 'algorithm': metadata['algorithm'],
                 'group': _result_group(metadata['port_kind']),
                 'port_kind': metadata['port_kind'],
                 'env_name': metadata['env_name'],
                 'seed': int(metadata['seed']),
+                'offline_steps': int(metadata['offline_steps']),
+                'online_steps': budget,
                 'auc_250k': (
                     _auc(points, 250_000) if budget >= 250_000 else float('nan')
                 ),
@@ -164,7 +204,15 @@ def main(_):
                 'run_dir': str(run_dir),
             }
         )
-    records.sort(key=lambda row: (row['group'], row['algorithm'], row['env_name'], row['seed']))
+    records.sort(
+        key=lambda row: (
+            row['protocol_id'],
+            row['group'],
+            row['algorithm'],
+            row['env_name'],
+            row['seed'],
+        )
+    )
     if records:
         with (output_dir / 'runs.csv').open('w', newline='', encoding='utf-8') as file:
             writer = csv.DictWriter(file, fieldnames=list(records[0]))
@@ -175,8 +223,14 @@ def main(_):
     matrices = {}
     by_algorithm = defaultdict(list)
     for record in records:
-        by_algorithm[record['algorithm']].append(record)
-    for algorithm, rows in sorted(by_algorithm.items()):
+        summary_key = (
+            record['protocol_id'],
+            record['algorithm'],
+            record['offline_steps'],
+        )
+        by_algorithm[summary_key].append(record)
+    for summary_key, rows in sorted(by_algorithm.items()):
+        protocol_id, algorithm, offline_steps = summary_key
         try:
             final_matrix, seeds, envs = _score_matrix(rows, 'final_success')
             auc_250k_matrix, _, _ = _score_matrix(rows, 'auc_250k')
@@ -203,7 +257,9 @@ def main(_):
             if np.all(np.isfinite(auc_250k_matrix))
             else 'auc_full'
         )
-        matrices[algorithm] = {
+        matrices[summary_key] = {
+            'protocol_id': protocol_id,
+            'algorithm': algorithm,
             'group': rows[0]['group'],
             'envs': envs,
             'metric': comparison_metric,
@@ -215,12 +271,21 @@ def main(_):
         }
         summaries.append(
             {
+                'protocol_version': rows[0]['protocol_version'],
+                'protocol_id': protocol_id,
+                'protocol_suite': rows[0]['protocol_suite'],
+                'run_group': rows[0]['run_group'],
+                'config_hashes': json.dumps(
+                    sorted({row['config_hash'] for row in rows})
+                ),
                 'algorithm': algorithm,
                 'group': rows[0]['group'],
                 'port_kind': rows[0]['port_kind'],
                 'num_runs': len(rows),
                 'num_envs': len(envs),
                 'num_seeds': len(seeds),
+                'offline_steps': offline_steps,
+                'online_steps': rows[0]['online_steps'],
                 'final_iqm': _iqm(final_matrix.reshape(-1)),
                 'final_iqm_ci_low': final_ci[0],
                 'final_iqm_ci_high': final_ci[1],
@@ -239,11 +304,12 @@ def main(_):
             writer.writerows(summaries)
 
     comparisons = []
-    for left_name, right_name in itertools.combinations(sorted(matrices), 2):
-        left = matrices[left_name]
-        right = matrices[right_name]
+    for left_key, right_key in itertools.combinations(sorted(matrices), 2):
+        left = matrices[left_key]
+        right = matrices[right_key]
         if (
-            left['group'] != right['group']
+            left['protocol_id'] != right['protocol_id']
+            or left['group'] != right['group']
             or left['envs'] != right['envs']
             or left['metric'] != right['metric']
         ):
@@ -259,8 +325,9 @@ def main(_):
         )
         comparisons.append(
             {
-                'algorithm_x': left_name,
-                'algorithm_y': right_name,
+                'protocol_id': left['protocol_id'],
+                'algorithm_x': left['algorithm'],
+                'algorithm_y': right['algorithm'],
                 'group': left['group'],
                 'metric': left['metric'],
                 'probability_x_better': probability,

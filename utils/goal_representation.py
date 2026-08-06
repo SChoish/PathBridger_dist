@@ -10,6 +10,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 import jax.numpy as jnp
+import numpy as np
 
 _MANIP_ARM_JOINT_DIM = 6
 _MANIP_HEAD_DIM = 2 * _MANIP_ARM_JOINT_DIM + 3 + 1 + 1 + 1 + 1
@@ -262,9 +263,80 @@ def goal_representation(
     return jnp.take(goals, jnp.asarray(indices, dtype=jnp.int32), axis=-1)
 
 
+def goal_representation_np(
+    goals: np.ndarray | None,
+    mode: str = 'phi',
+    phi_goal_obs_indices: Sequence[int] | tuple[int, ...] = (),
+    *,
+    env_name: str | None = None,
+) -> np.ndarray | None:
+    """NumPy equivalent of :func:`goal_representation` for host replay code.
+
+    Scene goals cannot be represented by a fixed index array because each
+    button is encoded as a one-hot block.  Keeping a real projector here makes
+    HER success checks use exactly the same achieved-goal semantics as the JAX
+    models instead of accidentally comparing empty vectors.
+    """
+
+    if goals is None:
+        return None
+    goals = np.asarray(goals)
+    normalize_phi_goal_obs_indices(phi_goal_obs_indices)
+    mode = str(mode).lower()
+    if mode in ('full', 'raw', 'none', ''):
+        return goals
+    if mode not in ('phi', 'auto', 'goal_phi'):
+        raise ValueError(f"Unknown goal_representation={mode!r}; expected 'full' or 'phi'.")
+
+    obs_dim = int(goals.shape[-1])
+    kind = _env_goal_phi_kind(env_name)
+    if kind == 'scene':
+        num_cubes, num_buttons, num_states = _scene_layout(obs_dim, env_name)
+        cursor = _MANIP_HEAD_DIM
+        parts: list[np.ndarray] = []
+        cube_indices: list[int] = []
+        for _ in range(num_cubes):
+            cube_indices.extend((cursor, cursor + 1, cursor + 2))
+            cursor += _MANIP_CUBE_STRIDE
+        if cube_indices:
+            parts.append(np.take(goals, cube_indices, axis=-1))
+        button_scalars: list[np.ndarray] = []
+        button_stride = num_states + 2
+        for _ in range(num_buttons):
+            one_hot = goals[..., cursor : cursor + num_states]
+            button_scalars.append(np.argmax(one_hot, axis=-1).astype(np.float32))
+            cursor += button_stride
+        if button_scalars:
+            parts.append(np.stack(button_scalars, axis=-1))
+        expected_cursor = obs_dim - _SCENE_TAIL_DIM
+        if cursor != expected_cursor:
+            raise ValueError(
+                f'Inconsistent Scene layout: parsed through {cursor}, '
+                f'expected {expected_cursor}.'
+            )
+        parts.append(np.take(goals, [obs_dim - 4, obs_dim - 2], axis=-1))
+        return parts[0] if len(parts) == 1 else np.concatenate(parts, axis=-1)
+
+    if kind == 'puzzle':
+        indices = _button_state_indices(obs_dim)
+    elif kind == 'cube':
+        indices = _cube_position_indices(obs_dim)
+    elif kind in ('antmaze', 'humanoidmaze'):
+        indices = _MAZE_GOAL_XY_INDICES if obs_dim >= 2 else ()
+    else:
+        raise AssertionError(f'Unhandled phi kind {kind!r}.')
+    if not indices:
+        raise ValueError(
+            f"goal_representation='phi' is incompatible with env={env_name!r}, "
+            f'obs_dim={obs_dim}.'
+        )
+    return np.take(goals, indices, axis=-1)
+
+
 __all__ = [
     'assert_phi_goal_obs_indices',
     'goal_representation',
+    'goal_representation_np',
     'infer_phi_goal_obs_indices',
     'normalize_phi_goal_obs_indices',
 ]

@@ -199,31 +199,48 @@ class GoalConditionedActorCritic(flax.struct.PyTreeNode):
             'actor/entropy': -log_prob.mean(),
         }
 
-    @partial(jax.jit, static_argnames=())
     def update(
         self, batch: dict[str, jnp.ndarray]
     ) -> tuple['GoalConditionedActorCritic', dict[str, jnp.ndarray]]:
+        update_actor = self.config['algorithm'] == 'sac' or (
+            int(self.network.step) % int(self.config['policy_delay']) == 0
+        )
+        return self._update_impl(batch, update_actor=update_actor)
+
+    @partial(jax.jit, static_argnames=('update_actor',))
+    def _update_impl(
+        self,
+        batch: dict[str, jnp.ndarray],
+        *,
+        update_actor: bool,
+    ) -> tuple['GoalConditionedActorCritic', dict[str, jnp.ndarray]]:
         new_rng, critic_seed, actor_seed = jax.random.split(self.rng, 3)
-        if self.config['algorithm'] == 'sac':
-            update_actor = jnp.asarray(True)
-        else:
-            update_actor = (
-                jnp.mod(self.network.step, int(self.config['policy_delay'])) == 0
-            )
 
         def loss_fn(grad_params):
             critic_loss, info = self.critic_loss(batch, grad_params, critic_seed)
-            actor_loss, actor_info = self.actor_loss(batch, grad_params, actor_seed)
-            actor_scale = jnp.asarray(update_actor, dtype=critic_loss.dtype)
-            total = critic_loss + actor_scale * actor_loss
+            if update_actor:
+                actor_loss, actor_info = self.actor_loss(
+                    batch, grad_params, actor_seed
+                )
+            else:
+                actor_loss = jnp.zeros((), dtype=critic_loss.dtype)
+                actor_info = {
+                    'actor/loss': actor_loss,
+                    'actor/action_abs_mean': actor_loss,
+                    'actor/entropy': actor_loss,
+                }
+            total = critic_loss + actor_loss
             return total, {'loss/total': total, **info, **actor_info}
 
-        network, info = self.network.apply_loss_fn(loss_fn)
+        trainable_modules = ('critic', 'actor') if update_actor else ('critic',)
+        network, info = self.network.apply_loss_fn(
+            loss_fn, trainable_modules=trainable_modules
+        )
         tau = float(self.config['tau'])
-        for source, target in (
-            ('critic', 'target_critic'),
-            ('actor', 'target_actor'),
-        ):
+        target_pairs = [('critic', 'target_critic')]
+        if update_actor:
+            target_pairs.append(('actor', 'target_actor'))
+        for source, target in target_pairs:
             updated = jax.tree_util.tree_map(
                 lambda value, target_value: tau * value + (1.0 - tau) * target_value,
                 network.params[f'modules_{source}'],
@@ -302,10 +319,14 @@ class GoalConditionedActorCritic(flax.struct.PyTreeNode):
         params = model.init(init_rng, **init_args)['params']
         params = _replace_subtree(params, 'target_actor', params['modules_actor'])
         params = _replace_subtree(params, 'target_critic', params['modules_critic'])
+        learning_rate = float(config['learning_rate'])
         network = TrainState.create(
             model,
             params,
-            tx=optax.adam(float(config['learning_rate'])),
+            tx={
+                'actor': optax.adam(learning_rate),
+                'critic': optax.adam(learning_rate),
+            },
         )
         return cls(
             rng=rng,
