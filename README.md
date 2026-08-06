@@ -11,13 +11,18 @@ PathBridger learns exactly four components:
 4. an inverse-dynamics model (IDM) that decodes the first five bridge
    transitions into actions.
 
-Both paper variants are included:
+Both paper endpoint variants are included:
 
 - **PBF** uses a conditional rectified flow for endpoint displacements.
 - **PBG** uses a conditional diagonal Gaussian.
 
+The endpoint backend is independent of the bridge-prefix backend. The default
+`prefix_model=deterministic` preserves PB, while `low_rank_gaussian` and
+`joint_flow` learn joint stochastic corrections to the executed five-step
+state prefix.
+
 There is no neural actor, action-conditioned critic, actor finetuning stage, or
-legacy algorithm switch in this distribution.
+Triangle-Q dependency in this distribution.
 
 ## Architecture
 
@@ -30,7 +35,8 @@ The diagram is the method overview bundled with the PathBridger paper source.
 ```text
 Pathbridger_dist/
 ├── agents/
-│   └── pathbridger.py       # Complete algorithm and its fixed constants.
+│   ├── pathbridger.py       # TransV, endpoint, bridge, IDM, and orchestration.
+│   └── prefix_generators.py # Joint Gaussian and flow prefix distributions.
 ├── assets/
 │   └── architecture.jpg     # Paper's bridge-policy overview.
 ├── configs/
@@ -191,6 +197,60 @@ boolean.
 `p_geom` and `p_traj` are mutually exclusive future-goal implementations.
 Because the final transitive value loss requires an ordered in-trajectory pair,
 `critic_p` must place all probability on either `p_geom` or `p_traj`.
+
+## Stochastic bridge prefixes
+
+A stochastic prefix is trained as a normalized residual around the detached
+deterministic bridge reference. Only the five states that can be executed
+before replanning are modeled; no full K-step stochastic path is created.
+Per-dimension scales are computed from the training observations and stored in
+both run and checkpoint metadata.
+
+```bash
+# Low-rank joint Gaussian, default rank 8.
+python main.py --agent=configs/pbf/cube_double.py \
+  --agent.prefix_model=low_rank_gaussian
+
+# Flattened joint rectified flow, default 8 Euler steps.
+python main.py --agent=configs/pbf/cube_double.py \
+  --agent.prefix_model=joint_flow
+```
+
+Inference first selects one endpoint with the unchanged online TransV score
+$V(s,z)V(z,g)$. `eval_prefix_selection=sample_one` then draws exactly one
+prefix for that endpoint. The optional `transv_chain` mode compares M stochastic
+prefixes, optionally including the deterministic prefix at candidate zero,
+using the EMA TransV chain score. It never expands every endpoint into M
+prefixes.
+
+The stochastic distribution loss is deliberately unweighted. Keep
+`path_weight_beta=0` for the primary deterministic/Gaussian/flow comparison;
+temporal-geodesic weighting should be enabled only as a separate ablation.
+
+## Temporal-geodesic bridge weighting
+
+The bridge objective additionally reweights each real dataset path by its
+one-sided temporal-geodesic defect under the EMA target TransV. For the first
+five transitions toward the padded trajectory endpoint, it estimates
+$d_i=\log V_{\mathrm{EMA}}(x_i,z)/\log\gamma$ and scores
+
+\[
+E(\tau,z)=\operatorname{mean}_{i\in A}
+\left[\max\left(0,\min(1,d_i)+d_{i+1}-d_i\right)\right],
+\]
+
+where $A$ excludes transitions whose current state already equals the
+endpoint. The per-path bridge weight is
+$w=\operatorname{clip}(\exp(-\beta E),w_{\min},1)$, detached from gradients,
+and the weighted bridge loss is normalized by the sum of weights.
+
+This stochastic branch defaults to `path_weight_beta=0` for clean
+backend comparisons. When enabled with the recommended `path_weight_beta=0.25`,
+weighting uses a 100k-step TransV warm-up and a 100k-step linear ramp; this
+avoids suppressing useful paths with an unreliable early value estimate.
+`path_weight_min=0.1` bounds the down-weighting. Geometry metrics
+include path energy, monotonic-violation rate, active-transition fraction,
+weight statistics, and effective sample-size fraction.
 
 ## Fixed implementation choices
 

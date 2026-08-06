@@ -10,7 +10,7 @@ from ml_collections import config_flags
 
 from agents import PathBridgerAgent
 from envs.env_utils import make_env_and_datasets
-from utils.datasets import PathBridgerDataset
+from utils.datasets import PathBridgerDataset, observation_state_scale
 from utils.evaluation import DEFAULT_TASK_IDS, evaluate
 from utils.flax_utils import resolve_checkpoint, restore_agent
 
@@ -56,12 +56,17 @@ def main(_):
         dataset_dir=FLAGS.dataset_dir or None,
     )
     dataset = PathBridgerDataset(train_data, config)
+    state_scale = observation_state_scale(
+        train_data,
+        floor=float(config.prefix_scale_floor),
+    )
     example_batch = dataset.sample(1)
     agent = PathBridgerAgent.create(
         FLAGS.seed,
         example_batch['observations'],
         example_batch['actions'],
         config,
+        state_scale=state_scale,
     )
     agent = restore_agent(agent, FLAGS.checkpoint_dir, FLAGS.checkpoint_step)
 
@@ -78,6 +83,15 @@ def main(_):
         'checkpoint_step': checkpoint_step,
         'env_name': str(config.env_name),
         'endpoint_distribution': str(config.endpoint_distribution),
+        'prefix_model': str(config.prefix_model),
+        'eval_prefix_selection': str(config.eval_prefix_selection),
+        'eval_num_prefix_samples': int(config.eval_num_prefix_samples),
+        'eval_prefix_temperature': float(config.eval_prefix_temperature),
+        'eval_include_deterministic_prefix': bool(
+            config.eval_include_deterministic_prefix
+        ),
+        'prefix_rank': int(config.prefix_rank),
+        'prefix_flow_steps': int(config.prefix_flow_steps),
         'eval_num_candidates': int(config.eval_num_candidates),
         'eval_temperature': float(config.eval_temperature),
         **{f'evaluation/{key}': value for key, value in metrics.items()},

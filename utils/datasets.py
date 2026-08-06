@@ -17,6 +17,7 @@ from typing import Any
 import numpy as np
 
 _ACTION_HORIZON = 5
+_BRIDGE_OFFSETS = np.arange(1, _ACTION_HORIZON + 1, dtype=np.int64)
 _CURRENT_GOAL = 0
 _FUTURE_GOAL = 1
 _RANDOM_GOAL = 2
@@ -141,6 +142,22 @@ def _config_get(config: Any, key: str) -> Any:
         raise ValueError(f"PathBridgerDataset config is missing {key!r}.") from exc
 
 
+def observation_state_scale(dataset: Dataset, floor: float = 1e-3) -> np.ndarray:
+    """Return per-state-dimension training standard deviations with a floor."""
+
+    floor = float(floor)
+    if not np.isfinite(floor) or floor <= 0.0:
+        raise ValueError(f"state scale floor must be positive and finite, got {floor}.")
+    observations = np.asarray(dataset["observations"], dtype=np.float32)
+    if observations.ndim != 2:
+        raise ValueError(
+            "state scale requires observations with shape [N, D], got "
+            f"{observations.shape}."
+        )
+    scale = np.std(observations.astype(np.float64), axis=0)
+    return np.maximum(scale, floor).astype(np.float32)
+
+
 def _validate_goal_mix(value: Any, *, name: str) -> tuple[float, float, float, float]:
     """Validate a ``(p_cur, p_geom, p_traj, p_rand)`` goal-sampling mix."""
 
@@ -246,11 +263,6 @@ class PathBridgerDataset:
                 f"No episode contains a full horizon-{self.horizon} state window."
             )
         self.valid_starts = np.concatenate(valid_parts)
-        self._bridge_offsets = np.arange(
-            1,
-            _ACTION_HORIZON + 1,
-            dtype=np.int64,
-        )
 
     def _validate_starts(self, idxs: Any) -> np.ndarray:
         idxs = np.asarray(idxs, dtype=np.int64)
@@ -369,7 +381,7 @@ class PathBridgerDataset:
         endpoint_target_idxs[random_endpoint_rows] = (
             idxs[random_endpoint_rows] + self.horizon
         )
-        bridge_target_idxs = idxs[:, None] + self._bridge_offsets[None, :]
+        bridge_target_idxs = idxs[:, None] + _BRIDGE_OFFSETS[None, :]
         bridge_target_idxs = np.minimum(
             bridge_target_idxs,
             endpoint_target_idxs[:, None],
@@ -420,4 +432,9 @@ class PathBridgerDataset:
         }
 
 
-__all__ = ["Dataset", "PathBridgerDataset", "PathBridgerDatasetConfig"]
+__all__ = [
+    "Dataset",
+    "PathBridgerDataset",
+    "PathBridgerDatasetConfig",
+    "observation_state_scale",
+]
