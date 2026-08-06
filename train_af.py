@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import random
+import signal
 import time
 from pathlib import Path
 
@@ -28,7 +29,12 @@ from agents.registry import (
     create_algorithm,
 )
 from envs.env_utils import make_env_and_datasets
-from utils.af_checkpoints import save_af_checkpoint
+from utils.af_checkpoints import (
+    load_af_checkpoint,
+    restore_af_agent,
+    restore_af_planner,
+    save_af_checkpoint,
+)
 from utils.af_data import (
     REPLAY_METRIC_KEYS,
     ActionFreeTrajectoryData,
@@ -67,10 +73,24 @@ flags.DEFINE_string(
     'Comma-separated online evaluation/checkpoint steps.',
 )
 flags.DEFINE_integer('eval_episodes', 10, 'Episodes per task at intermediate evaluation; zero disables evaluation.')
-flags.DEFINE_bool('save_replay', False, 'Include the replay arrays in checkpoints.')
+flags.DEFINE_bool(
+    'save_replay',
+    True,
+    'Include replay arrays in online checkpoints (needed for exact online resume).',
+)
 flags.DEFINE_bool('use_tqdm', True, 'Display progress bars.')
 flags.DEFINE_string('pbf_restore_path', '', 'Optional pretrained action-free PBF checkpoint.')
 flags.DEFINE_integer('pbf_restore_step', 0, 'PBF checkpoint step, or infer from exact filename.')
+flags.DEFINE_string(
+    'af_restore_path',
+    '',
+    'Optional AF checkpoint (.pkl) or directory for online/offline resume.',
+)
+flags.DEFINE_integer(
+    'af_restore_step',
+    -1,
+    'AF checkpoint step; -1 infers from path or latest step_*.pkl in a directory.',
+)
 flags.DEFINE_integer(
     'pbf_execute_horizon',
     1,
@@ -79,6 +99,71 @@ flags.DEFINE_integer(
 config_flags.DEFINE_config_file(
     'pbf', _DEFAULT_PBF_CONFIG, 'Environment-specific action-free PBF config.', lock_config=False
 )
+
+
+def _install_soft_stop(stop_requested: dict) -> None:
+    def _request_stop(signum, _frame):
+        if stop_requested['flag']:
+            return
+        stop_requested['flag'] = True
+        stop_requested['signum'] = int(signum)
+        print(
+            f'[signal] signum={signum} — will emergency-save after current step',
+            flush=True,
+        )
+
+    signal.signal(signal.SIGTERM, _request_stop)
+    signal.signal(signal.SIGINT, _request_stop)
+    try:
+        signal.signal(signal.SIGHUP, _request_stop)
+    except (ValueError, OSError):
+        pass
+
+
+def _resolve_af_restore_path(path: str, step: int) -> tuple[str | None, int | None]:
+    if not path:
+        return None, None
+    candidate = Path(path)
+    if candidate.is_dir():
+        if step >= 0:
+            online = candidate / f'step_{step}.pkl'
+            offline = candidate / f'offline_step_{step}.pkl'
+            if online.is_file():
+                return str(online), step
+            if offline.is_file():
+                return str(offline), step
+            raise FileNotFoundError(
+                f'No step_{step}.pkl or offline_step_{step}.pkl under {candidate}'
+            )
+        matches = sorted(
+            list(candidate.glob('step_*.pkl'))
+            + list(candidate.glob('offline_step_*.pkl')),
+            key=lambda item: item.stat().st_mtime,
+        )
+        if not matches:
+            raise FileNotFoundError(f'No step_*.pkl under {candidate}')
+        ckpt = matches[-1]
+        stem = ckpt.stem
+        step = int(stem.rsplit('_', 1)[-1])
+        return str(ckpt), step
+    if candidate.is_file():
+        if step < 0:
+            stem = candidate.stem
+            if stem.startswith('step_') or stem.startswith('offline_step_'):
+                step = int(stem.rsplit('_', 1)[-1])
+            else:
+                step = 0
+        return str(candidate), step
+    raise FileNotFoundError(path)
+
+
+def _write_emergency_marker(run_dir: str, step: int, signum: int | None, phase: str) -> None:
+    marker = Path(run_dir) / f'EMERGENCY_SAVE_{phase}_step{step}'
+    marker.write_text(f'signal={signum} phase={phase} step={step}\n', encoding='utf-8')
+    print(
+        f'[signal] emergency_save_done phase={phase} step={step} signum={signum}',
+        flush=True,
+    )
 
 
 def _host_metrics(info):
@@ -198,6 +283,40 @@ def main(_):
     )
     checkpoint_dir = os.path.join(run_dir, 'checkpoints')
     os.makedirs(checkpoint_dir, exist_ok=True)
+    stop_requested = {'flag': False, 'signum': None}
+    _install_soft_stop(stop_requested)
+    af_restore_file, af_restore_step = _resolve_af_restore_path(
+        FLAGS.af_restore_path, int(FLAGS.af_restore_step)
+    )
+    af_payload = None
+    skip_offline = False
+    online_start_step = 1
+    offline_start_step = 1
+    if af_restore_file is not None:
+        af_payload = load_af_checkpoint(af_restore_file)
+        if str(af_payload.get('algorithm')) != name:
+            raise ValueError(
+                f'AF restore algorithm mismatch: ckpt={af_payload.get("algorithm")} '
+                f'vs flags={name}'
+            )
+        phase = str(af_payload.get('phase', 'online'))
+        if phase == 'online':
+            skip_offline = True
+            online_start_step = int(af_payload['step']) + 1
+            print(
+                f'[resume] online from step={online_start_step} '
+                f'ckpt={af_restore_file}',
+                flush=True,
+            )
+        elif phase == 'offline':
+            offline_start_step = int(af_payload['step']) + 1
+            print(
+                f'[resume] offline from step={offline_start_step} '
+                f'ckpt={af_restore_file}',
+                flush=True,
+            )
+        else:
+            raise ValueError(f'Unsupported AF checkpoint phase={phase!r}')
 
     planner = None
     planner_config = None
@@ -224,10 +343,15 @@ def main(_):
         resolved_offline_steps = (
             int(FLAGS.offline_steps)
             if FLAGS.offline_steps >= 0
-            else (0 if FLAGS.pbf_restore_path else DEFAULT_OFFLINE_STEPS[name])
+            else (0 if FLAGS.pbf_restore_path or skip_offline else DEFAULT_OFFLINE_STEPS[name])
         )
+        if skip_offline:
+            resolved_offline_steps = 0
         offline_logger = CsvLogger(os.path.join(run_dir, 'offline.csv'))
-        iterator = range(1, resolved_offline_steps + 1)
+        offline_start = offline_start_step
+        if FLAGS.pbf_restore_path and FLAGS.pbf_restore_step > 0 and not skip_offline:
+            offline_start = max(offline_start, int(FLAGS.pbf_restore_step) + 1)
+        iterator = range(offline_start, resolved_offline_steps + 1)
         if FLAGS.use_tqdm and resolved_offline_steps:
             iterator = tqdm.tqdm(iterator, desc='offline-pbf', dynamic_ncols=True)
         for step in iterator:
@@ -237,8 +361,16 @@ def main(_):
             )
             if do_log:
                 offline_logger.log(_host_metrics(info), step)
-            if step % 100_000 == 0 or step == resolved_offline_steps:
+            emergency = bool(stop_requested['flag'])
+            if step % 100_000 == 0 or step == resolved_offline_steps or emergency:
                 save_agent(planner, os.path.join(run_dir, 'pbf_checkpoints'), step)
+                if emergency:
+                    _write_emergency_marker(
+                        run_dir, step, stop_requested['signum'], 'offline'
+                    )
+                    offline_logger.close()
+                    print(f'Run soft-stopped (offline) at {run_dir}', flush=True)
+                    return
         offline_logger.close()
         controller_config = idm_config().to_dict()
         controller_config['execute_horizon'] = int(FLAGS.pbf_execute_horizon)
@@ -259,15 +391,23 @@ def main(_):
         resolved_offline_steps = (
             int(FLAGS.offline_steps)
             if FLAGS.offline_steps >= 0
-            else DEFAULT_OFFLINE_STEPS[name]
+            else (0 if skip_offline else DEFAULT_OFFLINE_STEPS[name])
         )
+        if skip_offline:
+            resolved_offline_steps = 0
+        if (
+            af_payload is not None
+            and str(af_payload.get('phase')) == 'offline'
+            and not skip_offline
+        ):
+            agent = restore_af_agent(agent, af_payload)
         offline_logger = CsvLogger(os.path.join(run_dir, 'offline.csv'))
         batch_size = int(
             resolved_config.get(
                 'offline_batch_size', resolved_config.get('batch_size', 1024)
             )
         )
-        iterator = range(1, resolved_offline_steps + 1)
+        iterator = range(offline_start_step, resolved_offline_steps + 1)
         if FLAGS.use_tqdm and resolved_offline_steps:
             iterator = tqdm.tqdm(iterator, desc=f'offline-{name}', dynamic_ncols=True)
         for step in iterator:
@@ -282,6 +422,22 @@ def main(_):
             agent, info = agent.offline_update(batch)
             if step % FLAGS.log_interval == 0 or step == resolved_offline_steps:
                 offline_logger.log(_host_metrics(info), step)
+            if stop_requested['flag']:
+                save_af_checkpoint(
+                    os.path.join(checkpoint_dir, f'offline_step_{step}.pkl'),
+                    algorithm=name,
+                    agent=agent,
+                    step=step,
+                    config=resolved_config,
+                    metadata={'phase': 'offline'},
+                    phase='offline',
+                )
+                _write_emergency_marker(
+                    run_dir, step, stop_requested['signum'], 'offline'
+                )
+                offline_logger.close()
+                print(f'Run soft-stopped (offline) at {run_dir}', flush=True)
+                return
         offline_logger.close()
 
     eval_step_list = list(_parse_eval_steps(FLAGS.eval_steps, FLAGS.online_steps))
@@ -359,6 +515,44 @@ def main(_):
     start_time = time.time()
     last_info = {}
 
+    if af_payload is not None and str(af_payload.get('phase', 'online')) == 'online':
+        agent = restore_af_agent(agent, af_payload)
+        if planner is not None:
+            planner = restore_af_planner(planner, af_payload)
+            planner_digest = parameter_digest(planner.network.params)
+            run_metadata['planner_initial_digest'] = planner_digest
+        if af_payload.get('replay') is not None:
+            replay.load_state_dict(af_payload['replay'])
+        elif FLAGS.save_replay:
+            print(
+                '[resume] warning: online ckpt has no replay; buffer starts empty',
+                flush=True,
+            )
+        runtime = af_payload.get('runtime') or {}
+        if runtime:
+            # OGBench cannot rebind mid-episode physics; keep agent/replay/RNGs
+            # and open a fresh episode at the restored RNG state.
+            if runtime.get('task_rng_state') is not None:
+                task_rng.bit_generator.state = runtime['task_rng_state']
+            if runtime.get('exploration_rng_state') is not None:
+                exploration_rng.bit_generator.state = runtime['exploration_rng_state']
+            episode_id = int(runtime.get('episode_id', episode_id)) + 1
+            timestep = 0
+            pending_actions = []
+            pending_desired_next = []
+            task_id = int(task_rng.choice(DEFAULT_TASK_IDS))
+            observation, reset_info = env.reset(
+                options={'task_id': task_id, 'render_goal': False}
+            )
+            observation = np.asarray(observation, dtype=np.float32)
+            goal = np.asarray(reset_info['goal'], dtype=np.float32)
+            history = [observation.copy()]
+            print(
+                f'[resume] fresh episode_id={episode_id} task_id={task_id} '
+                '(mid-episode env state not restored)',
+                flush=True,
+            )
+
     def current_policy():
         if name == 'pbf_online_idm':
             return PBFOnlineIDMPolicy(
@@ -370,8 +564,27 @@ def main(_):
             )
         return agent
 
-    def evaluate_and_save(step):
-        if eval_env is not None:
+    def _runtime_state(step: int) -> dict:
+        return {
+            'online_step': int(step),
+            'episode_id': int(episode_id),
+            'timestep': int(timestep),
+            'task_id': int(task_id),
+            'observation': np.asarray(observation, dtype=np.float32),
+            'goal': np.asarray(goal, dtype=np.float32),
+            'history': [np.asarray(item, dtype=np.float32) for item in history],
+            'pending_actions': [
+                np.asarray(item, dtype=np.float32) for item in pending_actions
+            ],
+            'pending_desired_next': [
+                np.asarray(item, dtype=np.float32) for item in pending_desired_next
+            ],
+            'task_rng_state': task_rng.bit_generator.state,
+            'exploration_rng_state': exploration_rng.bit_generator.state,
+        }
+
+    def evaluate_and_save(step, *, force_replay: bool = False):
+        if eval_env is not None and not force_replay:
             metrics = evaluate_policy(
                 current_policy(),
                 eval_env,
@@ -384,6 +597,9 @@ def main(_):
                 ),
             )
             eval_logger.log(metrics, step)
+        elif eval_env is not None and force_replay:
+            # Soft-stop: skip expensive eval; still persist weights/replay/runtime.
+            pass
         save_af_checkpoint(
             os.path.join(checkpoint_dir, f'step_{step}.pkl'),
             algorithm=name,
@@ -393,13 +609,19 @@ def main(_):
             metadata=run_metadata,
             planner=planner,
             planner_config=planner_config,
-            replay_state=replay.state_dict() if FLAGS.save_replay else None,
+            replay_state=(
+                replay.state_dict()
+                if (FLAGS.save_replay or force_replay)
+                else None
+            ),
+            runtime=_runtime_state(step),
+            phase='online',
         )
 
-    if 0 in eval_steps:
+    if 0 in eval_steps and online_start_step <= 1 and af_payload is None:
         evaluate_and_save(0)
 
-    iterator = range(1, FLAGS.online_steps + 1)
+    iterator = range(online_start_step, FLAGS.online_steps + 1)
     if FLAGS.use_tqdm and FLAGS.online_steps:
         iterator = tqdm.tqdm(iterator, desc=f'online-{name}', dynamic_ncols=True)
     for step in iterator:
@@ -590,8 +812,19 @@ def main(_):
                 task_id=task_id,
             )
             online_logger.log(metrics, step)
+        emergency = bool(stop_requested['flag'])
         if step in eval_steps:
             evaluate_and_save(step)
+        elif emergency:
+            evaluate_and_save(step, force_replay=True)
+        if emergency:
+            _write_emergency_marker(
+                run_dir, step, stop_requested['signum'], 'online'
+            )
+            online_logger.close()
+            eval_logger.close()
+            print(f'Run soft-stopped (online) at {run_dir}', flush=True)
+            return
 
     online_logger.close()
     eval_logger.close()

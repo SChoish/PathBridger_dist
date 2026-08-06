@@ -97,6 +97,31 @@ def test_her_includes_immediate_positive_anchor():
     assert batch['replay/her_success_fraction'] == pytest.approx(1.0)
 
 
+def test_replay_state_dict_round_trip():
+    replay = OnlineReplayBuffer(4, (2,), (1,), seed=3)
+    for step in range(3):
+        replay.add(
+            observation=np.asarray([step, 0.0], np.float32),
+            action=np.asarray([0.1], np.float32),
+            next_observation=np.asarray([step + 1.0, 0.0], np.float32),
+            goal=np.asarray([9.0, 0.0], np.float32),
+            reward=-1.0,
+            mask=1.0,
+            episode_id=0,
+            timestep=step,
+            desired_next=np.asarray([step + 0.5, 0.0], np.float32),
+            desired_next_valid=True,
+        )
+    state = replay.state_dict()
+    restored = OnlineReplayBuffer(4, (2,), (1,), seed=0)
+    restored.load_state_dict(state)
+    assert restored.size == 3
+    assert restored.pointer == 3
+    np.testing.assert_array_equal(restored.observations[:3], replay.observations[:3])
+    batch = restored.sample(8, her_probability=0.0)
+    assert batch['observations'].shape[0] == 8
+
+
 def _scene_state(index: int) -> np.ndarray:
     observation = np.zeros((40,), dtype=np.float32)
     observation[19:22] = np.asarray([index, index + 0.1, index + 0.2])

@@ -157,3 +157,28 @@ python scripts/make_af_manifest.py \
 Every run writes immutable provenance metadata, offline and online training
 logs, evaluation curves, and component-wise checkpoints.  Aggregate completed
 runs with `python aggregate_results.py --root=<experiment-root>`.
+
+## Soft-stop and online resume
+
+`train_af.py` handles `SIGTERM` / `SIGINT` / `SIGHUP` by finishing the current
+step, writing a checkpoint, then exiting.  Markers are
+`EMERGENCY_SAVE_{offline|online}_step{N}` under the run directory.
+
+Online checkpoints (`checkpoints/step_{N}.pkl`, format version 2) include agent
+weights, optional frozen planner, replay arrays when `--save_replay` (default
+true), and runtime RNG / episode counters.  Resume with:
+
+```bash
+python train_af.py \
+  --algorithm=pbf_online_idm \
+  --pbf=configs/pbf_af/antmaze_large.py \
+  --af_restore_path=exp/pbf_af_o2o/<run_group>/<exp>/checkpoints \
+  --online_steps=250000 \
+  --save_replay
+```
+
+`--af_restore_step=-1` (default) picks the newest `step_*.pkl` or
+`offline_step_*.pkl`.  Online resume skips offline and continues from
+`step+1`.  Mid-episode physics is not restored (OGBench limitation); agent,
+replay, and RNGs are restored and a fresh episode is opened.  Offline PBF
+resume continues to use `--pbf_restore_path` / `--pbf_restore_step`.

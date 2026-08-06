@@ -54,12 +54,15 @@ def save_af_checkpoint(
     planner: Any | None = None,
     planner_config: dict[str, Any] | None = None,
     replay_state: dict[str, Any] | None = None,
+    runtime: dict[str, Any] | None = None,
+    phase: str = 'online',
 ) -> str:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
-        'format_version': 1,
+        'format_version': 2,
         'algorithm': str(algorithm),
+        'phase': str(phase),
         'step': int(step),
         'config': dict(config),
         'metadata': dict(metadata),
@@ -67,6 +70,7 @@ def save_af_checkpoint(
         'planner': None if planner is None else flax.serialization.to_state_dict(planner),
         'planner_config': planner_config,
         'replay': replay_state,
+        'runtime': runtime,
     }
     temporary = path.with_suffix(path.suffix + '.tmp')
     with temporary.open('wb') as file:
@@ -78,8 +82,13 @@ def save_af_checkpoint(
 def load_af_checkpoint(path: str | os.PathLike[str]) -> dict[str, Any]:
     with Path(path).open('rb') as file:
         payload = pickle.load(file)
-    if not isinstance(payload, dict) or payload.get('format_version') != 1:
+    if not isinstance(payload, dict):
         raise ValueError(f'Invalid action-free checkpoint: {path}')
+    version = int(payload.get('format_version', 0))
+    if version not in (1, 2):
+        raise ValueError(f'Invalid action-free checkpoint: {path}')
+    payload.setdefault('phase', 'online')
+    payload.setdefault('runtime', None)
     return payload
 
 
@@ -87,4 +96,15 @@ def restore_af_agent(template: Any, payload: dict[str, Any]) -> Any:
     return _restore_agent(template, payload['agent'])
 
 
-__all__ = ['load_af_checkpoint', 'restore_af_agent', 'save_af_checkpoint']
+def restore_af_planner(template: Any, payload: dict[str, Any]) -> Any | None:
+    if payload.get('planner') is None or template is None:
+        return template
+    return flax.serialization.from_state_dict(template, payload['planner'])
+
+
+__all__ = [
+    'load_af_checkpoint',
+    'restore_af_agent',
+    'restore_af_planner',
+    'save_af_checkpoint',
+]
