@@ -22,6 +22,13 @@ from utils.goal_representation import infer_phi_goal_obs_indices
 FORBIDDEN_OFFLINE_FIELDS = frozenset(
     {'actions', 'rewards', 'returns', 'return_to_go', 'rtg'}
 )
+REPLAY_METRIC_KEYS = (
+    'replay/her_relabel_fraction',
+    'replay/her_success_fraction',
+    'replay/commanded_success_fraction',
+    'replay/desired_next_valid_fraction',
+    'replay/desired_next_l2',
+)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -145,11 +152,16 @@ class ActionFreeTrajectoryData:
         self,
         batch_size: int,
         *,
-        future_probability: float = 0.7,
-        current_probability: float = 0.2,
+        future_probability: float = 0.9,
+        current_probability: float = 0.0,
         subgoal_steps: int = 10,
     ) -> dict[str, np.ndarray]:
-        """Sample action-free value/planner supervision."""
+        """Sample supervision under the transition reward ``r(s', g)``.
+
+        Current-state goals are disabled by default because they are not
+        terminal anchors under this convention.  Immediate future states
+        provide the zero-reward Bellman anchors instead.
+        """
 
         indices = self._sample_transition_indices(batch_size)
         next_indices = indices + 1
@@ -253,6 +265,7 @@ class OnlineReplayBuffer:
         self.rewards = np.zeros((self.capacity,), np.float32)
         self.masks = np.ones((self.capacity,), np.float32)
         self.desired_next = np.zeros_like(self.observations)
+        self.desired_next_valid = np.zeros((self.capacity,), np.bool_)
         self.episode_ids = np.full((self.capacity,), -1, np.int64)
         self.timesteps = np.full((self.capacity,), -1, np.int64)
         self.pointer = 0
@@ -283,6 +296,7 @@ class OnlineReplayBuffer:
         episode_id: int,
         timestep: int,
         desired_next: Any | None = None,
+        desired_next_valid: bool = False,
     ) -> None:
         slot = self.pointer
         self._remove_old_slot(slot)
@@ -295,6 +309,7 @@ class OnlineReplayBuffer:
         self.desired_next[slot] = (
             next_observation if desired_next is None else desired_next
         )
+        self.desired_next_valid[slot] = bool(desired_next_valid)
         self.episode_ids[slot] = int(episode_id)
         self.timesteps[slot] = int(timestep)
         bisect.insort(
@@ -319,18 +334,26 @@ class OnlineReplayBuffer:
         goals = self.goals[indices].copy()
         rewards = self.rewards[indices].copy()
         masks = self.masks[indices].copy()
+        commanded_success_fraction = np.mean(rewards >= 0.0, dtype=np.float32)
         relabel = self.rng.random(len(indices)) < float(her_probability)
+        relabeled = np.zeros(len(indices), dtype=np.bool_)
+        her_successes = np.zeros(len(indices), dtype=np.bool_)
         for row in np.flatnonzero(relabel):
             slot = int(indices[row])
             episode = int(self.episode_ids[slot])
             entries = self._episode_slots[episode]
-            position = bisect.bisect_left(entries, (int(self.timesteps[slot]) + 1, -1))
+            # Include the current transition.  Its achieved next state is the
+            # necessary immediate positive anchor g = s_{t+1}.
+            position = bisect.bisect_left(
+                entries, (int(self.timesteps[slot]), -1)
+            )
             if position >= len(entries):
                 continue
             future_timestep, future_slot = entries[
                 int(self.rng.integers(position, len(entries)))
             ]
             del future_timestep
+            relabeled[row] = True
             goals[row] = self.next_observations[future_slot]
             achieved = self.next_observations[slot]
             if goal_indices is not None:
@@ -339,8 +362,15 @@ class OnlineReplayBuffer:
             else:
                 target = goals[row]
             success = bool(np.linalg.norm(achieved - target) <= success_tolerance)
+            her_successes[row] = success
             rewards[row] = 0.0 if success else -1.0
             masks[row] = 0.0 if success else 1.0
+        num_relabeled = int(np.sum(relabeled))
+        desired_valid = self.desired_next_valid[indices]
+        desired_errors = np.linalg.norm(
+            self.next_observations[indices] - self.desired_next[indices], axis=-1
+        )
+        desired_valid_count = int(np.sum(desired_valid))
         return {
             'observations': self.observations[indices],
             'actions': self.actions[indices],
@@ -349,6 +379,24 @@ class OnlineReplayBuffer:
             'rewards': rewards,
             'masks': masks,
             'desired_next': self.desired_next[indices],
+            'desired_next_valid': self.desired_next_valid[indices].astype(np.float32),
+            'replay/her_relabel_fraction': np.asarray(
+                np.mean(relabeled), dtype=np.float32
+            ),
+            'replay/her_success_fraction': np.asarray(
+                np.sum(her_successes) / max(num_relabeled, 1), dtype=np.float32
+            ),
+            'replay/commanded_success_fraction': np.asarray(
+                commanded_success_fraction, dtype=np.float32
+            ),
+            'replay/desired_next_valid_fraction': np.asarray(
+                np.mean(desired_valid), dtype=np.float32
+            ),
+            'replay/desired_next_l2': np.asarray(
+                np.sum(desired_errors * desired_valid)
+                / max(desired_valid_count, 1),
+                dtype=np.float32,
+            ),
         }
 
     def state_dict(self) -> dict[str, Any]:
@@ -363,6 +411,7 @@ class OnlineReplayBuffer:
             'rewards': self.rewards,
             'masks': self.masks,
             'desired_next': self.desired_next,
+            'desired_next_valid': self.desired_next_valid,
             'episode_ids': self.episode_ids,
             'timesteps': self.timesteps,
             'rng_state': self.rng.bit_generator.state,
@@ -374,4 +423,5 @@ __all__ = [
     'EpisodeIndex',
     'FORBIDDEN_OFFLINE_FIELDS',
     'OnlineReplayBuffer',
+    'REPLAY_METRIC_KEYS',
 ]

@@ -67,7 +67,12 @@ class PassiveHIQLAgent(flax.struct.PyTreeNode):
             self._expectile(target - v1, float(self.config['expectile']))
             + self._expectile(target - v2, float(self.config['expectile']))
         )
-        return loss, {'value/loss': loss, 'value/mean': 0.5 * (v1.mean() + v2.mean())}
+        return loss, {
+            'value/loss': loss,
+            'value/mean': 0.5 * (v1.mean() + v2.mean()),
+            'value/target_mean': target.mean(),
+            'value/target_std': target.std(),
+        }
 
     @partial(jax.jit, static_argnames=())
     def offline_update(self, batch):
@@ -127,10 +132,20 @@ class PassiveHIQLAgent(flax.struct.PyTreeNode):
             ) - jnp.log(jnp.maximum(1.0 - jnp.square(clipped_actions), 1e-6))
             log_prob = jnp.sum(log_prob, axis=-1)
             current_v = jnp.mean(
-                jnp.stack(self.network.select('target_value')(batch['observations'], batch['goals'])), axis=0
+                jnp.stack(
+                    self.network.select('target_value')(
+                        batch['observations'], subgoals
+                    )
+                ),
+                axis=0,
             )
             next_v = jnp.mean(
-                jnp.stack(self.network.select('target_value')(batch['next_observations'], batch['goals'])), axis=0
+                jnp.stack(
+                    self.network.select('target_value')(
+                        batch['next_observations'], subgoals
+                    )
+                ),
+                axis=0,
             )
             weights = jnp.minimum(
                 jnp.exp(float(self.config['low_alpha']) * (next_v - current_v)),

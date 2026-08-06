@@ -12,8 +12,12 @@ forbidden:  actions, logged rewards, returns, behavior policy
 ```
 
 Sparse goal rewards used for value learning are reconstructed from sampled
-state-goal relations.  The immutable state buffer and the action-bearing
-online replay are separate objects.  Only the explicitly labeled `gc_rlpd`
+state-goal relations using one transition convention: reward is zero and the
+Bellman mask is terminal when the achieved next state reaches the goal.
+Current-state goals are not sampled as failures; immediate future goals supply
+positive anchors.  The immutable state buffer and the action-bearing
+online replay are separate objects.  Only the explicitly labeled
+`gc_sac_50_50`
 upper bound receives the offline action array.
 
 For `pbf_online_idm`, PBF is constructed without an IDM module.  Its value,
@@ -22,18 +26,23 @@ phase.  A new deterministic IDM is initialized at online step zero; it is the
 only optimized module.  A SHA-256 parameter-tree audit fails the run if the
 PBF tree changes.
 
+The default `--pbf_execute_horizon=1` replans every primitive step.
+`--pbf_execute_horizon=5` uses a real collection-time action queue: all five
+decoded primitive transitions are executed and stored before replanning.  This
+is deterministic PBF prefix execution, not a stochastic PathFlower claim.
+
 ## Main methods and provenance
 
 | Result block | Name | Implementation status | Native online update |
 |---|---|---|---|
 | Proposed | `pbf_online_idm` | Native PBF extension | IDM only |
-| Action-free | `gc_mscp` | Paper reimplementation; official source pinned | low policy/value, 50:50 state mixing |
-| Action-free | `passive_hiql` | Action-free online adaptation of HIQL | low policy/value |
+| Action-free | `gc_mscp_style` | Simplified paper reimplementation; official source pinned | low policy/value, 50:50 state mixing |
+| Action-free | `hiql_endpoint_online` | HIQL-inspired endpoint hierarchy | low policy/value |
 | Action-free | `gc_af_guide` | Goal-conditioned adaptation | Guided SAC and guide critic |
-| Action-free | `gc_oso_decqn` | Paper reimplementation and GC adaptation | TD3, IDM, guide switching |
+| Action-free | `gc_oso_decqn_factorized` | Factorized three-bin reimplementation and GC adaptation | TD3, IDM, guide switching |
 | Online only | `gc_sac` | Shared native implementation | SAC + future HER |
 | Online only | `gc_td3` | Shared native implementation | TD3 + future HER |
-| Full action | `gc_rlpd` | RLPD-style symmetric-replay upper bound | SAC on 50:50 offline/online replay |
+| Full action | `gc_sac_50_50` | Symmetric-replay upper bound; not RLPD | SAC on 50:50 offline/online replay |
 
 The adaptation and reimplementation labels are intentional: they are not
 presented as exact reproduction numbers from a different benchmark.  Audited
@@ -65,6 +74,10 @@ appendices.  Online results must not be used to select an offline checkpoint.
 - Goal distribution: uniform over OGBench task IDs 1--5 at episode reset.
 - Goal policy: a single `pi(a | s, g)` per environment.
 - Replay relabeling: episode-aware future HER for action-policy baselines.
+- HER includes the current transition's achieved next state as a candidate and
+  logs relabel, HER-success, and commanded-success fractions.
+- AF-Guide stores an explicit desired-state validity bit; random-grounding
+  samples do not update its guide critic or guide the actor.
 - Evaluation trajectories are never inserted into replay.
 - Task-goal RNG and exploration RNG are independent, preserving paired goal
   sequences across algorithms with the same seed.
@@ -92,20 +105,47 @@ clip actions to the environment bounds, and report any-step episode success.
 Primary reporting is IQM AUC@250k with a stratified-bootstrap 95% confidence
 interval.  Also report AUC@1M and Success@1M.  The aggregator refuses to
 extrapolate interrupted runs to the requested final budget and keeps
-online-only, action-free, and full-action result blocks separate.
+online-only, action-free, and full-action result blocks separate.  Its
+bootstrap preserves the `[seed, environment]` matrix, resamples the seed axis
+within each environment, and also reports pairwise probability of improvement.
 
 ## Locked runs
 
-Generate the 280-run main manifest (7 methods x 8 environments x 5 seeds):
+Start with the required 14-run P0 gate (7 methods x 2 environments x 1 seed):
 
 ```bash
-python scripts/make_af_manifest.py --output=benchmark_manifest.csv
+python scripts/make_af_manifest.py --suite=p0_smoke --output=p0_smoke.csv
 ```
 
-Add the 40 full-action upper-bound runs only when requested:
+It uses 50k online steps and evaluates at 0/10k/25k/50k.  Inspect HER positive
+rate, IDM error, desired-next realization error, AF-Guide valid-target rate,
+value targets, critic Q statistics, successes, and the planner freeze audit.
+Only then generate the 84-run four-environment, three-seed pilot:
+
+```bash
+python scripts/make_af_manifest.py --suite=pilot --output=pilot.csv
+```
+
+The 280-run eight-environment, five-seed suite is a **pre-tuning screening
+track**, not a final fair leaderboard:
 
 ```bash
 python scripts/make_af_manifest.py \
+  --suite=screening \
+  --output=screening.csv
+```
+
+PBF currently uses paper-selected environment-specific hyperparameters while
+the baseline ports use global defaults.  Final native/tuned claims therefore
+require an equal per-method tuning budget and validation-only selection.  This
+repository records that limitation instead of treating screening results as a
+finished comparison.
+
+Add the full-action upper-bound runs only when requested:
+
+```bash
+python scripts/make_af_manifest.py \
+  --suite=screening \
   --include_full_action \
   --output=benchmark_with_upper_bound.csv
 ```

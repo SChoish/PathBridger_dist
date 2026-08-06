@@ -48,6 +48,7 @@ class OnlineIDMAgent(flax.struct.PyTreeNode):
             return loss, {
                 'idm/loss': loss,
                 'idm/action_mse': jnp.mean(jnp.square(errors)),
+                'idm/action_l1': jnp.mean(jnp.abs(errors)),
                 'idm/action_abs_mean': jnp.mean(jnp.abs(predictions)),
             }
 
@@ -159,10 +160,19 @@ class PBFOnlineIDMPolicy:
         if seed is None:
             seed = jax.random.PRNGKey(0)
         prefix = self.desired_prefix(observations, goals, seed=seed)
+        return self.decode_prefix(prefix)
+
+    def decode_prefix(self, prefix: jnp.ndarray) -> jnp.ndarray:
+        """Decode one planned prefix into the configured primitive action chunk."""
+
         if prefix.ndim == 2:
             prefix = prefix[None, ...]
         batch_size, _, state_dim = prefix.shape
         horizon = int(self.execute_horizon)
+        if prefix.shape[1] < horizon + 1:
+            raise ValueError(
+                f'Prefix length {prefix.shape[1]} is too short for horizon {horizon}.'
+            )
         current = prefix[:, :horizon, :].reshape(batch_size * horizon, state_dim)
         following = prefix[:, 1 : horizon + 1, :].reshape(
             batch_size * horizon, state_dim

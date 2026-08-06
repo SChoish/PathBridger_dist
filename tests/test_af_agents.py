@@ -91,7 +91,24 @@ def test_mscp_afguide_and_oso_smoke():
         'target_deltas': jnp.ones_like(OBS) * 0.02,
     }
     guide, _ = guide.offline_update(sequence_batch)
-    guide, _ = guide.online_update(_online_batch())
+    guide_critic_before = guide.network.params['modules_guide_critic']
+    invalid_guide_batch = {
+        **_online_batch(),
+        'desired_next_valid': jnp.zeros((len(OBS),), jnp.float32),
+    }
+    guide, invalid_info = guide.online_update(invalid_guide_batch)
+    assert float(invalid_info['guide/valid_target_fraction']) == 0.0
+    for left, right in zip(
+        jax.tree_util.tree_leaves(guide_critic_before),
+        jax.tree_util.tree_leaves(guide.network.params['modules_guide_critic']),
+    ):
+        np.testing.assert_array_equal(left, right)
+    guide_batch = {
+        **_online_batch(),
+        'desired_next_valid': jnp.ones((len(OBS),), jnp.float32),
+    }
+    guide, valid_info = guide.online_update(guide_batch)
+    assert float(valid_info['guide/valid_target_fraction']) == 1.0
     assert guide.sample_actions(OBS, OBS + 0.2, seed=jax.random.PRNGKey(3)).shape == ACT.shape
 
     ocfg = oso_config().to_dict()
@@ -133,6 +150,11 @@ def test_action_free_pbf_has_no_idm_and_composes_online(monkeypatch):
     policy = PBFOnlineIDMPolicy(planner, idm, 1, 0.0, 1)
     actions = policy.sample_actions(OBS, OBS + 0.2, seed=jax.random.PRNGKey(5))
     assert actions.shape == ACT.shape
+    chunk_policy = PBFOnlineIDMPolicy(planner, idm, 1, 0.0, 5)
+    action_chunk = chunk_policy.sample_actions(
+        OBS, OBS + 0.2, seed=jax.random.PRNGKey(6)
+    )
+    assert action_chunk.shape == (len(OBS), 5, ACT.shape[-1])
 
 
 def test_component_checkpoint_round_trip(tmp_path):

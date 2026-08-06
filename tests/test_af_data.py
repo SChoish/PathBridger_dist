@@ -30,6 +30,11 @@ def test_action_free_view_and_sampler_never_expose_action_or_logged_reward():
     assert 'actions' not in batch
     assert data.offline_fields_seen == ('observations', 'terminals')
     assert np.all(batch['indices'] + 1 <= data.episodes.terminal_for_state[batch['indices']])
+    assert not np.any(batch['goal_components'] == 0)
+    np.testing.assert_array_equal(
+        batch['rewards'] == 0.0,
+        batch['indices'] + 1 == batch['goal_indices'],
+    )
 
 
 def test_sequence_sampler_is_left_padded_and_action_free():
@@ -60,6 +65,27 @@ def test_replay_future_her_stays_inside_episode():
             )
     batch = replay.sample(128, her_probability=1.0)
     np.testing.assert_array_equal(batch['observations'][:, 0], batch['goals'][:, 0])
+    assert batch['replay/her_relabel_fraction'] == pytest.approx(1.0)
+    assert batch['replay/her_success_fraction'] > 0.0
+
+
+def test_her_includes_immediate_positive_anchor():
+    replay = OnlineReplayBuffer(2, (1,), (1,), seed=7)
+    replay.add(
+        observation=np.asarray([0.0], np.float32),
+        action=np.asarray([0.0], np.float32),
+        next_observation=np.asarray([1.0], np.float32),
+        goal=np.asarray([9.0], np.float32),
+        reward=-1.0,
+        mask=1.0,
+        episode_id=0,
+        timestep=0,
+    )
+    batch = replay.sample(16, her_probability=1.0)
+    np.testing.assert_array_equal(batch['goals'], np.ones((16, 1), np.float32))
+    np.testing.assert_array_equal(batch['rewards'], np.zeros(16, np.float32))
+    np.testing.assert_array_equal(batch['masks'], np.zeros(16, np.float32))
+    assert batch['replay/her_success_fraction'] == pytest.approx(1.0)
 
 
 def test_provenance_rejects_action_leakage():

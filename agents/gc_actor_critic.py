@@ -163,7 +163,9 @@ class GoalConditionedActorCritic(flax.struct.PyTreeNode):
         return loss, {
             'critic/loss': loss,
             'critic/q_mean': 0.5 * (q1.mean() + q2.mean()),
+            'critic/q_std': jnp.stack([q1, q2]).std(),
             'critic/target_mean': target.mean(),
+            'critic/target_std': target.std(),
         }
 
     def actor_loss(

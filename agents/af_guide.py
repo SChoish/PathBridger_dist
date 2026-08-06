@@ -124,6 +124,15 @@ class AFGuideAgent(flax.struct.PyTreeNode):
         new_rng, next_seed, actor_seed = jax.random.split(self.rng, 3)
 
         def loss_fn(params):
+            guide_valid = jnp.asarray(
+                batch.get(
+                    'desired_next_valid',
+                    jnp.ones(batch['rewards'].shape, dtype=jnp.float32),
+                ),
+                dtype=jnp.float32,
+            )
+            valid_count = jnp.maximum(jnp.sum(guide_valid), 1.0)
+            valid_fraction = jnp.mean(guide_valid)
             next_mean, next_log_std = self.network.select('actor')(
                 batch['next_observations'], batch['goals']
             )
@@ -164,12 +173,14 @@ class AFGuideAgent(flax.struct.PyTreeNode):
             g1, g2 = self.network.select('guide_critic')(
                 batch['observations'], batch['goals'], batch['actions'], params=params
             )
-            critic_loss = jnp.mean(
-                jnp.square(q1 - env_target)
-                + jnp.square(q2 - env_target)
-                + jnp.square(g1 - guide_target)
-                + jnp.square(g2 - guide_target)
+            env_critic_loss = jnp.mean(
+                jnp.square(q1 - env_target) + jnp.square(q2 - env_target)
             )
+            guide_critic_loss = jnp.sum(
+                guide_valid
+                * (jnp.square(g1 - guide_target) + jnp.square(g2 - guide_target))
+            ) / valid_count
+            critic_loss = env_critic_loss + guide_critic_loss
             mean, log_std = self.network.select('actor')(
                 batch['observations'], batch['goals'], params=params
             )
@@ -189,15 +200,21 @@ class AFGuideAgent(flax.struct.PyTreeNode):
             actor_loss = jnp.mean(
                 float(self.config['entropy_coefficient']) * log_prob
                 - actor_q
-                - float(self.config['guide_weight']) * actor_guide
+                - float(self.config['guide_weight'])
+                * valid_fraction
+                * actor_guide
             )
             total = critic_loss + actor_loss
             return total, {
                 'loss/total': total,
                 'critic/loss': critic_loss,
+                'critic/q_mean': 0.5 * (q1.mean() + q2.mean()),
+                'critic/q_std': jnp.stack([q1, q2]).std(),
                 'actor/loss': actor_loss,
-                'guide/reward': guide_reward.mean(),
+                'guide/reward': jnp.sum(guide_valid * guide_reward) / valid_count,
                 'guide/q_mean': 0.5 * (g1.mean() + g2.mean()),
+                'guide/critic_loss': guide_critic_loss,
+                'guide/valid_target_fraction': valid_fraction,
             }
 
         network, info = self.network.apply_loss_fn(loss_fn)

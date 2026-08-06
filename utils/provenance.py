@@ -26,6 +26,7 @@ class AlgorithmMetadata:
     online_modules_updated: tuple[str, ...]
     uses_offline_actions: bool = False
     uses_offline_logged_rewards: bool = False
+    implementation_notes: str = ''
 
     def validate(self) -> None:
         if not self.algorithm.strip():

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import itertools
 import json
 from collections import defaultdict
 from pathlib import Path
@@ -16,6 +17,11 @@ flags.DEFINE_string('root', 'exp/pbf_af_o2o', 'Root containing train_af runs.')
 flags.DEFINE_string('output_dir', '', 'Output directory; defaults to <root>/aggregate.')
 flags.DEFINE_integer('bootstrap_samples', 10_000, 'Stratified bootstrap resamples.')
 flags.DEFINE_integer('seed', 0, 'Bootstrap seed.')
+flags.DEFINE_bool(
+    'require_balanced_matrix',
+    True,
+    'Require every algorithm summary to have the same seeds for every environment.',
+)
 
 
 def _read_curve(path: Path):
@@ -56,18 +62,62 @@ def _iqm(values):
     return float(np.mean(values[lower:upper]))
 
 
-def _stratified_ci(by_env, samples, seed):
+def _score_matrix(rows, metric):
+    envs = sorted({row['env_name'] for row in rows})
+    seeds = sorted({int(row['seed']) for row in rows})
+    values = {
+        (int(row['seed']), row['env_name']): float(row[metric]) for row in rows
+    }
+    missing = [
+        (seed, env) for seed in seeds for env in envs if (seed, env) not in values
+    ]
+    if missing:
+        raise ValueError(
+            f'Unbalanced seed x environment matrix for {metric}; missing {missing[:8]}.'
+        )
+    matrix = np.asarray(
+        [[values[(seed, env)] for env in envs] for seed in seeds],
+        dtype=np.float64,
+    )
+    return matrix, tuple(seeds), tuple(envs)
+
+
+def _stratified_ci(matrix, samples, seed):
+    """Rliable-compatible bootstrap over runs, stratified by environment."""
+
     rng = np.random.default_rng(seed)
-    envs = sorted(by_env)
-    if not envs:
+    matrix = np.asarray(matrix, dtype=np.float64)
+    if matrix.ndim != 2 or not matrix.size:
         return [float('nan'), float('nan')]
+    num_runs, num_envs = matrix.shape
     draws = np.empty(samples, dtype=np.float64)
     for index in range(samples):
-        sampled = []
-        for env in rng.choice(envs, size=len(envs), replace=True):
-            values = np.asarray(by_env[env], dtype=np.float64)
-            sampled.append(float(rng.choice(values)))
-        draws[index] = _iqm(sampled)
+        run_indices = rng.integers(0, num_runs, size=(num_runs, num_envs))
+        sampled = np.take_along_axis(matrix, run_indices, axis=0)
+        draws[index] = _iqm(sampled.reshape(-1))
+    return [float(value) for value in np.percentile(draws, [2.5, 97.5])]
+
+
+def _probability_of_improvement(left, right):
+    left = np.asarray(left, dtype=np.float64)
+    right = np.asarray(right, dtype=np.float64)
+    if left.ndim != 2 or right.ndim != 2 or left.shape[1] != right.shape[1]:
+        raise ValueError('Probability matrices must share the environment dimension.')
+    comparisons = left[:, None, :] - right[None, :, :]
+    return float(np.mean((comparisons > 0.0) + 0.5 * (comparisons == 0.0)))
+
+
+def _probability_ci(left, right, samples, seed):
+    rng = np.random.default_rng(seed)
+    left = np.asarray(left, dtype=np.float64)
+    right = np.asarray(right, dtype=np.float64)
+    draws = np.empty(samples, dtype=np.float64)
+    for index in range(samples):
+        left_indices = rng.integers(0, left.shape[0], size=left.shape)
+        right_indices = rng.integers(0, right.shape[0], size=right.shape)
+        left_sample = np.take_along_axis(left, left_indices, axis=0)
+        right_sample = np.take_along_axis(right, right_indices, axis=0)
+        draws[index] = _probability_of_improvement(left_sample, right_sample)
     return [float(value) for value in np.percentile(draws, [2.5, 97.5])]
 
 
@@ -122,44 +172,64 @@ def main(_):
             writer.writerows(records)
 
     summaries = []
+    matrices = {}
     by_algorithm = defaultdict(list)
     for record in records:
         by_algorithm[record['algorithm']].append(record)
     for algorithm, rows in sorted(by_algorithm.items()):
-        final_by_env = defaultdict(list)
-        auc_250k_by_env = defaultdict(list)
-        auc_full_by_env = defaultdict(list)
-        for row in rows:
-            final_by_env[row['env_name']].append(row['final_success'])
-            auc_250k_by_env[row['env_name']].append(row['auc_250k'])
-            auc_full_by_env[row['env_name']].append(row['auc_full'])
-        final_values = [row['final_success'] for row in rows]
-        auc_250k_values = [row['auc_250k'] for row in rows]
-        auc_full_values = [row['auc_full'] for row in rows]
+        try:
+            final_matrix, seeds, envs = _score_matrix(rows, 'final_success')
+            auc_250k_matrix, _, _ = _score_matrix(rows, 'auc_250k')
+            auc_full_matrix, _, _ = _score_matrix(rows, 'auc_full')
+        except ValueError:
+            if FLAGS.require_balanced_matrix:
+                raise
+            continue
+        final_ci = _stratified_ci(
+            final_matrix, FLAGS.bootstrap_samples, FLAGS.seed
+        )
+        auc_250k_ci = (
+            _stratified_ci(
+                auc_250k_matrix, FLAGS.bootstrap_samples, FLAGS.seed + 1
+            )
+            if np.all(np.isfinite(auc_250k_matrix))
+            else [float('nan'), float('nan')]
+        )
+        auc_full_ci = _stratified_ci(
+            auc_full_matrix, FLAGS.bootstrap_samples, FLAGS.seed + 2
+        )
+        comparison_metric = (
+            'auc_250k'
+            if np.all(np.isfinite(auc_250k_matrix))
+            else 'auc_full'
+        )
+        matrices[algorithm] = {
+            'group': rows[0]['group'],
+            'envs': envs,
+            'metric': comparison_metric,
+            'scores': (
+                auc_250k_matrix
+                if comparison_metric == 'auc_250k'
+                else auc_full_matrix
+            ),
+        }
         summaries.append(
             {
                 'algorithm': algorithm,
                 'group': rows[0]['group'],
                 'port_kind': rows[0]['port_kind'],
                 'num_runs': len(rows),
-                'num_envs': len(final_by_env),
-                'final_iqm': _iqm(final_values),
-                'final_iqm_ci_low': _stratified_ci(final_by_env, FLAGS.bootstrap_samples, FLAGS.seed)[0],
-                'final_iqm_ci_high': _stratified_ci(final_by_env, FLAGS.bootstrap_samples, FLAGS.seed)[1],
-                'auc_250k_iqm': _iqm(auc_250k_values),
-                'auc_250k_iqm_ci_low': _stratified_ci(
-                    auc_250k_by_env, FLAGS.bootstrap_samples, FLAGS.seed + 1
-                )[0],
-                'auc_250k_iqm_ci_high': _stratified_ci(
-                    auc_250k_by_env, FLAGS.bootstrap_samples, FLAGS.seed + 1
-                )[1],
-                'auc_full_iqm': _iqm(auc_full_values),
-                'auc_full_iqm_ci_low': _stratified_ci(
-                    auc_full_by_env, FLAGS.bootstrap_samples, FLAGS.seed + 2
-                )[0],
-                'auc_full_iqm_ci_high': _stratified_ci(
-                    auc_full_by_env, FLAGS.bootstrap_samples, FLAGS.seed + 2
-                )[1],
+                'num_envs': len(envs),
+                'num_seeds': len(seeds),
+                'final_iqm': _iqm(final_matrix.reshape(-1)),
+                'final_iqm_ci_low': final_ci[0],
+                'final_iqm_ci_high': final_ci[1],
+                'auc_250k_iqm': _iqm(auc_250k_matrix.reshape(-1)),
+                'auc_250k_iqm_ci_low': auc_250k_ci[0],
+                'auc_250k_iqm_ci_high': auc_250k_ci[1],
+                'auc_full_iqm': _iqm(auc_full_matrix.reshape(-1)),
+                'auc_full_iqm_ci_low': auc_full_ci[0],
+                'auc_full_iqm_ci_high': auc_full_ci[1],
             }
         )
     if summaries:
@@ -167,8 +237,51 @@ def main(_):
             writer = csv.DictWriter(file, fieldnames=list(summaries[0]))
             writer.writeheader()
             writer.writerows(summaries)
+
+    comparisons = []
+    for left_name, right_name in itertools.combinations(sorted(matrices), 2):
+        left = matrices[left_name]
+        right = matrices[right_name]
+        if (
+            left['group'] != right['group']
+            or left['envs'] != right['envs']
+            or left['metric'] != right['metric']
+        ):
+            continue
+        probability = _probability_of_improvement(
+            left['scores'], right['scores']
+        )
+        interval = _probability_ci(
+            left['scores'],
+            right['scores'],
+            FLAGS.bootstrap_samples,
+            FLAGS.seed + 3,
+        )
+        comparisons.append(
+            {
+                'algorithm_x': left_name,
+                'algorithm_y': right_name,
+                'group': left['group'],
+                'metric': left['metric'],
+                'probability_x_better': probability,
+                'ci_low': interval[0],
+                'ci_high': interval[1],
+            }
+        )
+    if comparisons:
+        with (output_dir / 'comparisons.csv').open(
+            'w', newline='', encoding='utf-8'
+        ) as file:
+            writer = csv.DictWriter(file, fieldnames=list(comparisons[0]))
+            writer.writeheader()
+            writer.writerows(comparisons)
     (output_dir / 'summary.json').write_text(
-        json.dumps({'runs': records, 'summary': summaries}, indent=2, sort_keys=True) + '\n'
+        json.dumps(
+            {'runs': records, 'summary': summaries, 'comparisons': comparisons},
+            indent=2,
+            sort_keys=True,
+        )
+        + '\n'
     )
     print(f'Aggregated {len(records)} runs into {output_dir}')
 

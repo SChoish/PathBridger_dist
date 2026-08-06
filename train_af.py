@@ -28,7 +28,11 @@ from agents.registry import (
 )
 from envs.env_utils import make_env_and_datasets
 from utils.af_checkpoints import save_af_checkpoint
-from utils.af_data import ActionFreeTrajectoryData, OnlineReplayBuffer
+from utils.af_data import (
+    REPLAY_METRIC_KEYS,
+    ActionFreeTrajectoryData,
+    OnlineReplayBuffer,
+)
 from utils.af_evaluation import evaluate_policy
 from utils.datasets import PathBridgerDataset, action_free_view, observation_state_scale
 from utils.evaluation import DEFAULT_TASK_IDS, _info_success, _max_episode_steps
@@ -63,6 +67,11 @@ flags.DEFINE_bool('save_replay', False, 'Include the replay arrays in checkpoint
 flags.DEFINE_bool('use_tqdm', True, 'Display progress bars.')
 flags.DEFINE_string('pbf_restore_path', '', 'Optional pretrained action-free PBF checkpoint.')
 flags.DEFINE_integer('pbf_restore_step', 0, 'PBF checkpoint step, or infer from exact filename.')
+flags.DEFINE_integer(
+    'pbf_execute_horizon',
+    1,
+    'Primitive actions decoded per PBF plan; supported values are 1 and 5.',
+)
 config_flags.DEFINE_config_file(
     'pbf', _DEFAULT_PBF_CONFIG, 'Environment-specific action-free PBF config.', lock_config=False
 )
@@ -98,15 +107,17 @@ def _offline_batch(name, data, full_action_data, batch_size, config, delta_scale
         batch_size,
         subgoal_steps=int(config.get('subgoal_steps', 10)),
     )
-    if name == 'gc_oso_decqn':
+    if name == 'gc_oso_decqn_factorized':
         batch['delta_bins'] = discretize_deltas(
             batch['next_observations'] - batch['observations'],
             delta_scale,
             float(config['discretization_threshold']),
         )
-    if name == 'gc_rlpd':
+    if name == 'gc_sac_50_50':
         if full_action_data is None:
-            raise ValueError('GC-RLPD requires its explicitly scoped full-action dataset.')
+            raise ValueError(
+                'GC-SAC-50/50 requires its explicitly scoped full-action dataset.'
+            )
         batch['actions'] = np.asarray(
             full_action_data['actions'][batch['indices']], dtype=np.float32
         )
@@ -144,6 +155,8 @@ def main(_):
         raise ValueError('online_steps and random_steps must be non-negative.')
     if FLAGS.random_steps > FLAGS.online_steps:
         raise ValueError('random_steps cannot exceed online_steps.')
+    if FLAGS.pbf_execute_horizon not in (1, 5):
+        raise ValueError('pbf_execute_horizon must be 1 or 5.')
     random.seed(FLAGS.seed)
     np.random.seed(FLAGS.seed)
     task_rng = np.random.default_rng(FLAGS.seed + 17_003)
@@ -164,7 +177,7 @@ def main(_):
     delta_scale = _delta_scale(af_data)
     example_observations = af_data.observations[:2]
     metadata = algorithm_metadata(name)
-    full_action_data = train_data if name == 'gc_rlpd' else None
+    full_action_data = train_data if name == 'gc_sac_50_50' else None
 
     exp_name = get_exp_name(FLAGS.seed, env_name=env_name, agent_name=name)
     run_dir = os.path.abspath(
@@ -215,6 +228,7 @@ def main(_):
                 save_agent(planner, os.path.join(run_dir, 'pbf_checkpoints'), step)
         offline_logger.close()
         controller_config = idm_config().to_dict()
+        controller_config['execute_horizon'] = int(FLAGS.pbf_execute_horizon)
         agent = OnlineIDMAgent.create(
             FLAGS.seed + 1, example_observations, action_dim, controller_config
         )
@@ -274,6 +288,7 @@ def main(_):
         delta_scale=np.asarray(delta_scale).tolist(),
         config=resolved_config,
         pbf_config=planner_config,
+        planner_initial_digest=planner_digest,
     )
     Path(run_dir, 'metadata.json').write_text(
         json.dumps(run_metadata, indent=2, sort_keys=True) + '\n'
@@ -299,6 +314,8 @@ def main(_):
     goal = np.asarray(reset_info['goal'], dtype=np.float32)
     observation = np.asarray(observation, dtype=np.float32)
     history = [observation.copy()]
+    pending_actions: list[np.ndarray] = []
+    pending_desired_next: list[np.ndarray] = []
     start_time = time.time()
     last_info = {}
 
@@ -347,26 +364,32 @@ def main(_):
         iterator = tqdm.tqdm(iterator, desc=f'online-{name}', dynamic_ncols=True)
     for step in iterator:
         desired_next = observation.copy()
+        desired_next_valid = False
         if step <= FLAGS.random_steps:
             action = exploration_rng.uniform(action_low, action_high).astype(np.float32)
         elif name == 'pbf_online_idm':
             policy = current_policy()
-            action_seed = jax.random.PRNGKey(FLAGS.seed * 1_000_003 + step)
-            prefix = policy.desired_prefix(
-                jnp.asarray(observation[None, :]),
-                jnp.asarray(goal[None, :]),
-                seed=action_seed,
-            )
-            desired_next = np.asarray(jax.device_get(prefix[0, 1]), dtype=np.float32)
-            action = np.asarray(
-                jax.device_get(
-                    agent.predict(
-                        jnp.asarray(observation[None, :]),
-                        jnp.asarray(desired_next[None, :]),
-                    )[0]
-                ),
-                dtype=np.float32,
-            )
+            if not pending_actions:
+                action_seed = jax.random.PRNGKey(FLAGS.seed * 1_000_003 + step)
+                prefix = policy.desired_prefix(
+                    jnp.asarray(observation[None, :]),
+                    jnp.asarray(goal[None, :]),
+                    seed=action_seed,
+                )
+                decoded = np.asarray(
+                    jax.device_get(policy.decode_prefix(prefix)), dtype=np.float32
+                )
+                if decoded.ndim == 2:
+                    decoded = decoded[:, None, :]
+                horizon = int(resolved_config['execute_horizon'])
+                pending_actions = [item.copy() for item in decoded[0, :horizon]]
+                prefix_host = np.asarray(jax.device_get(prefix[0]), dtype=np.float32)
+                pending_desired_next = [
+                    item.copy() for item in prefix_host[1 : horizon + 1]
+                ]
+            action = pending_actions.pop(0)
+            desired_next = pending_desired_next.pop(0)
+            desired_next_valid = True
             decay = min(
                 max(step - FLAGS.random_steps, 0)
                 / max(int(resolved_config['exploration_decay_steps']), 1),
@@ -396,6 +419,7 @@ def main(_):
                         jnp.asarray(history_masks),
                     )[0]
                 )
+                desired_next_valid = True
             action = np.asarray(
                 jax.device_get(
                     agent.sample_actions(
@@ -417,10 +441,11 @@ def main(_):
             next_observation=next_observation,
             goal=goal,
             reward=0.0 if success else -1.0,
-            mask=0.0 if bool(terminated) else 1.0,
+            mask=0.0 if success or bool(terminated) else 1.0,
             episode_id=episode_id,
             timestep=timestep,
             desired_next=desired_next,
+            desired_next_valid=desired_next_valid,
         )
         history.append(next_observation.copy())
         observation = next_observation
@@ -441,13 +466,16 @@ def main(_):
                 ),
                 goal_indices=af_data.phi_indices,
             )
+            replay_metrics = {
+                key: online_batch.pop(key) for key in REPLAY_METRIC_KEYS
+            }
             if name == 'pbf_online_idm':
                 idm_batch = {
                     key: online_batch[key]
                     for key in ('observations', 'next_observations', 'actions')
                 }
                 agent, last_info = agent.online_update(idm_batch)
-            elif name == 'gc_mscp':
+            elif name == 'gc_mscp_style':
                 offline_batch = _offline_batch(
                     name,
                     af_data,
@@ -461,7 +489,7 @@ def main(_):
                     offline_batch,
                     tune_planners=bool(resolved_config['tune_planners_online']),
                 )
-            elif name == 'gc_oso_decqn':
+            elif name == 'gc_oso_decqn_factorized':
                 offline_batch = _offline_batch(
                     name,
                     af_data,
@@ -471,25 +499,28 @@ def main(_):
                     delta_scale,
                 )
                 agent, last_info = agent.online_update(online_batch, offline_batch)
-            elif name == 'gc_rlpd':
+            elif name == 'gc_sac_50_50':
+                half_size = max(batch_size // 2, 1)
                 offline_batch = _offline_batch(
                     name,
                     af_data,
                     full_action_data,
-                    max(batch_size // 2, 1),
+                    half_size,
                     resolved_config,
                     delta_scale,
                 )
-                half_online = replay.sample(
-                    max(batch_size // 2, 1),
-                    her_probability=float(resolved_config.get('her_probability', 0.8)),
-                    goal_indices=af_data.phi_indices,
-                )
+                half_online = {
+                    key: value[:half_size]
+                    for key, value in online_batch.items()
+                    if np.asarray(value).ndim > 0
+                    and np.asarray(value).shape[0] == batch_size
+                }
                 agent, last_info = agent.online_update(
                     _concat_batches(half_online, offline_batch)
                 )
             else:
                 agent, last_info = agent.online_update(online_batch)
+            last_info = {**last_info, **replay_metrics}
 
         if terminated or truncated or timestep >= max_episode_steps:
             episode_id += 1
@@ -501,6 +532,8 @@ def main(_):
             observation = np.asarray(observation, dtype=np.float32)
             goal = np.asarray(reset_info['goal'], dtype=np.float32)
             history = [observation.copy()]
+            pending_actions.clear()
+            pending_desired_next.clear()
 
         if step % FLAGS.log_interval == 0 or step == FLAGS.online_steps:
             metrics = _host_metrics(last_info)
@@ -515,8 +548,17 @@ def main(_):
 
     online_logger.close()
     eval_logger.close()
-    if planner is not None and parameter_digest(planner.network.params) != planner_digest:
-        raise RuntimeError('Frozen PBF parameters changed during online IDM training.')
+    if planner is not None:
+        planner_final_digest = parameter_digest(planner.network.params)
+        if planner_final_digest != planner_digest:
+            raise RuntimeError('Frozen PBF parameters changed during online IDM training.')
+        run_metadata.update(
+            planner_final_digest=planner_final_digest,
+            planner_frozen_verified=True,
+        )
+        Path(run_dir, 'metadata.json').write_text(
+            json.dumps(run_metadata, indent=2, sort_keys=True) + '\n'
+        )
     print(f'Run saved to {run_dir}')
 
 

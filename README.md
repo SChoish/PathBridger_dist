@@ -14,12 +14,12 @@ baselines retain their native online learners.
 Implemented algorithms:
 
 - `pbf_online_idm`
-- `gc_mscp`
-- `passive_hiql`
+- `gc_mscp_style`
+- `hiql_endpoint_online`
 - `gc_af_guide` (explicit goal-conditioned OGBench adaptation)
-- `gc_oso_decqn` (paper reimplementation and goal-conditioned adaptation)
+- `gc_oso_decqn_factorized` (paper reimplementation and GC adaptation)
 - `gc_sac` and `gc_td3` with future HER
-- `gc_rlpd` full-action upper bound
+- `gc_sac_50_50` full-action symmetric-replay upper bound
 
 Pretrain an action-free PBF with the existing offline entry point:
 
@@ -42,13 +42,13 @@ Run an external baseline:
 
 ```bash
 python train_af.py \
-  --algorithm=gc_mscp \
+  --algorithm=gc_mscp_style \
   --env_name=antmaze-medium-navigate-v0 \
   --online_steps=250000 \
   --seed=0
 ```
 
-The locked main protocol uses one million primitive environment steps, a 10k
+The full screening protocol uses one million primitive environment steps, a 10k
 random-action grounding phase, checkpoints at 0/10k/25k/50k/100k/250k/500k/1M,
 five seeds, and ten episodes for each of the five official tasks per checkpoint.
 Its primary sample-efficiency statistic is AUC@250k; AUC@1M and Success@1M are
@@ -56,13 +56,18 @@ reported separately.
 
 `train_af.py` writes `offline.csv`, `online.csv`, `eval.csv`, immutable
 provenance metadata, and component-wise checkpoints.  Evaluate one checkpoint
-with `evaluate_af.py --checkpoint=<step_*.pkl>`.  Generate the locked 280-run
-main manifest and aggregate completed runs with:
+with `evaluate_af.py --checkpoint=<step_*.pkl>`.  Generate the staged P0 smoke
+manifest and aggregate completed runs with:
 
 ```bash
-python scripts/make_af_manifest.py --output=benchmark_manifest.csv
+python scripts/make_af_manifest.py --suite=p0_smoke --output=p0_smoke.csv
 python aggregate_results.py --root=exp/pbf_af_o2o
 ```
+
+Promote to `--suite=pilot` only after the diagnostic gate passes.  The
+280-run `--suite=screening` manifest is deliberately labeled pre-tuning
+screening because PBF has paper-selected environment-specific settings while
+the local baseline ports currently use global defaults.
 
 The aggregate output keeps action-free, online-only, and full-action upper-bound
 groups separate.  Reference repositories and audited commits are pinned in

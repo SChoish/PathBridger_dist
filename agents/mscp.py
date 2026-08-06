@@ -54,7 +54,12 @@ class MSCPAgent(flax.struct.PyTreeNode):
             jnp.where(diff1 >= 0, expectile, 1 - expectile) * jnp.square(diff1)
             + jnp.where(diff2 >= 0, expectile, 1 - expectile) * jnp.square(diff2)
         )
-        return loss, {'value/loss': loss, 'value/mean': 0.5 * (v1.mean() + v2.mean())}
+        return loss, {
+            'value/loss': loss,
+            'value/mean': 0.5 * (v1.mean() + v2.mean()),
+            'value/target_mean': target.mean(),
+            'value/target_std': target.std(),
+        }
 
     @partial(jax.jit, static_argnames=())
     def offline_update(self, batch):
