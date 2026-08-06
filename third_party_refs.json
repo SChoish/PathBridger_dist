@@ -1,0 +1,31 @@
+{
+  "af_guide": {
+    "commit": "8579489dea345b2aaed8eafafaed3b16daef7683",
+    "paper": "https://arxiv.org/abs/2301.12876",
+    "repository": "https://github.com/Vision-CAIR/AF-Guide"
+  },
+  "hiql": {
+    "paper": "https://papers.nips.cc/paper_files/paper/2023/hash/6d7c4a0727e089ed6cdd3151cbe8d8ba-Abstract-Conference.html",
+    "repository": "https://seohong.me/projects/hiql/"
+  },
+  "mscp": {
+    "commit": "81bc98f889ac058691dc67f8f585982140b559c1",
+    "paper": "https://proceedings.mlr.press/v235/wu24j.html",
+    "repository": "https://github.com/ChengjieWU/MSCP"
+  },
+  "ogbench": {
+    "commit": "1d4140997f60c52c6fb0702ec100dc988b18c548",
+    "repository": "https://github.com/seohongpark/ogbench"
+  },
+  "oso_decqn": {
+    "paper": "https://arxiv.org/abs/2602.00629",
+    "repository": null
+  },
+  "pathbridger_base": {
+    "commit": "44a6dc1ea8227e3195306dafcf7731f006bdf0f8"
+  },
+  "rlpd": {
+    "paper": "https://arxiv.org/abs/2302.02948",
+    "repository": "https://github.com/ikostrikov/rlpd"
+  }
+}

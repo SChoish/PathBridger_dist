@@ -1,5 +1,73 @@
 # PathBridger
 
+## Action-free offline + online study
+
+The exact information boundary, training budget, evaluation schedule, method
+labels, and aggregation rules are specified in
+[`docs/action_free_o2o_protocol.md`](docs/action_free_o2o_protocol.md).
+
+This worktree adds the `PBF-OnlineIDM` setting and the external comparison
+suite.  In the proposed method, offline PBF contains no IDM parameters and
+online optimization updates only a separately initialized IDM.  External
+baselines retain their native online learners.
+
+Implemented algorithms:
+
+- `pbf_online_idm`
+- `gc_mscp`
+- `passive_hiql`
+- `gc_af_guide` (explicit goal-conditioned OGBench adaptation)
+- `gc_oso_decqn` (paper reimplementation and goal-conditioned adaptation)
+- `gc_sac` and `gc_td3` with future HER
+- `gc_rlpd` full-action upper bound
+
+Pretrain an action-free PBF with the existing offline entry point:
+
+```bash
+python main.py --agent=configs/pbf_af/antmaze_medium.py --seed=0
+```
+
+Run the full proposed pipeline, optionally restoring that PBF checkpoint:
+
+```bash
+python train_af.py \
+  --algorithm=pbf_online_idm \
+  --pbf=configs/pbf_af/antmaze_medium.py \
+  --pbf_restore_path=/path/to/params_1000000.pkl \
+  --online_steps=1000000 \
+  --seed=0
+```
+
+Run an external baseline:
+
+```bash
+python train_af.py \
+  --algorithm=gc_mscp \
+  --env_name=antmaze-medium-navigate-v0 \
+  --online_steps=250000 \
+  --seed=0
+```
+
+The locked main protocol uses one million primitive environment steps, a 10k
+random-action grounding phase, checkpoints at 0/10k/25k/50k/100k/250k/500k/1M,
+five seeds, and ten episodes for each of the five official tasks per checkpoint.
+Its primary sample-efficiency statistic is AUC@250k; AUC@1M and Success@1M are
+reported separately.
+
+`train_af.py` writes `offline.csv`, `online.csv`, `eval.csv`, immutable
+provenance metadata, and component-wise checkpoints.  Evaluate one checkpoint
+with `evaluate_af.py --checkpoint=<step_*.pkl>`.  Generate the locked 280-run
+main manifest and aggregate completed runs with:
+
+```bash
+python scripts/make_af_manifest.py --output=benchmark_manifest.csv
+python aggregate_results.py --root=exp/pbf_af_o2o
+```
+
+The aggregate output keeps action-free, online-only, and full-action upper-bound
+groups separate.  Reference repositories and audited commits are pinned in
+`third_party_refs.json`.
+
 This is the compact, actor-free distribution of PathBridger for state-based
 offline goal-conditioned reinforcement learning on OGBench.
 

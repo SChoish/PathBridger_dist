@@ -201,6 +201,7 @@ class PathBridgerDataset:
 
     dataset: Dataset
     config: Any
+    require_actions: bool = True
 
     def __post_init__(self) -> None:
         self.horizon = int(_config_get(self.config, "horizon"))
@@ -231,7 +232,7 @@ class PathBridgerDataset:
                 "PathBridger_dist supports state-vector observations only; "
                 f"expected observations with shape [N, D], got {observations.shape}."
             )
-        if "actions" not in self.dataset:
+        if self.require_actions and "actions" not in self.dataset:
             raise ValueError("PathBridgerDataset requires an 'actions' field.")
         if "terminals" not in self.dataset:
             raise ValueError(
@@ -412,10 +413,9 @@ class PathBridgerDataset:
             )
         transitive_idxs = idxs + transitive_offsets
 
-        return {
+        state_batch = {
             "observations": np.asarray(observations[idxs], dtype=np.float32),
             "next_observations": np.asarray(observations[idxs + 1], dtype=np.float32),
-            "actions": np.asarray(self.dataset["actions"][idxs], dtype=np.float32),
             "bridge_targets": np.asarray(
                 observations[bridge_target_idxs],
                 dtype=np.float32,
@@ -430,11 +430,40 @@ class PathBridgerDataset:
             "transitive_offsets": transitive_offsets.astype(np.float32),
             "transitive_valids": transitive_valids.astype(np.float32),
         }
+        if self.require_actions:
+            # Preserve the original explicit public contract for legacy PBF.
+            return {
+                "observations": state_batch["observations"],
+                "next_observations": state_batch["next_observations"],
+                "actions": np.asarray(
+                    self.dataset["actions"][idxs], dtype=np.float32
+                ),
+                "bridge_targets": state_batch["bridge_targets"],
+                "endpoint_goals": state_batch["endpoint_goals"],
+                "endpoint_targets": state_batch["endpoint_targets"],
+                "value_goals": state_batch["value_goals"],
+                "value_offsets": state_batch["value_offsets"],
+                "base_goals": state_batch["base_goals"],
+                "base_offsets": state_batch["base_offsets"],
+                "transitive_subgoals": state_batch["transitive_subgoals"],
+                "transitive_offsets": state_batch["transitive_offsets"],
+                "transitive_valids": state_batch["transitive_valids"],
+            }
+        return state_batch
+
+
+def action_free_view(dataset: Dataset) -> Dataset:
+    """Return an immutable offline view with action/reward supervision removed."""
+
+    forbidden = {'actions', 'rewards', 'returns', 'return_to_go', 'rtg'}
+    fields = {key: dataset[key] for key in dataset if key.lower() not in forbidden}
+    return Dataset.create(**fields)
 
 
 __all__ = [
     "Dataset",
     "PathBridgerDataset",
     "PathBridgerDatasetConfig",
+    "action_free_view",
     "observation_state_scale",
 ]

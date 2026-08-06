@@ -18,7 +18,7 @@ from ml_collections import config_flags
 
 from agents import PathBridgerAgent
 from envs.env_utils import make_env_and_datasets
-from utils.datasets import PathBridgerDataset, observation_state_scale
+from utils.datasets import PathBridgerDataset, action_free_view, observation_state_scale
 from utils.flax_utils import resolve_checkpoint, restore_agent, save_agent
 from utils.log_utils import CsvLogger, get_exp_name, get_flag_dict, setup_wandb
 
@@ -125,7 +125,10 @@ def main(_):
         str(config.env_name),
         dataset_dir=FLAGS.dataset_dir or None,
     )
-    dataset = PathBridgerDataset(train_data, config)
+    action_free = bool(config.get('offline_action_free', False))
+    if action_free:
+        train_data = action_free_view(train_data)
+    dataset = PathBridgerDataset(train_data, config, require_actions=not action_free)
     state_scale = observation_state_scale(
         train_data,
         floor=float(config.prefix_scale_floor),
@@ -134,7 +137,7 @@ def main(_):
     agent = PathBridgerAgent.create(
         FLAGS.seed,
         example_batch['observations'],
-        example_batch['actions'],
+        example_batch.get('actions'),
         config,
         state_scale=state_scale,
     )

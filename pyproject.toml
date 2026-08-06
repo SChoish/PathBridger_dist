@@ -24,13 +24,16 @@ dependencies = [
 [project.scripts]
 pathbridger-train = "main:run"
 pathbridger-eval = "evaluate:run"
+pathbridger-af-train = "train_af:run"
+pathbridger-af-eval = "evaluate_af:run"
+pathbridger-af-aggregate = "aggregate_results:run"
 
 [project.optional-dependencies]
 tracking = ["wandb"]
 dev = ["ruff"]
 
 [tool.setuptools]
-py-modules = ["main", "evaluate"]
+py-modules = ["main", "evaluate", "train_af", "evaluate_af", "aggregate_results"]
 
 [tool.setuptools.packages.find]
 where = ["."]

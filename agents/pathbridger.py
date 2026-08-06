@@ -66,6 +66,9 @@ _REQUIRED_BATCH_KEYS = (
     'transitive_offsets',
     'transitive_valids',
 )
+_REQUIRED_STATE_BATCH_KEYS = tuple(
+    key for key in _REQUIRED_BATCH_KEYS if key != 'actions'
+)
 
 
 class ScalarTransitiveValue(nn.Module):
@@ -930,7 +933,11 @@ class PathBridgerAgent(flax.struct.PyTreeNode):
             full_metrics,
             prefix=bridge_prefix,
         )
-        idm_loss, idm_info = self.idm_loss(batch, grad_params, full_metrics)
+        if bool(self.config.get('offline_action_free', False)):
+            idm_loss = jnp.zeros((), dtype=value_loss.dtype)
+            idm_info = {}
+        else:
+            idm_loss, idm_info = self.idm_loss(batch, grad_params, full_metrics)
         prefix_rng = jax.random.fold_in(rng, _PREFIX_STREAM_ID)
         prefix_loss, prefix_info = self.prefix_distribution_loss(
             batch,
@@ -987,7 +994,12 @@ class PathBridgerAgent(flax.struct.PyTreeNode):
     ) -> tuple['PathBridgerAgent', dict[str, jnp.ndarray]]:
         """Apply one joint gradient update and one value-target EMA update."""
 
-        missing = [key for key in _REQUIRED_BATCH_KEYS if key not in batch]
+        required = (
+            _REQUIRED_STATE_BATCH_KEYS
+            if bool(self.config.get('offline_action_free', False))
+            else _REQUIRED_BATCH_KEYS
+        )
+        missing = [key for key in required if key not in batch]
         if missing:
             raise KeyError(f'PathBridger batch is missing keys: {missing}')
         if int(batch['bridge_targets'].shape[1]) != _ACTION_HORIZON:
@@ -1283,6 +1295,103 @@ class PathBridgerAgent(flax.struct.PyTreeNode):
         jax.jit,
         static_argnames=('num_candidates', 'temperature'),
     )
+    def sample_state_prefix(
+        self,
+        observations: jnp.ndarray,
+        goals: jnp.ndarray,
+        seed: jax.Array | None = None,
+        num_candidates: int | None = None,
+        temperature: float | None = None,
+    ) -> jnp.ndarray:
+        """Plan one absolute six-state prefix without decoding actions."""
+
+        if seed is None:
+            seed = jax.random.PRNGKey(0)
+        if num_candidates is None:
+            num_candidates = int(self.config['eval_num_candidates'])
+        if temperature is None:
+            temperature = float(self.config['eval_temperature'])
+        if num_candidates < 1:
+            raise ValueError('num_candidates must be at least one.')
+        if temperature < 0.0:
+            raise ValueError('temperature must be non-negative.')
+
+        squeeze = observations.ndim == 1
+        if squeeze:
+            observations = observations[None, :]
+            goals = goals[None, :]
+
+        candidates = self._sample_endpoint_candidates(
+            observations,
+            goals,
+            seed,
+            num_candidates=num_candidates,
+            temperature=temperature,
+        )
+        batch_size, _, state_dim = candidates.shape
+        repeated_observations = jnp.broadcast_to(observations[:, None, :], candidates.shape)
+        repeated_goals = jnp.broadcast_to(
+            goals[:, None, :],
+            (batch_size, num_candidates, goals.shape[-1]),
+        )
+        flat_observations = repeated_observations.reshape(batch_size * num_candidates, state_dim)
+        flat_candidates = candidates.reshape(batch_size * num_candidates, state_dim)
+        flat_goals = repeated_goals.reshape(batch_size * num_candidates, goals.shape[-1])
+        values_to_endpoint = jax.nn.sigmoid(
+            self.network.select('value')(flat_observations, flat_candidates)
+        )
+        values_to_goal = jax.nn.sigmoid(
+            self.network.select('value')(flat_candidates, flat_goals)
+        )
+        scores = (values_to_endpoint * values_to_goal).reshape(batch_size, num_candidates)
+        best_indices = jnp.argmax(scores, axis=1)
+        selected_endpoints = jnp.take_along_axis(
+            candidates, best_indices[:, None, None], axis=1
+        )[:, 0, :]
+
+        prefix_seed = jax.random.fold_in(seed, _PREFIX_STREAM_ID)
+        if self.config['prefix_model'] == 'deterministic':
+            prefix_candidates = self._sample_prefixes(
+                observations,
+                selected_endpoints,
+                prefix_seed,
+                num_samples=1,
+                temperature=0.0,
+                include_deterministic=True,
+            )
+            prefix = prefix_candidates[:, 0, :, :]
+        elif self.config['eval_prefix_selection'] == 'sample_one':
+            prefix_candidates = self._sample_prefixes(
+                observations,
+                selected_endpoints,
+                prefix_seed,
+                num_samples=1,
+                temperature=float(self.config['eval_prefix_temperature']),
+                include_deterministic=False,
+            )
+            prefix = prefix_candidates[:, 0, :, :]
+        else:
+            prefix_candidates = self._sample_prefixes(
+                observations,
+                selected_endpoints,
+                prefix_seed,
+                num_samples=int(self.config['eval_num_prefix_samples']),
+                temperature=float(self.config['eval_prefix_temperature']),
+                include_deterministic=bool(self.config['eval_include_deterministic_prefix']),
+            )
+            chain_scores = self._transv_chain_scores(prefix_candidates, selected_endpoints)
+            best_prefix_indices = jnp.argmax(chain_scores, axis=1)
+            prefix = jnp.take_along_axis(
+                prefix_candidates,
+                best_prefix_indices[:, None, None, None],
+                axis=1,
+            )[:, 0, :, :]
+        return prefix[0] if squeeze else prefix
+
+    @partial(
+        jax.jit,
+        static_argnames=('num_candidates', 'temperature'),
+    )
     def sample_action_chunks(
         self,
         observations: jnp.ndarray,
@@ -1292,6 +1401,12 @@ class PathBridgerAgent(flax.struct.PyTreeNode):
         temperature: float | None = None,
     ) -> jnp.ndarray:
         """Select an endpoint first, sample its prefix, then decode actions."""
+
+        if bool(self.config.get('offline_action_free', False)):
+            raise ValueError(
+                'An action-free PBF checkpoint has no IDM. Use sample_state_prefix '
+                'with a separately trained online IDM.'
+            )
 
         if seed is None:
             seed = jax.random.PRNGKey(0)
@@ -1414,13 +1529,14 @@ class PathBridgerAgent(flax.struct.PyTreeNode):
         cls,
         seed: int,
         ex_observations: jnp.ndarray,
-        ex_actions: jnp.ndarray,
+        ex_actions: jnp.ndarray | None,
         config: dict[str, Any],
         state_scale: jnp.ndarray | None = None,
     ) -> 'PathBridgerAgent':
         """Initialize all PathBridger modules and the joint optimizer."""
 
         config = dict(config)
+        config.setdefault('offline_action_free', False)
         endpoint_distribution = str(
             config['endpoint_distribution']
         ).lower()
@@ -1483,17 +1599,20 @@ class PathBridgerAgent(flax.struct.PyTreeNode):
             raise ValueError('eval_temperature must be non-negative.')
 
         observations = jnp.asarray(ex_observations, dtype=jnp.float32)
-        actions = jnp.asarray(ex_actions, dtype=jnp.float32)
-        if observations.ndim != 2 or actions.ndim != 2:
-            raise ValueError(
-                'ex_observations and ex_actions must be batched rank-2 arrays.'
-            )
-        if observations.shape[0] != actions.shape[0]:
-            raise ValueError(
-                'ex_observations and ex_actions must have equal batch sizes.'
-            )
+        action_free = bool(config['offline_action_free'])
+        if observations.ndim != 2:
+            raise ValueError('ex_observations must be a batched rank-2 array.')
+        actions = None if ex_actions is None else jnp.asarray(ex_actions, dtype=jnp.float32)
+        if not action_free:
+            if actions is None or actions.ndim != 2:
+                raise ValueError(
+                    'Action-conditioned PathBridger requires batched rank-2 ex_actions.'
+                )
+            if observations.shape[0] != actions.shape[0]:
+                raise ValueError(
+                    'ex_observations and ex_actions must have equal batch sizes.'
+                )
         state_dim = int(observations.shape[-1])
-        action_dim = int(actions.shape[-1])
         if state_scale is None:
             state_scale_array = jnp.ones((state_dim,), dtype=jnp.float32)
         else:
@@ -1538,7 +1657,6 @@ class PathBridgerAgent(flax.struct.PyTreeNode):
                 jnp.zeros((observations.shape[0], 1), dtype=jnp.float32),
             )
         bridge_def = BridgeResidual(state_dim=state_dim)
-        idm_def = InverseDynamics(action_dim=action_dim)
         event_steps = _ACTION_HORIZON - int(horizon == _ACTION_HORIZON)
         prefix_event_dim = event_steps * state_dim
         prefix_def = None
@@ -1582,8 +1700,10 @@ class PathBridgerAgent(flax.struct.PyTreeNode):
                 bridge_def,
                 (observations, jnp.zeros_like(observations), bridge_times),
             ),
-            'idm': (idm_def, (observations, observations)),
         }
+        if not action_free:
+            idm_def = InverseDynamics(action_dim=int(actions.shape[-1]))
+            network_info['idm'] = (idm_def, (observations, observations))
         if prefix_def is not None:
             network_info['prefix'] = (prefix_def, prefix_args)
         network_def = ModuleDict(
@@ -1647,6 +1767,7 @@ def get_config() -> ml_collections.ConfigDict:
             eval_num_prefix_samples=1,
             eval_prefix_temperature=1.0,
             eval_include_deterministic_prefix=False,
+            offline_action_free=False,
         )
     )
 

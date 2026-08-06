@@ -150,6 +150,7 @@ def _checkpoint_metadata(agent: Any) -> dict[str, Any]:
         'prefix_model': prefix_model,
         'horizon': int(config['horizon']),
         'state_scale': np.asarray(agent.state_scale, dtype=np.float32),
+        'offline_action_free': bool(config.get('offline_action_free', False)),
     }
     if prefix_model == 'low_rank_gaussian':
         metadata.update({
@@ -175,7 +176,7 @@ def _validate_checkpoint_metadata(agent: Any, metadata: Any) -> None:
         raise ValueError('Invalid PathBridger checkpoint metadata.')
 
     expected = _checkpoint_metadata(agent)
-    keys = ['endpoint_distribution', 'prefix_model', 'horizon']
+    keys = ['endpoint_distribution', 'prefix_model', 'horizon', 'offline_action_free']
     if prefix_model == 'low_rank_gaussian':
         keys.extend(['prefix_rank', 'prefix_sigma_floor'])
     elif prefix_model == 'joint_flow':
