@@ -173,6 +173,7 @@ class ActionFreePixelTrajectoryData:
         value_p_curgoal: float = 0.0,
         value_p_trajgoal: float = 1.0,
         value_p_randomgoal: float = 0.0,
+        pbf_indices_only: bool = False,
     ) -> dict[str, np.ndarray]:
         batch_size = int(batch_size)
         if batch_size < 1:
@@ -228,11 +229,6 @@ class ActionFreePixelTrajectoryData:
             bridge_indices = np.minimum(
                 bridge_indices, endpoint_target_indices[:, None]
             )
-        bridge_targets = self.stack_indices(bridge_indices.reshape(-1)).reshape(
-            len(indices), path_horizon, *self.image_shape
-        )
-        successes = endpoint_goal_indices == indices + 1
-
         mix = np.asarray(
             [value_p_curgoal, value_p_trajgoal, value_p_randomgoal],
             dtype=np.float64,
@@ -281,6 +277,31 @@ class ActionFreePixelTrajectoryData:
                 self.rng.random(np.sum(transitive_valids)) * max_offsets
             ).astype(np.int64)
         transitive_indices = indices + transitive_offsets
+
+        if pbf_indices_only:
+            if endpoint_horizon is None:
+                raise ValueError(
+                    'Indexed PBF batches require an explicit endpoint_horizon.'
+                )
+            return {
+                'observation_indices': indices,
+                'next_observation_indices': indices + 1,
+                'endpoint_goal_indices': endpoint_goal_indices,
+                'endpoint_target_indices': endpoint_target_indices,
+                'bridge_indices': bridge_indices,
+                'value_goal_indices': value_goal_indices,
+                'base_indices': base_indices,
+                'transitive_indices': transitive_indices,
+                'value_offsets': value_offsets.astype(np.float32),
+                'base_offsets': base_offsets.astype(np.float32),
+                'transitive_offsets': transitive_offsets.astype(np.float32),
+                'transitive_valids': transitive_valids.astype(np.float32),
+            }
+
+        bridge_targets = self.stack_indices(bridge_indices.reshape(-1)).reshape(
+            len(indices), path_horizon, *self.image_shape
+        )
+        successes = endpoint_goal_indices == indices + 1
 
         result = {
             'observations': self.stack_indices(indices),
@@ -336,7 +357,12 @@ class PixelTrajectoryData(ActionFreePixelTrajectoryData):
 
     def sample(self, batch_size: int, **kwargs) -> dict[str, np.ndarray]:
         batch = super().sample(batch_size, **kwargs)
-        batch['actions'] = self.actions[batch['indices']]
+        index_key = (
+            'observation_indices'
+            if bool(kwargs.get('pbf_indices_only', False))
+            else 'indices'
+        )
+        batch['actions'] = self.actions[batch[index_key]]
         return batch
 
 

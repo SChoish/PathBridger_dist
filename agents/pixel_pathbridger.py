@@ -74,6 +74,26 @@ class ImpalaSmallEncoder(nn.Module):
         return MLP((self.feature_dim,), activate_final=True)(hidden)
 
 
+def _stack_resident_frames(frames, initial_for_state, indices, frame_stack: int):
+    """Build channel-stacked observations from a device-resident frame store."""
+
+    indices = jnp.asarray(indices, dtype=jnp.int32)
+    flat_indices = indices.reshape(-1)
+    initials = initial_for_state[flat_indices]
+    offsets = jnp.arange(frame_stack - 1, -1, -1, dtype=jnp.int32)
+    history = jnp.maximum(
+        flat_indices[:, None] - offsets[None, :], initials[:, None]
+    )
+    pixels = frames[history]
+    pixels = jnp.transpose(pixels, (0, 2, 3, 1, 4)).reshape(
+        flat_indices.shape[0],
+        frames.shape[1],
+        frames.shape[2],
+        frame_stack * frames.shape[3],
+    )
+    return pixels.reshape((*indices.shape, *pixels.shape[1:]))
+
+
 class LatentPathBridge(nn.Module):
     feature_dim: int
     path_horizon: int = 5
@@ -225,7 +245,7 @@ class PixelPathBridgerAgent(flax.struct.PyTreeNode):
     def _encode(self, images, params=None, *, module: str = 'encoder'):
         return self.network.select(module)(images, params=params)
 
-    def value_loss(self, batch, grad_params):
+    def value_loss(self, batch, grad_params, features=None):
         discount = jnp.asarray(self.config['discount'], dtype=jnp.float32)
         expectile = float(self.config['expectile'])
         observations = batch['observations']
@@ -233,10 +253,28 @@ class PixelPathBridgerAgent(flax.struct.PyTreeNode):
         base_goals = batch['base_goals']
         subgoals = batch['transitive_subgoals']
 
-        current = self._encode(observations, grad_params)
-        value_goal_feats = self._encode(value_goals, grad_params)
-        base_goal_feats = self._encode(base_goals, grad_params)
-        subgoal_feats = self._encode(subgoals, grad_params)
+        if features is None:
+            current = self._encode(observations, grad_params)
+            value_goal_feats = self._encode(value_goals, grad_params)
+            base_goal_feats = self._encode(base_goals, grad_params)
+            subgoal_feats = self._encode(subgoals, grad_params)
+            target_current = self._encode(observations, module='target_encoder')
+            target_sub = self._encode(subgoals, module='target_encoder')
+            target_value_goals = self._encode(
+                value_goals, module='target_encoder'
+            )
+            target_base_goals = self._encode(
+                base_goals, module='target_encoder'
+            )
+        else:
+            current = features['current']
+            value_goal_feats = features['value_goals']
+            base_goal_feats = features['base_goals']
+            subgoal_feats = features['subgoals']
+            target_current = features['target_current']
+            target_sub = features['target_subgoals']
+            target_value_goals = features['target_value_goals']
+            target_base_goals = features['target_base_goals']
 
         online_logits = self.network.select('value')(
             jnp.concatenate([current, current, current], axis=0),
@@ -263,10 +301,6 @@ class PixelPathBridgerAgent(flax.struct.PyTreeNode):
         use_distance_weights = (
             float(self.config['value_distance_weight_power']) != 0.0
         )
-        target_current = self._encode(observations, module='target_encoder')
-        target_sub = self._encode(subgoals, module='target_encoder')
-        target_value_goals = self._encode(value_goals, module='target_encoder')
-        target_base_goals = self._encode(base_goals, module='target_encoder')
         target_states = [target_current, target_sub]
         target_goals = [target_sub, target_value_goals]
         if use_distance_weights:
@@ -412,21 +446,125 @@ class PixelPathBridgerAgent(flax.struct.PyTreeNode):
             candidates, best[:, None, None], axis=1
         )[:, 0, :]
 
-    @partial(jax.jit, static_argnames=())
-    def offline_update(self, batch):
+    def _materialize_indexed_batch(self, batch, frames, initial_for_state):
+        frame_stack = int(self.config['frame_stack'])
+        materialized = {
+            'observations': _stack_resident_frames(
+                frames,
+                initial_for_state,
+                batch['observation_indices'],
+                frame_stack,
+            ),
+            'endpoint_goals': _stack_resident_frames(
+                frames,
+                initial_for_state,
+                batch['endpoint_goal_indices'],
+                frame_stack,
+            ),
+            'endpoint_targets': _stack_resident_frames(
+                frames,
+                initial_for_state,
+                batch['endpoint_target_indices'],
+                frame_stack,
+            ),
+            'bridge_targets': _stack_resident_frames(
+                frames,
+                initial_for_state,
+                batch['bridge_indices'],
+                frame_stack,
+            ),
+            'value_goals': _stack_resident_frames(
+                frames,
+                initial_for_state,
+                batch['value_goal_indices'],
+                frame_stack,
+            ),
+            'base_goals': _stack_resident_frames(
+                frames,
+                initial_for_state,
+                batch['base_indices'],
+                frame_stack,
+            ),
+            'transitive_subgoals': _stack_resident_frames(
+                frames,
+                initial_for_state,
+                batch['transitive_indices'],
+                frame_stack,
+            ),
+            'value_offsets': batch['value_offsets'],
+            'base_offsets': batch['base_offsets'],
+            'transitive_offsets': batch['transitive_offsets'],
+            'transitive_valids': batch['transitive_valids'],
+        }
+        if not bool(self.config.get('offline_action_free', False)):
+            materialized['next_observations'] = _stack_resident_frames(
+                frames,
+                initial_for_state,
+                batch['next_observation_indices'],
+                frame_stack,
+            )
+            materialized['actions'] = batch['actions']
+        return materialized
+
+    def _offline_update_impl(self, batch):
         path_horizon = int(self.config['path_horizon'])
         new_rng, noise_rng, time_rng = jax.random.split(self.rng, 3)
 
         def loss_fn(params):
-            value_loss, value_info = self.value_loss(batch, params)
-            current = self.network.select('encoder')(
-                batch['observations'], params=params
+            online_images = [
+                batch['observations'],
+                batch['value_goals'],
+                batch['base_goals'],
+                batch['transitive_subgoals'],
+                batch['endpoint_goals'],
+            ]
+            if not bool(self.config.get('offline_action_free', False)):
+                online_images.append(batch['next_observations'])
+            online_features = self.network.select('encoder')(
+                jnp.concatenate(online_images, axis=0), params=params
             )
-            goal = self.network.select('encoder')(
-                batch['endpoint_goals'], params=params
+            online_parts = jnp.split(
+                online_features, len(online_images), axis=0
             )
-            target_endpoint = self.network.select('target_encoder')(
-                batch['endpoint_targets']
+            current, value_goal, base_goal, subgoal, goal = online_parts[:5]
+
+            path_images = batch['bridge_targets']
+            flat_path_images = path_images.reshape(
+                (-1, *path_images.shape[2:])
+            )
+            target_images = [
+                batch['observations'],
+                batch['transitive_subgoals'],
+                batch['value_goals'],
+                batch['base_goals'],
+                batch['endpoint_targets'],
+                flat_path_images,
+            ]
+            target_features = self.network.select('target_encoder')(
+                jnp.concatenate(target_images, axis=0)
+            )
+            batch_size = current.shape[0]
+            target_current = target_features[0 * batch_size : 1 * batch_size]
+            target_subgoal = target_features[1 * batch_size : 2 * batch_size]
+            target_value_goal = target_features[2 * batch_size : 3 * batch_size]
+            target_base_goal = target_features[3 * batch_size : 4 * batch_size]
+            target_endpoint = target_features[4 * batch_size : 5 * batch_size]
+            target_path = target_features[5 * batch_size :].reshape(
+                (-1, path_horizon, current.shape[-1])
+            )
+            value_loss, value_info = self.value_loss(
+                batch,
+                params,
+                features={
+                    'current': current,
+                    'value_goals': value_goal,
+                    'base_goals': base_goal,
+                    'subgoals': subgoal,
+                    'target_current': target_current,
+                    'target_subgoals': target_subgoal,
+                    'target_value_goals': target_value_goal,
+                    'target_base_goals': target_base_goal,
+                },
             )
             endpoint_weights, value_gap = self._endpoint_weights(
                 current, goal, target_endpoint
@@ -456,11 +594,6 @@ class PixelPathBridgerAgent(flax.struct.PyTreeNode):
             predicted_path = self.network.select('bridge')(
                 current, jax.lax.stop_gradient(target_endpoint), params=params
             )
-            path_images = batch['bridge_targets']
-            flat_images = path_images.reshape((-1, *path_images.shape[2:]))
-            target_path = self.network.select('target_encoder')(
-                flat_images
-            ).reshape((-1, path_horizon, current.shape[-1]))
             feature_errors = jnp.sum(
                 jnp.abs(predicted_path - jax.lax.stop_gradient(target_path)),
                 axis=-1,
@@ -472,9 +605,7 @@ class PixelPathBridgerAgent(flax.struct.PyTreeNode):
             else:
                 if 'actions' not in batch:
                     raise KeyError('Full offline pixel PBF batch requires actions.')
-                following = self.network.select('encoder')(
-                    batch['next_observations'], params=params
-                )
+                following = online_parts[5]
                 predicted_actions = self.network.select('idm')(
                     current, following, params=params
                 )
@@ -498,12 +629,7 @@ class PixelPathBridgerAgent(flax.struct.PyTreeNode):
             }
             return total, info
 
-        trainable_modules = [
-                'encoder',
-                'endpoint',
-                'bridge',
-                'value',
-        ]
+        trainable_modules = ['encoder', 'endpoint', 'bridge', 'value']
         if not bool(self.config.get('offline_action_free', False)):
             trainable_modules.append('idm')
         network, info = self.network.apply_loss_fn(
@@ -525,14 +651,28 @@ class PixelPathBridgerAgent(flax.struct.PyTreeNode):
         return self.replace(network=network, rng=new_rng), info
 
     @partial(jax.jit, static_argnames=())
+    def offline_update(self, batch):
+        return self._offline_update_impl(batch)
+
+    @partial(jax.jit, static_argnames=())
+    def offline_update_indexed(self, batch, frames, initial_for_state):
+        materialized = self._materialize_indexed_batch(
+            batch, frames, initial_for_state
+        )
+        return self._offline_update_impl(materialized)
+
+    @partial(jax.jit, static_argnames=())
     def online_update(self, batch):
         """Ground actual online transitions without updating the visual prior."""
 
         def loss_fn(params):
-            current = self.network.select('encoder')(batch['observations'])
-            following = self.network.select('encoder')(
-                batch['next_observations']
+            images = jnp.concatenate(
+                [batch['observations'], batch['next_observations']], axis=0
             )
+            features = jax.lax.stop_gradient(
+                self.network.select('encoder')(images)
+            )
+            current, following = jnp.split(features, 2, axis=0)
             predicted = self.network.select('idm')(
                 current, following, params=params
             )

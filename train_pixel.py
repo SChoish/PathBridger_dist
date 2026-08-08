@@ -260,7 +260,13 @@ def _module_digest(agent, name: str) -> str:
     return parameter_digest(agent.network.params[f'modules_{name}'])
 
 
-def _sample_offline_batch(pixel_data, batch_size: int, config: dict):
+def _sample_offline_batch(
+    pixel_data,
+    batch_size: int,
+    config: dict,
+    *,
+    pbf_indices_only: bool = False,
+):
     kwargs = {'path_horizon': int(config.get('path_horizon', 5))}
     if 'endpoint_horizon' in config:
         kwargs['endpoint_horizon'] = int(config['endpoint_horizon'])
@@ -272,6 +278,8 @@ def _sample_offline_batch(pixel_data, batch_size: int, config: dict):
             value_p_trajgoal=float(config.get('value_p_trajgoal', 1.0)),
             value_p_randomgoal=float(config.get('value_p_randomgoal', 0.0)),
         )
+    if pbf_indices_only:
+        kwargs['pbf_indices_only'] = True
     return pixel_data.sample(batch_size, **kwargs)
 
 
@@ -398,6 +406,23 @@ def main(_):
     if pixel_data is None and offline_steps:
         raise ValueError(f'{algorithm} is online-only and cannot use offline_steps.')
 
+    indexed_pixel_pbf = algorithm in (
+        'pixel_pbf',
+        'pixel_pathbridger_online_idm',
+    )
+    device_pixel_frames = None
+    device_pixel_initials = None
+    if indexed_pixel_pbf and pixel_data is not None and offline_steps:
+        device_pixel_frames = jax.device_put(pixel_data.observations)
+        device_pixel_initials = jax.device_put(
+            pixel_data.episodes.initial_for_state.astype(np.int32, copy=False)
+        )
+        print(
+            '[pixel-pbf] resident dataset '
+            f'frames={pixel_data.observations.nbytes / 2**30:.2f} GiB',
+            flush=True,
+        )
+
     exp_name = get_exp_name(FLAGS.seed, env_name=FLAGS.env_name, agent_name=algorithm)
     resume_in_place = bool(restore_file and FLAGS.resume_in_place)
     if resume_in_place:
@@ -487,9 +512,20 @@ def main(_):
         if FLAGS.use_tqdm:
             iterator = tqdm.tqdm(iterator, desc=f'{algorithm}-offline', dynamic_ncols=True)
         for step in iterator:
-            agent, info = agent.offline_update(
-                _sample_offline_batch(pixel_data, batch_size, config)
+            offline_batch = _sample_offline_batch(
+                pixel_data,
+                batch_size,
+                config,
+                pbf_indices_only=indexed_pixel_pbf,
             )
+            if indexed_pixel_pbf:
+                agent, info = agent.offline_update_indexed(
+                    offline_batch,
+                    device_pixel_frames,
+                    device_pixel_initials,
+                )
+            else:
+                agent, info = agent.offline_update(offline_batch)
             if step % FLAGS.log_interval == 0 or step == offline_steps:
                 logger.log(_host_metrics(info), step)
             if stop_requested['flag']:
@@ -550,6 +586,16 @@ def main(_):
         'env_name': str(FLAGS.env_name),
         'seed': int(FLAGS.seed),
         'observation_modality': 'rgb_uint8',
+        'offline_input_pipeline': (
+            'gpu_resident_indexed_uint8'
+            if indexed_pixel_pbf
+            else 'host_materialized_uint8'
+        ),
+        'resident_dataset_bytes': (
+            int(pixel_data.observations.nbytes)
+            if indexed_pixel_pbf and pixel_data is not None
+            else 0
+        ),
         'offline_fields_seen': (
             [] if pixel_data is None else list(pixel_data.offline_fields_seen)
         ),

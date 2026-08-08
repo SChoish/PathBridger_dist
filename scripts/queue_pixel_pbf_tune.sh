@@ -14,6 +14,7 @@ SLOTS_PER_GPU="${SLOTS_PER_GPU:-2}"
 RUN_GROUP="${RUN_GROUP:-pixel_pbf_full_gap_nt_s0}"
 OFFLINE_STEPS="${OFFLINE_STEPS:-1000000}"
 EVAL_EPISODES="${EVAL_EPISODES:-50}"
+AUTO_RESUME="${AUTO_RESUME:-1}"
 SEED="${SEED:-0}"
 POLL_SEC="${POLL_SEC:-20}"
 CPU_STRIDE="${CPU_STRIDE:-16}"
@@ -131,6 +132,16 @@ find_checkpoint() {
   printf '%s\n' "$checkpoint"
 }
 
+find_resume_checkpoint() {
+  local env="$1" gap="$2" root checkpoint
+  root="$SAVE_DIR/pixel_o2o/${RUN_GROUP}_gap${gap}"
+  checkpoint=$(find "$root" -type f \
+    -path "*/pixel_pbf_${env}_sd$(printf '%03d' "$SEED")_*/checkpoints/offline_step_*.pkl" \
+    -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -1 | cut -d' ' -f2-)
+  [[ -n "$checkpoint" && -f "$checkpoint" ]] || return 1
+  printf '%s\n' "$checkpoint"
+}
+
 launch_job() {
   local phase="$1" env="$2" gap="$3" n="${4:-1}" temp="${5:-0}"
   local key slot gpu cpu0 cpu1 out cfg group checkpoint output pid
@@ -166,6 +177,10 @@ launch_job() {
       --offline_steps="$OFFLINE_STEPS" --online_steps=0 --random_steps=0
       --eval_steps=0 --eval_episodes=0 --frame_stack=3
       --resume_interval=0 --nouse_tqdm --config_json="$cfg")
+    if [[ "$AUTO_RESUME" == 1 ]] && checkpoint=$(find_resume_checkpoint "$env" "$gap"); then
+      log "RESUME env=$env gap=$gap checkpoint=$checkpoint"
+      cmd+=(--restore_path="$checkpoint" --restore_step=-1 --resume_in_place)
+    fi
   else
     checkpoint=$(find_checkpoint "$env" "$gap") || {
       log "FATAL missing checkpoint env=$env gap=$gap"; return 1;

@@ -115,10 +115,10 @@ class TrainState(flax.struct.PyTreeNode):
         called, so both their parameters and optimizer states remain bitwise
         unchanged across phase boundaries and delayed-policy steps.
         """
-        grads, info = jax.grad(loss_fn, has_aux=True)(self.params)
         if not isinstance(self.tx, Mapping):
             if trainable_modules is not None:
                 raise ValueError('trainable_modules requires module optimizers.')
+            grads, info = jax.grad(loss_fn, has_aux=True)(self.params)
             return self.apply_gradients(grads), info
         if not trainable_modules:
             raise ValueError('At least one trainable module must be selected.')
@@ -126,13 +126,32 @@ class TrainState(flax.struct.PyTreeNode):
         names = tuple(str(name) for name in trainable_modules)
         if len(set(names)) != len(names):
             raise ValueError(f'Duplicate trainable modules: {names}.')
+        keys = tuple(f'modules_{name}' for name in names)
+        for module_name, key in zip(names, keys):
+            if module_name not in self.tx:
+                raise ValueError(f'No optimizer configured for module {module_name!r}.')
+            if key not in self.params:
+                raise ValueError(
+                    f'Trainable module {module_name!r} has no parameter subtree {key!r}.'
+                )
+
+        # Differentiate only the requested subtrees.  Building a gradient tree
+        # for frozen image encoders/targets creates large zero buffers and makes
+        # phase-specific updates compile and dispatch substantially more work.
+        trainable_params = {key: self.params[key] for key in keys}
+
+        def selected_loss(selected_params):
+            if isinstance(self.params, flax.core.FrozenDict):
+                full_params = self.params.copy(selected_params)
+            else:
+                full_params = {**self.params, **selected_params}
+            return loss_fn(full_params)
+
+        grads, info = jax.grad(selected_loss, has_aux=True)(trainable_params)
         frozen_params = isinstance(self.params, flax.core.FrozenDict)
         params = flax.core.unfreeze(self.params) if frozen_params else dict(self.params)
         opt_state = dict(self.opt_state)
-        for module_name in names:
-            if module_name not in self.tx:
-                raise ValueError(f'No optimizer configured for module {module_name!r}.')
-            key = f'modules_{module_name}'
+        for module_name, key in zip(names, keys):
             transform = self.tx[module_name]
             updates, module_opt_state = transform.update(
                 grads[key], self.opt_state[module_name], params[key]

@@ -195,8 +195,13 @@ def test_full_offline_pixel_pbf_trains_idm_from_dataset_actions():
         endpoint_horizon=5,
         discount=0.99,
         value_geom_sample=True,
+        pbf_indices_only=True,
     )
-    agent, info = agent.offline_update(batch)
+    agent, info = agent.offline_update_indexed(
+        batch,
+        np.asarray(data.observations),
+        np.asarray(data.episodes.initial_for_state, dtype=np.int32),
+    )
     assert np.isfinite(float(info['loss/total']))
     assert np.isfinite(float(info['idm/loss']))
     assert parameter_digest(agent.network.params['modules_idm']) != before
