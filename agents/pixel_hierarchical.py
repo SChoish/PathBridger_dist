@@ -59,6 +59,7 @@ class GoalRepresentation(nn.Module):
 class PixelTwinValue(nn.Module):
     """Twin V(s, phi([s; g])) with a value-specific state tower."""
 
+    goal_rep: nn.Module
     rep_dim: int = 10
     feature_dim: int = 512
     hidden_dims: Sequence[int] = (512, 512, 512)
@@ -71,13 +72,9 @@ class PixelTwinValue(nn.Module):
         state_features = ImpalaSmallEncoder(
             self.feature_dim, name='state_encoder'
         )(observations)
-        goal_features = GoalRepresentation(
-            rep_dim=self.rep_dim,
-            feature_dim=self.feature_dim,
-            hidden_dims=self.hidden_dims,
-            layer_norm=self.layer_norm,
-            name='goal_rep',
-        )(jnp.concatenate([observations, goals], axis=-1))
+        goal_features = self.goal_rep(
+            jnp.concatenate([observations, goals], axis=-1)
+        )
         inputs = jnp.concatenate([state_features, goal_features], axis=-1)
         value1 = MLP(
             (*self.hidden_dims, 1),
@@ -399,7 +396,11 @@ class PixelHierarchicalAgent(flax.struct.PyTreeNode):
         if mode == 'ota':
             for name in ('low_value', 'target_low_value', 'high_value', 'target_high_value'):
                 modules[name] = PixelTwinValue(
-                    rep_dim, feature_dim, value_hidden, layer_norm
+                    goal_rep=goal_rep,
+                    rep_dim=rep_dim,
+                    feature_dim=feature_dim,
+                    hidden_dims=value_hidden,
+                    layer_norm=layer_norm,
                 )
                 init_args[name] = (examples, examples)
             target_pairs = (
@@ -408,10 +409,18 @@ class PixelHierarchicalAgent(flax.struct.PyTreeNode):
             )
         else:
             modules['value'] = PixelTwinValue(
-                rep_dim, feature_dim, value_hidden, layer_norm
+                goal_rep=goal_rep,
+                rep_dim=rep_dim,
+                feature_dim=feature_dim,
+                hidden_dims=value_hidden,
+                layer_norm=layer_norm,
             )
             modules['target_value'] = PixelTwinValue(
-                rep_dim, feature_dim, value_hidden, layer_norm
+                goal_rep=goal_rep,
+                rep_dim=rep_dim,
+                feature_dim=feature_dim,
+                hidden_dims=value_hidden,
+                layer_norm=layer_norm,
             )
             init_args['value'] = (examples, examples)
             init_args['target_value'] = (examples, examples)

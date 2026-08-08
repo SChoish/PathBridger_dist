@@ -239,6 +239,9 @@ def test_pixel_hierarchical_baselines_train_and_act(name):
         action_dim=2,
         config=config,
     )
+    assert 'goal_rep' not in agent.network.params[
+        'modules_low_value' if name == 'pixel_ota' else 'modules_value'
+    ]
     batch = data.sample_hierarchical(2, **config)
     before = parameter_digest(agent.network.params['modules_goal_rep'])
     agent, info = agent.offline_update(batch)
