@@ -31,6 +31,11 @@ flags.DEFINE_float(
     -1.0,
     'PBF endpoint temperature; negative uses checkpoint config.',
 )
+flags.DEFINE_boolean(
+    'log_each_episode',
+    True,
+    'Print one line after every episode (task/ep/success/steps/running rate).',
+)
 
 
 def main(_):
@@ -77,11 +82,27 @@ def main(_):
         config=config,
     )
     agent = restore_af_agent(template, payload)
+    episodes_path = None
+    if FLAGS.output_path:
+        path = Path(FLAGS.output_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        episodes_path = path.with_name(path.stem + '_episodes.jsonl')
+    print(
+        f'[eval] start env={metadata["env_name"]} '
+        f'episodes_per_task={FLAGS.episodes} '
+        f'N={int(config.get("eval_num_candidates", 1))} '
+        f'T={float(config.get("eval_temperature", 0.0))} '
+        f'ckpt_step={int(payload["step"])}'
+        + (f' episode_log={episodes_path}' if episodes_path else ''),
+        flush=True,
+    )
     metrics = evaluate_pixel_policy(
         agent,
         env,
         episodes_per_task=FLAGS.episodes,
         seed=FLAGS.seed,
+        log_each_episode=bool(FLAGS.log_each_episode),
+        episode_log_path=episodes_path,
     )
     result = {
         'algorithm': algorithm,
@@ -94,11 +115,11 @@ def main(_):
         **metrics,
     }
     output = json.dumps(result, indent=2, sort_keys=True)
-    print(output)
+    print(output, flush=True)
     if FLAGS.output_path:
         path = Path(FLAGS.output_path)
-        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(output + '\n')
+        print(f'[eval] wrote summary → {path}', flush=True)
 
 
 def run():

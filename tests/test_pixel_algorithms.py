@@ -70,6 +70,13 @@ def _config(name):
             endpoint_horizon=5,
             endpoint_flow_steps=2,
         )
+    if name in ('pixel_hiql', 'pixel_ota'):
+        config.update(
+            actor_hidden_dims=(16,),
+            value_hidden_dims=(16,),
+            rep_dim=4,
+            p_aug=0.0,
+        )
     return config
 
 
@@ -84,6 +91,8 @@ def _online_batch(data):
 def test_pixel_registry_declares_information_and_online_update_boundaries():
     assert PIXEL_ALGORITHMS == (
         'pixel_pbf',
+        'pixel_hiql',
+        'pixel_ota',
         'gc_pixel_lapo_decoder',
         'gc_pixel_drqv2',
         'vip_style_frozen_gc_drqv2',
@@ -116,6 +125,8 @@ def test_pixel_registry_declares_information_and_online_update_boundaries():
         'encoder', 'endpoint', 'bridge', 'value', 'idm'
     )
     assert pixel_method_scope('pixel_pbf')['online_trainable_modules'] == ()
+    assert pixel_method_scope('pixel_hiql')['online_trainable_modules'] == ()
+    assert pixel_method_scope('pixel_ota')['online_trainable_modules'] == ()
     assert pixel_method_scope('gc_pixel_lapo_decoder')[
         'online_trainable_modules'
     ] == ('decoder',)
@@ -205,6 +216,49 @@ def test_full_offline_pixel_pbf_trains_idm_from_dataset_actions():
     assert np.isfinite(float(info['loss/total']))
     assert np.isfinite(float(info['idm/loss']))
     assert parameter_digest(agent.network.params['modules_idm']) != before
+
+
+@pytest.mark.parametrize('name', ('pixel_hiql', 'pixel_ota'))
+def test_pixel_hierarchical_baselines_train_and_act(name):
+    frames = _pixels()
+    data = PixelTrajectoryData(
+        {
+            'observations': frames,
+            'terminals': np.array([0, 0, 1, 0, 0, 1], np.float32),
+            'actions': np.linspace(-0.5, 0.5, 12, dtype=np.float32).reshape(6, 2),
+        },
+        seed=7,
+        frame_stack=1,
+    )
+    config = _config(name)
+    config.update(subgoal_steps=2, abstraction_factor=2)
+    agent, _ = create_pixel_algorithm(
+        name,
+        seed=0,
+        example_images=data.example_images,
+        action_dim=2,
+        config=config,
+    )
+    batch = data.sample_hierarchical(2, **config)
+    before = parameter_digest(agent.network.params['modules_goal_rep'])
+    agent, info = agent.offline_update(batch)
+    assert np.isfinite(float(info['loss/total']))
+    assert np.isfinite(float(info['low_actor/loss']))
+    assert parameter_digest(agent.network.params['modules_goal_rep']) != before
+    actions = agent.sample_actions(
+        data.example_images[:1],
+        data.example_images[1:2],
+        seed=jax.random.PRNGKey(1),
+        temperature=0.0,
+    )
+    assert actions.shape == (1, 2)
+    assert np.all(np.isfinite(np.asarray(actions)))
+    if name == 'pixel_ota':
+        assert 'high_value/loss' in info
+        assert np.all(
+            batch['high_value_option_indices']
+            <= data.episodes.terminal_for_state[batch['indices']]
+        )
 
 
 def test_vip_frozen_and_finetuned_have_distinct_online_encoder_behavior():
@@ -328,7 +382,9 @@ def test_pixel_manifest_matches_all_algorithms_and_locked_dimensions(tmp_path):
         rows = build_rows(root=tmp_path, python='python', suite_name=name)
         assert len(rows) == count
         assert {row['algorithm'] for row in rows} == set(PIXEL_ALGORITHMS) - {
-            'pixel_pbf'
+            'pixel_pbf',
+            'pixel_hiql',
+            'pixel_ota',
         }
         assert all('train_pixel.py' in row['command'] for row in rows)
         assert all('train_af.py' not in row['command'] for row in rows)

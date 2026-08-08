@@ -267,6 +267,8 @@ def _sample_offline_batch(
     *,
     pbf_indices_only: bool = False,
 ):
+    if str(config.get('agent_name', '')) in ('hiql', 'ota'):
+        return pixel_data.sample_hierarchical(batch_size, **config)
     kwargs = {'path_horizon': int(config.get('path_horizon', 5))}
     if 'endpoint_horizon' in config:
         kwargs['endpoint_horizon'] = int(config['endpoint_horizon'])
@@ -286,7 +288,7 @@ def _sample_offline_batch(
 def _make_env_and_data(algorithm: str):
     metadata = pixel_algorithm_metadata(algorithm)
     if metadata.offline_fields_seen:
-        full_offline = algorithm == 'pixel_pbf'
+        full_offline = algorithm in ('pixel_pbf', 'pixel_hiql', 'pixel_ota')
         env, train_dataset, _ = make_pixel_env_and_datasets(
             FLAGS.env_name,
             dataset_dir=FLAGS.dataset_dir or None,
@@ -359,6 +361,16 @@ def main(_):
     task_rng = np.random.default_rng(FLAGS.seed + 17_003)
     exploration_rng = np.random.default_rng(FLAGS.seed + 91_009)
     algorithm = str(FLAGS.algorithm)
+    if algorithm in ('pixel_hiql', 'pixel_ota'):
+        if FLAGS.online_steps != 0:
+            raise ValueError(
+                f'{algorithm} is an offline baseline; run with --online_steps=0.'
+            )
+        if FLAGS.frame_stack != 1:
+            raise ValueError(
+                f'{algorithm} follows the official visual protocol with '
+                '--frame_stack=1.'
+            )
     algorithm_metadata = pixel_algorithm_metadata(algorithm)
     method_scope = pixel_method_scope(algorithm)
     env, pixel_data, example_images = _make_env_and_data(algorithm)
@@ -374,6 +386,12 @@ def main(_):
     if not isinstance(overrides, dict):
         raise ValueError('config_json must decode to a JSON object.')
     overrides.setdefault('frame_stack', int(FLAGS.frame_stack))
+    if algorithm in ('pixel_hiql', 'pixel_ota'):
+        is_manipulation = any(
+            token in FLAGS.env_name for token in ('cube', 'scene', 'puzzle')
+        )
+        overrides.setdefault('p_aug', 0.5 if is_manipulation else 0.0)
+        overrides.setdefault('subgoal_steps', 10 if is_manipulation else 25)
     if algorithm == 'pixel_pbf':
         overrides = apply_pixel_pbf_locks(FLAGS.env_name, overrides)
     agent, config = create_pixel_algorithm(

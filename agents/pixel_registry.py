@@ -6,6 +6,11 @@ from typing import Any
 
 from agents.pixel_drq import PixelDrQAgent, get_config as drq_config
 from agents.pixel_lapo import PixelLAPOAgent, get_config as lapo_config
+from agents.pixel_hierarchical import (
+    PixelHIQLAgent,
+    PixelOTAAgent,
+    get_config as hierarchical_config,
+)
 from agents.pixel_pathbridger import (
     PixelPathBridgerAgent,
     get_config as pathbridger_config,
@@ -15,6 +20,8 @@ from utils.provenance import AlgorithmMetadata
 
 PIXEL_ALGORITHMS = (
     'pixel_pbf',
+    'pixel_hiql',
+    'pixel_ota',
     'gc_pixel_lapo_decoder',
     'gc_pixel_drqv2',
     'vip_style_frozen_gc_drqv2',
@@ -50,6 +57,25 @@ PIXEL_METHOD_SCOPES = {
             'value',
             'target_value',
             'idm',
+        ),
+    },
+    'pixel_hiql': {
+        'offline_trainable_modules': (
+            'goal_rep', 'value', 'low_actor', 'high_actor'
+        ),
+        'online_trainable_modules': (),
+        'online_frozen_modules': (
+            'goal_rep', 'value', 'target_value', 'low_actor', 'high_actor'
+        ),
+    },
+    'pixel_ota': {
+        'offline_trainable_modules': (
+            'goal_rep', 'low_value', 'high_value', 'low_actor', 'high_actor'
+        ),
+        'online_trainable_modules': (),
+        'online_frozen_modules': (
+            'goal_rep', 'low_value', 'target_low_value', 'high_value',
+            'target_high_value', 'low_actor', 'high_actor'
         ),
     },
     'gc_pixel_lapo_decoder': {
@@ -104,6 +130,8 @@ PIXEL_METHOD_SCOPES = {
 
 _PIXEL_METHOD_CONFIG_CONTRACTS = {
     'pixel_pbf': {'offline_action_free': False},
+    'pixel_hiql': {'agent_name': 'hiql', 'low_actor_rep_grad': True},
+    'pixel_ota': {'agent_name': 'ota', 'low_actor_rep_grad': True},
     'gc_pixel_drqv2': {
         'pretraining': 'none',
         'freeze_encoder_online': False,
@@ -156,6 +184,10 @@ def get_pixel_config(name: str) -> dict[str, Any]:
         config = pathbridger_config().to_dict()
         config['offline_action_free'] = False
         return config
+    if name == 'pixel_hiql':
+        return hierarchical_config('hiql').to_dict()
+    if name == 'pixel_ota':
+        return hierarchical_config('ota').to_dict()
     if name == 'gc_pixel_lapo_decoder':
         return lapo_config().to_dict()
     if name == 'gc_pixel_drqv2':
@@ -189,6 +221,12 @@ def create_pixel_algorithm(
             ),
             resolved,
         )
+    if name in ('pixel_hiql', 'pixel_ota'):
+        agent_cls = PixelHIQLAgent if name == 'pixel_hiql' else PixelOTAAgent
+        return (
+            agent_cls.create(seed, example_images, action_dim, resolved),
+            resolved,
+        )
     if name == 'gc_pixel_lapo_decoder':
         return (
             PixelLAPOAgent.create(seed, example_images, action_dim, resolved),
@@ -218,6 +256,35 @@ def pixel_algorithm_metadata(name: str) -> AlgorithmMetadata:
                 'pixel encoder and EMA target encoder. TransV, rectified-flow '
                 'endpoint proposal, endpoint-pinned bridge, and IDM are '
                 'trained jointly from offline images and actions.'
+            ),
+        ),
+        'pixel_hiql': dict(
+            port_kind='full_action',
+            paper_url='https://arxiv.org/abs/2307.11949',
+            official_repo_url='https://github.com/seohongpark/ogbench',
+            official_repo_commit=None,
+            offline_fields_seen=('observations', 'terminals', 'actions'),
+            online_modules_updated=(),
+            uses_offline_actions=True,
+            implementation_notes=(
+                'Offline visual HIQL baseline ported from the official OGBench '
+                'implementation: separate IMPALA-small towers, 10-D '
+                'length-normalized state-dependent subgoal representation, '
+                'twin expectile value, and hierarchical AWR actors.'
+            ),
+        ),
+        'pixel_ota': dict(
+            port_kind='full_action',
+            paper_url='https://openreview.net/forum?id=E7yV6taTkF',
+            official_repo_url='https://github.com/ota-v/ota-v',
+            official_repo_commit=None,
+            offline_fields_seen=('observations', 'terminals', 'actions'),
+            online_modules_updated=(),
+            uses_offline_actions=True,
+            implementation_notes=(
+                'Offline visual OTA baseline: HIQL hierarchy plus a separate '
+                'option-aware high-level twin value trained at s^Omega with '
+                'one high-level discount per temporal abstraction.'
             ),
         ),
         'gc_pixel_lapo_decoder': dict(

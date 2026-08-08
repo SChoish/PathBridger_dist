@@ -365,6 +365,175 @@ class PixelTrajectoryData(ActionFreePixelTrajectoryData):
         batch['actions'] = self.actions[batch[index_key]]
         return batch
 
+    def _hierarchical_goal_indices(
+        self, indices, *, discount, p_current, p_trajectory, p_random, geometric
+    ):
+        probabilities = np.asarray(
+            [p_current, p_trajectory, p_random], dtype=np.float64
+        )
+        if not np.isclose(probabilities.sum(), 1.0):
+            raise ValueError('Hierarchical goal probabilities must sum to one.')
+        finals = self.episodes.terminal_for_state[indices]
+        random_indices = self.episodes.transition_indices[
+            self.rng.integers(
+                0, len(self.episodes.transition_indices), size=len(indices)
+            )
+        ]
+        if geometric:
+            probability = np.clip(1.0 - float(discount), 1e-6, 1.0 - 1e-6)
+            offsets = self.rng.geometric(probability, size=len(indices))
+            trajectory_indices = np.minimum(indices + offsets, finals)
+        else:
+            distances = self.rng.random(len(indices))
+            trajectory_indices = np.round(
+                np.minimum(indices + 1, finals) * distances
+                + finals * (1.0 - distances)
+            ).astype(np.int64)
+        components = self.rng.choice(3, size=len(indices), p=probabilities)
+        return np.where(
+            components == 0,
+            indices,
+            np.where(components == 1, trajectory_indices, random_indices),
+        )
+
+    def _augment_hierarchical(self, batch, keys):
+        padding = 3
+        offsets = self.rng.integers(
+            0, 2 * padding + 1, size=(len(batch[keys[0]]), 2)
+        )
+        for key in keys:
+            images = np.asarray(batch[key])
+            padded = np.pad(
+                images,
+                ((0, 0), (padding, padding), (padding, padding), (0, 0)),
+                mode='edge',
+            )
+            shifted = np.empty_like(images)
+            height, width = images.shape[1:3]
+            for row, (top, left) in enumerate(offsets):
+                shifted[row] = padded[
+                    row, top : top + height, left : left + width
+                ]
+            batch[key] = shifted
+
+    def sample_hierarchical(self, batch_size: int, **config):
+        """Sample official HGCDataset fields required by HIQL or OTA."""
+
+        agent_name = str(config['agent_name'])
+        if agent_name not in ('hiql', 'ota'):
+            raise ValueError("agent_name must be 'hiql' or 'ota'.")
+        transitions = self.episodes.transition_indices
+        indices = transitions[
+            self.rng.integers(0, len(transitions), size=int(batch_size))
+        ]
+        finals = self.episodes.terminal_for_state[indices]
+        discount = float(config.get('discount', 0.99))
+        subgoal_steps = int(config.get('subgoal_steps', 25))
+        value_goals = self._hierarchical_goal_indices(
+            indices,
+            discount=discount,
+            p_current=float(config.get('value_p_curgoal', 0.2)),
+            p_trajectory=float(config.get('value_p_trajgoal', 0.5)),
+            p_random=float(config.get('value_p_randomgoal', 0.3)),
+            geometric=bool(config.get('value_geom_sample', True)),
+        )
+        successes = indices == value_goals
+        low_goals = np.minimum(indices + subgoal_steps, finals)
+        if bool(config.get('actor_geom_sample', False)):
+            probability = np.clip(1.0 - discount, 1e-6, 1.0 - 1e-6)
+            actor_goals = np.minimum(
+                indices + self.rng.geometric(probability, size=len(indices)),
+                finals,
+            )
+        else:
+            distances = self.rng.random(len(indices))
+            actor_goals = np.round(
+                np.minimum(indices + 1, finals) * distances
+                + finals * (1.0 - distances)
+            ).astype(np.int64)
+        actor_targets = np.minimum(indices + subgoal_steps, actor_goals)
+        random_actor_goals = transitions[
+            self.rng.integers(0, len(transitions), size=len(indices))
+        ]
+        pick_random = self.rng.random(len(indices)) < float(
+            config.get('actor_p_randomgoal', 0.0)
+        )
+        high_actor_goals = np.where(
+            pick_random, random_actor_goals, actor_goals
+        )
+        high_actor_targets = np.where(
+            pick_random, np.minimum(indices + subgoal_steps, finals), actor_targets
+        )
+        batch = {
+            'observations': self.stack_indices(indices),
+            'next_observations': self.stack_indices(indices + 1),
+            'actions': self.actions[indices],
+            'value_goals': self.stack_indices(value_goals),
+            'rewards': successes.astype(np.float32) - 1.0,
+            'masks': 1.0 - successes.astype(np.float32),
+            'low_actor_goals': self.stack_indices(low_goals),
+            'high_actor_goals': self.stack_indices(high_actor_goals),
+            'high_actor_targets': self.stack_indices(high_actor_targets),
+            'indices': indices,
+            'value_goal_indices': value_goals,
+            'low_actor_goal_indices': low_goals,
+            'high_actor_goal_indices': high_actor_goals,
+            'high_actor_target_indices': high_actor_targets,
+        }
+        if agent_name == 'ota':
+            random_goals = transitions[
+                self.rng.integers(0, len(transitions), size=len(indices))
+            ]
+            if bool(config.get('value_geom_sample', True)):
+                probability = np.clip(1.0 - discount, 1e-6, 1.0 - 1e-6)
+                trajectory_goals = np.minimum(
+                    indices + self.rng.geometric(probability, size=len(indices)),
+                    finals,
+                )
+            else:
+                distances = self.rng.random(len(indices))
+                trajectory_goals = np.round(
+                    np.minimum(indices + 1, finals) * distances
+                    + finals * (1.0 - distances)
+                ).astype(np.int64)
+            p_current = float(config.get('value_p_curgoal', 0.2))
+            p_trajectory = float(config.get('value_p_trajgoal', 0.5))
+            trajectory_mask = self.rng.random(len(indices)) < (
+                p_trajectory / (1.0 - p_current + 1e-6)
+            )
+            factor = int(config.get('abstraction_factor', 5))
+            option_indices = np.where(
+                trajectory_mask,
+                np.minimum(indices + factor, trajectory_goals),
+                np.minimum(indices + factor, finals),
+            )
+            high_value_goals = np.where(
+                trajectory_mask, trajectory_goals, random_goals
+            )
+            high_value_goals = np.where(
+                self.rng.random(len(indices)) < p_current,
+                option_indices,
+                high_value_goals,
+            )
+            high_successes = option_indices == high_value_goals
+            batch.update(
+                high_value_goals=self.stack_indices(high_value_goals),
+                high_value_option_observations=self.stack_indices(option_indices),
+                high_value_rewards=high_successes.astype(np.float32) - 1.0,
+                high_value_masks=1.0 - high_successes.astype(np.float32),
+                high_value_goal_indices=high_value_goals,
+                high_value_option_indices=option_indices,
+            )
+        if self.rng.random() < float(config.get('p_aug', 0.0)):
+            self._augment_hierarchical(
+                batch,
+                (
+                    'observations', 'next_observations', 'value_goals',
+                    'low_actor_goals', 'high_actor_goals', 'high_actor_targets',
+                ),
+            )
+        return batch
+
 
 class PixelReplayBuffer:
     """Episode-aware indexed raw-frame replay with future-image HER."""
