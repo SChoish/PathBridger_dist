@@ -66,6 +66,9 @@ def pixel_pbf_lock_for_env(env_name: str) -> dict[str, Any]:
     critic = trl_critic_lock_for_env(env_name)
     return {
         **critic,
+        'encoder': 'impala_small',
+        'feature_dim': 512,
+        'encoder_learning_rate': 3e-4,
         'path_horizon': 5,
         'endpoint_horizon': PIXEL_PBF_ENDPOINT_HORIZONS[env_name],
         'endpoint_flow_steps': 8,

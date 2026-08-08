@@ -19,6 +19,7 @@ from agents.pixel_trl_critic_locks import (
     apply_pixel_pbf_locks,
     trl_critic_lock_for_env,
 )
+from agents.pixel_pathbridger import ImpalaSmallEncoder
 from scripts.make_pixel_manifest import SUITES, build_rows
 from utils.af_checkpoints import load_af_checkpoint, restore_af_agent, save_af_checkpoint
 from utils.pixel_data import ActionFreePixelTrajectoryData
@@ -401,12 +402,27 @@ def test_pixel_pbf_search_grid_and_locks_are_explicit():
         {'endpoint_value_scale': 5.0, 'eval_num_candidates': 16},
     )
     assert locked['endpoint_horizon'] == 40
+    assert locked['encoder'] == 'impala_small'
+    assert locked['feature_dim'] == 512
     assert locked['path_horizon'] == 5
     assert locked['endpoint_value_scale'] == 5.0
     with pytest.raises(ValueError, match='Only gap and'):
         apply_pixel_pbf_locks(
             'visual-cube-double-play-v0', {'discount': 0.95}
         )
+
+
+def test_impala_small_encoder_matches_official_stack_shape():
+    module = ImpalaSmallEncoder(feature_dim=32)
+    variables = module.init(
+        jax.random.PRNGKey(9), np.zeros((2, 32, 32, 9), dtype=np.uint8)
+    )
+    features = module.apply(
+        variables, np.zeros((2, 32, 32, 9), dtype=np.uint8)
+    )
+    assert features.shape == (2, 32)
+    stack_names = [name for name in variables['params'] if name.startswith('ImpalaResidualStack')]
+    assert len(stack_names) == 3
 
 
 def test_pixel_pbf_sampler_uses_k_endpoint_and_first_five_bridge_targets():

@@ -599,6 +599,8 @@ def main(_):
         if algorithm == 'pixel_pathbridger_online_idm'
         else None,
         'pixel_pbf_tune': {
+            'encoder': str(config['encoder']),
+            'feature_dim': int(config['feature_dim']),
             'gap': float(config['endpoint_value_scale']),
             'num_candidates': int(config['eval_num_candidates']),
             'endpoint_temperature': float(config['eval_temperature']),

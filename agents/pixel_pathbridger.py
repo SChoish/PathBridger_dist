@@ -13,13 +13,65 @@ import ml_collections
 import optax
 
 from agents.gc_actor_critic import _replace_subtree
-from agents.pixel_drq import DrQEncoder
 from utils.flax_utils import ModuleDict, TrainState, nonpytree_field
 from utils.networks import MLP
 
 _VALUE_EPS = 1e-6
 _ENDPOINT_WEIGHT_CAP = 5.0
 _BRIDGE_ALPHA_POWER = 0.8
+
+
+class ImpalaResidualStack(nn.Module):
+    """One official IMPALA-small residual stack."""
+
+    channels: int
+
+    @nn.compact
+    def __call__(self, inputs):
+        initializer = nn.initializers.xavier_uniform()
+        hidden = nn.Conv(
+            self.channels,
+            kernel_size=(3, 3),
+            strides=1,
+            padding='SAME',
+            kernel_init=initializer,
+        )(inputs)
+        hidden = nn.max_pool(
+            hidden, window_shape=(3, 3), strides=(2, 2), padding='SAME'
+        )
+        residual = hidden
+        hidden = nn.relu(hidden)
+        hidden = nn.Conv(
+            self.channels,
+            kernel_size=(3, 3),
+            strides=1,
+            padding='SAME',
+            kernel_init=initializer,
+        )(hidden)
+        hidden = nn.relu(hidden)
+        hidden = nn.Conv(
+            self.channels,
+            kernel_size=(3, 3),
+            strides=1,
+            padding='SAME',
+            kernel_init=initializer,
+        )(hidden)
+        return hidden + residual
+
+
+class ImpalaSmallEncoder(nn.Module):
+    """Official IMPALA-small image encoder (one block per 16/32/32 stack)."""
+
+    feature_dim: int = 512
+
+    @nn.compact
+    def __call__(self, images):
+        hidden = jnp.asarray(images, dtype=jnp.float32) / 255.0
+        for channels in (16, 32, 32):
+            hidden = ImpalaResidualStack(channels)(hidden)
+        hidden = nn.relu(hidden)
+        hidden = hidden.reshape((hidden.shape[0], -1))
+        return MLP((self.feature_dim,), activate_final=True)(hidden)
 
 
 class LatentPathBridge(nn.Module):
@@ -569,11 +621,16 @@ class PixelPathBridgerAgent(flax.struct.PyTreeNode):
                 f'{expected_channels}] for frame_stack={config["frame_stack"]}.'
             )
         feature_dim = int(config['feature_dim'])
+        if config.get('encoder') != 'impala_small':
+            raise ValueError(
+                "Pixel PBF requires encoder='impala_small', got "
+                f"{config.get('encoder')!r}."
+            )
         hidden_dims = tuple(config['hidden_dims'])
         value_hidden = tuple(
             config.get('value_hidden_dims', config['hidden_dims'])
         )
-        encoder = DrQEncoder(feature_dim)
+        encoder = ImpalaSmallEncoder(feature_dim)
         bridge = LatentPathBridge(
             feature_dim=feature_dim,
             path_horizon=path_horizon,
@@ -655,7 +712,8 @@ def get_config():
     return ml_collections.ConfigDict(
         dict(
             frame_stack=3,
-            feature_dim=128,
+            encoder='impala_small',
+            feature_dim=512,
             hidden_dims=(512, 512, 512),
             bridge_layer_norm=True,
             value_hidden_dims=(512, 512, 512),
@@ -666,7 +724,7 @@ def get_config():
             endpoint_horizon=25,
             endpoint_flow_steps=8,
             learning_rate=3e-4,
-            encoder_learning_rate=1e-4,
+            encoder_learning_rate=3e-4,
             value_learning_rate=3e-4,
             idm_learning_rate=3e-4,
             tau=0.01,
@@ -692,6 +750,7 @@ def get_config():
 
 __all__ = [
     'LatentInverseDynamics',
+    'ImpalaSmallEncoder',
     'LatentFlowEndpoint',
     'LatentPathBridge',
     'LatentTransitiveValue',
