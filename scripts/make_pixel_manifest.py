@@ -27,18 +27,6 @@ PIXEL_ALGORITHMS = (
 )
 EVAL_STEPS = '0,10000,25000,50000,100000,250000,500000,1000000'
 SUITES = {
-    'p0_smoke': {
-        'algorithms': PIXEL_ALGORITHMS,
-        'environments': (
-            'visual-antmaze-medium-navigate-v0',
-            'visual-cube-double-play-v0',
-            'visual-scene-play-v0',
-        ),
-        'seeds': (0,),
-        'online_steps': 50_000,
-        'eval_steps': '0,10000,25000,50000',
-        'run_group': 'pixel_p0_smoke_50k',
-    },
     'pilot': {
         'algorithms': PIXEL_ALGORITHMS,
         'environments': (
@@ -63,7 +51,17 @@ SUITES = {
 }
 
 
-def build_rows(*, root: Path, python: str, suite_name: str, run_group: str = ''):
+DEFAULT_DATASET_DIR = '/raid/ext_csv/datasets/ogbench_visual'
+
+
+def build_rows(
+    *,
+    root: Path,
+    python: str,
+    suite_name: str,
+    run_group: str = '',
+    dataset_dir: str = DEFAULT_DATASET_DIR,
+):
     suite = SUITES[suite_name]
     group = run_group or suite['run_group']
     rows = []
@@ -85,7 +83,13 @@ def build_rows(*, root: Path, python: str, suite_name: str, run_group: str = '')
                     '--her_probability=0.8',
                     f'--eval_steps={suite["eval_steps"]}',
                     '--eval_episodes=10',
+                    '--nouse_tqdm',
+                    '--resume_interval=50000',
+                    '--resume_keep=1',
+                    '--save_replay',
                 ]
+                if dataset_dir:
+                    command.append(f'--dataset_dir={dataset_dir}')
                 rows.append(
                     {
                         'suite': suite_name,
@@ -102,8 +106,13 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--output', default='pixel_manifest.csv')
     parser.add_argument('--python', default='python')
-    parser.add_argument('--suite', choices=tuple(SUITES), default='p0_smoke')
+    parser.add_argument('--suite', choices=tuple(SUITES), default='pilot')
     parser.add_argument('--run_group', default='')
+    parser.add_argument(
+        '--dataset_dir',
+        default=DEFAULT_DATASET_DIR,
+        help='Local visual OGBench NPZ directory (train+val).',
+    )
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
     rows = build_rows(
@@ -111,6 +120,7 @@ def main():
         python=args.python,
         suite_name=args.suite,
         run_group=args.run_group,
+        dataset_dir=args.dataset_dir,
     )
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)

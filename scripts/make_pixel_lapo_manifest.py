@@ -21,17 +21,6 @@ ENVIRONMENTS = (
 ALGORITHM = 'gc_pixel_lapo_decoder'
 EVAL_STEPS = '0,10000,25000,50000,100000,250000,500000,1000000'
 SUITES = {
-    'p0_smoke': {
-        'environments': (
-            'visual-antmaze-medium-navigate-v0',
-            'visual-cube-double-play-v0',
-            'visual-scene-play-v0',
-        ),
-        'seeds': (0,),
-        'online_steps': 50_000,
-        'eval_steps': '0,10000,25000,50000',
-        'run_group': 'pixel_p0_smoke_50k',
-    },
     'pilot': {
         'environments': (
             'visual-antmaze-large-navigate-v0',
@@ -89,7 +78,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--output', default='pixel_lapo_manifest.csv')
     parser.add_argument('--python', default='python')
-    parser.add_argument('--suite', choices=tuple(SUITES), default='p0_smoke')
+    parser.add_argument('--suite', choices=tuple(SUITES), default='pilot')
     parser.add_argument('--run_group', default='')
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]

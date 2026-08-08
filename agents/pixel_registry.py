@@ -28,10 +28,122 @@ PIXEL_ALGORITHM_ALIASES = {
     'gc_pixel_apv': 'gc_pixel_apv_style_drq',
 }
 
+# This is the executable training contract for the visual comparison.  Direct
+# gradient updates are listed separately from target-network EMA updates; the
+# latter are intentionally not reported as trainable method modules.
+PIXEL_METHOD_SCOPES = {
+    'pixel_pathbridger_online_idm': {
+        'offline_trainable_modules': (
+            'encoder',
+            'bridge',
+            'world_decoder',
+            'value',
+        ),
+        'online_trainable_modules': ('idm',),
+        'online_frozen_modules': (
+            'encoder',
+            'target_encoder',
+            'bridge',
+            'world_decoder',
+            'value',
+            'target_value',
+        ),
+    },
+    'gc_pixel_lapo_decoder': {
+        'offline_trainable_modules': ('latent_model', 'latent_policy'),
+        'online_trainable_modules': ('decoder',),
+        'online_frozen_modules': ('latent_model', 'latent_policy'),
+    },
+    'gc_pixel_drqv2': {
+        'offline_trainable_modules': (),
+        'online_trainable_modules': ('encoder', 'actor', 'critic'),
+        'online_frozen_modules': (
+            'video_predictor',
+            'action_dynamics',
+            'world_decoder',
+        ),
+    },
+    'vip_style_frozen_gc_drqv2': {
+        'offline_trainable_modules': ('encoder',),
+        'online_trainable_modules': ('actor', 'critic'),
+        'online_frozen_modules': (
+            'encoder',
+            'target_encoder',
+            'video_predictor',
+            'action_dynamics',
+            'world_decoder',
+        ),
+    },
+    'vip_style_finetuned_gc_drqv2': {
+        'offline_trainable_modules': ('encoder',),
+        'online_trainable_modules': ('encoder', 'actor', 'critic'),
+        'online_frozen_modules': (
+            'video_predictor',
+            'action_dynamics',
+            'world_decoder',
+        ),
+    },
+    'gc_pixel_apv_style_drq': {
+        'offline_trainable_modules': (
+            'encoder',
+            'video_predictor',
+            'world_decoder',
+        ),
+        'online_trainable_modules': (
+            'encoder',
+            'actor',
+            'critic',
+            'action_dynamics',
+        ),
+        'online_frozen_modules': ('video_predictor', 'world_decoder'),
+    },
+}
+
+_PIXEL_METHOD_CONFIG_CONTRACTS = {
+    'gc_pixel_drqv2': {
+        'pretraining': 'none',
+        'freeze_encoder_online': False,
+    },
+    'vip_style_frozen_gc_drqv2': {
+        'pretraining': 'vip',
+        'freeze_encoder_online': True,
+    },
+    'vip_style_finetuned_gc_drqv2': {
+        'pretraining': 'vip',
+        'freeze_encoder_online': False,
+    },
+    'gc_pixel_apv_style_drq': {
+        'pretraining': 'apv',
+        'freeze_encoder_online': False,
+    },
+}
+
 
 def canonical_pixel_algorithm(name: str) -> str:
     name = str(name).lower()
     return PIXEL_ALGORITHM_ALIASES.get(name, name)
+
+
+def pixel_method_scope(name: str) -> dict[str, tuple[str, ...]]:
+    """Return the immutable phase/module contract for one visual method."""
+
+    name = canonical_pixel_algorithm(name)
+    if name not in PIXEL_METHOD_SCOPES:
+        raise ValueError(f'Unknown pixel algorithm {name!r}.')
+    return {
+        key: tuple(value) for key, value in PIXEL_METHOD_SCOPES[name].items()
+    }
+
+
+def _validate_method_config(name: str, config: dict[str, Any]) -> None:
+    for key, expected in _PIXEL_METHOD_CONFIG_CONTRACTS.get(name, {}).items():
+        actual = config.get(key)
+        if actual != expected:
+            raise ValueError(
+                f'{name} requires {key}={expected!r}, got {actual!r}. '
+                'Choose the matching algorithm name instead of overriding its '
+                'training regime.'
+            )
 
 
 def get_pixel_config(name: str) -> dict[str, Any]:
@@ -63,6 +175,7 @@ def create_pixel_algorithm(
     resolved = get_pixel_config(name)
     if config:
         resolved.update(config)
+    _validate_method_config(name, resolved)
     if name == 'pixel_pathbridger_online_idm':
         return (
             PixelPathBridgerAgent.create(
@@ -93,7 +206,13 @@ def pixel_algorithm_metadata(name: str) -> AlgorithmMetadata:
             official_repo_commit=None,
             offline_fields_seen=('observations', 'terminals'),
             online_modules_updated=('idm',),
-            implementation_notes='Proposed visual extension: an action-free endpoint-pinned latent path bridge is frozen online, while a separately initialized IDM is grounded from new RGB/action transitions.',
+            implementation_notes=(
+                'Proposed visual extension: latent TransV critic (TRL-locked '
+                'lam/expectile/discount/value_p) plus an action-free '
+                'endpoint-pinned latent path bridge are frozen online, while a '
+                'separately initialized IDM is grounded from new RGB/action '
+                'transitions.'
+            ),
         ),
         'gc_pixel_lapo_decoder': dict(
             port_kind='goal_conditioned_adaptation',
@@ -148,6 +267,13 @@ def pixel_algorithm_metadata(name: str) -> AlgorithmMetadata:
     }
     if name not in records:
         raise ValueError(f'Unknown pixel algorithm {name!r}.')
+    expected_online = pixel_method_scope(name)['online_trainable_modules']
+    declared_online = tuple(records[name]['online_modules_updated'])
+    if declared_online != expected_online:
+        raise RuntimeError(
+            f'Pixel method scope mismatch for {name}: metadata={declared_online} '
+            f'vs executable={expected_online}.'
+        )
     metadata = AlgorithmMetadata(
         algorithm=name,
         uses_offline_logged_rewards=False,
@@ -160,8 +286,10 @@ def pixel_algorithm_metadata(name: str) -> AlgorithmMetadata:
 __all__ = [
     'PIXEL_ALGORITHMS',
     'PIXEL_ALGORITHM_ALIASES',
+    'PIXEL_METHOD_SCOPES',
     'canonical_pixel_algorithm',
     'create_pixel_algorithm',
     'get_pixel_config',
+    'pixel_method_scope',
     'pixel_algorithm_metadata',
 ]

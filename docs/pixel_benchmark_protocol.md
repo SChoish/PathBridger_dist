@@ -80,31 +80,19 @@ should additionally be reported as updates and wall-clock time in final tables.
 
 The unified manifest includes all six registry entries:
 
-- `p0_smoke`: 6 algorithms x 3 environments x 1 seed = 18 runs.
 - `pilot`: 6 algorithms x 4 environments x 3 seeds = 72 runs.
 - `screening`: 6 algorithms x 8 environments x 5 seeds = 240 runs.
 
 Manifest generation never launches training or downloads datasets:
 
 ```bash
-python scripts/make_pixel_manifest.py --suite=p0_smoke \
-  --output=manifests/pixel_p0.csv
+python scripts/make_pixel_manifest.py --suite=pilot \
+  --output=manifests/pixel_pilot.csv
 ```
 
 The visual dataset must be provisioned explicitly. Missing data raises an
 error unless `--allow_dataset_download=true` is supplied. The online-only
 DrQ-v2 entry can run without opening a visual offline dataset.
-
-Example development smoke:
-
-```bash
-python train_pixel.py \
-  --algorithm=pixel_pathbridger_online_idm \
-  --env_name=visual-antmaze-medium-navigate-v0 \
-  --offline_steps=2 --online_steps=10 --random_steps=10 \
-  --update_start=2 --replay_capacity=50 --frame_stack=3 \
-  --eval_episodes=0 --eval_steps=10 --use_tqdm=false
-```
 
 Evaluate a saved checkpoint with:
 
@@ -112,10 +100,10 @@ Evaluate a saved checkpoint with:
 python evaluate_pixel.py --checkpoint=/exact/path/to/step_10.pkl
 ```
 
-Promotion beyond P0 requires finite losses, non-degenerate actions, positive
-HER success rate, nonzero critic/IDM learning signals as applicable, and no
-frozen-module hash violation. Commanded success is reported separately so HER
-positives cannot be mistaken for environment success.
+Formal runs require finite losses, non-degenerate actions, positive HER success
+rate, nonzero critic/IDM learning signals as applicable, and no frozen-module
+hash violation. Commanded success is reported separately so HER positives
+cannot be mistaken for environment success.
 
 ## Deferred methods
 

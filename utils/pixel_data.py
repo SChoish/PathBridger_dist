@@ -138,21 +138,49 @@ class ActionFreePixelTrajectoryData:
             indices = np.repeat(indices, 2)
         return self.stack_indices(indices)
 
+    def _sample_future_offsets(
+        self,
+        indices: np.ndarray,
+        *,
+        discount: float,
+        geom_sample: bool,
+    ) -> np.ndarray:
+        """Sample positive within-episode offsets for goals / value targets."""
+
+        finals = self.episodes.terminal_for_state[indices]
+        remaining = np.maximum(finals - indices, 1)
+        if geom_sample:
+            # TRL-style geometric horizon with success at the terminal capped.
+            probs = 1.0 - float(discount)
+            probs = min(max(probs, 1e-6), 1.0 - 1e-6)
+            offsets = self.rng.geometric(p=probs, size=len(indices))
+            offsets = np.minimum(offsets, remaining).astype(np.int64)
+            offsets = np.maximum(offsets, 1)
+        else:
+            offsets = 1 + np.floor(
+                self.rng.random(len(indices)) * remaining
+            ).astype(np.int64)
+        return offsets
+
     def sample(
         self,
         batch_size: int,
         *,
         path_horizon: int = 5,
+        discount: float = 0.99,
+        value_geom_sample: bool = True,
+        value_p_curgoal: float = 0.0,
+        value_p_trajgoal: float = 1.0,
+        value_p_randomgoal: float = 0.0,
     ) -> dict[str, np.ndarray]:
         choices = self.rng.integers(
             0, len(self.episodes.transition_indices), size=int(batch_size)
         )
         indices = self.episodes.transition_indices[choices]
-        finals = self.episodes.terminal_for_state[indices]
-        offsets = 1 + np.floor(
-            self.rng.random(len(indices)) * (finals - indices)
-        ).astype(np.int64)
-        goal_indices = indices + offsets
+        path_offsets = self._sample_future_offsets(
+            indices, discount=discount, geom_sample=False
+        )
+        goal_indices = indices + path_offsets
         path_horizon = int(path_horizon)
         if path_horizon < 1:
             raise ValueError('path_horizon must be positive.')
@@ -165,6 +193,42 @@ class ActionFreePixelTrajectoryData:
             len(indices), path_horizon, *self.image_shape
         )
         successes = goal_indices == indices + 1
+
+        mix = np.asarray(
+            [value_p_curgoal, value_p_trajgoal, value_p_randomgoal],
+            dtype=np.float64,
+        )
+        if mix.sum() <= 0:
+            raise ValueError('Value goal mixture probabilities must sum to > 0.')
+        mix = mix / mix.sum()
+        components = self.rng.choice(3, size=len(indices), p=mix)
+        value_offsets = np.zeros(len(indices), dtype=np.int64)
+        value_goal_indices = indices.copy()
+        traj_mask = components == 1
+        if np.any(traj_mask):
+            traj_offsets = self._sample_future_offsets(
+                indices[traj_mask],
+                discount=discount,
+                geom_sample=bool(value_geom_sample),
+            )
+            value_offsets[traj_mask] = traj_offsets
+            value_goal_indices[traj_mask] = indices[traj_mask] + traj_offsets
+        rand_mask = components == 2
+        if np.any(rand_mask):
+            rand_choices = self.rng.integers(
+                0, len(self.episodes.transition_indices), size=int(np.sum(rand_mask))
+            )
+            value_goal_indices[rand_mask] = self.episodes.transition_indices[
+                rand_choices
+            ]
+            value_offsets[rand_mask] = np.maximum(
+                value_goal_indices[rand_mask] - indices[rand_mask], 0
+            )
+        # Midpoint subgoal for latent TransV (between obs and value goal).
+        mid_offsets = np.maximum(value_offsets // 2, 0)
+        mid_indices = indices + mid_offsets
+        transitive_valids = (value_offsets > 1).astype(np.float32)
+
         return {
             'observations': self.stack_indices(indices),
             'next_observations': self.stack_indices(indices + 1),
@@ -180,6 +244,13 @@ class ActionFreePixelTrajectoryData:
             'goal_indices': goal_indices,
             'path_indices': path_indices,
             'path_observations': path_observations,
+            'value_goals': self.stack_indices(value_goal_indices),
+            'value_offsets': value_offsets.astype(np.float32),
+            'base_goals': self.stack_indices(indices + 1),
+            'base_offsets': np.ones(len(indices), dtype=np.float32),
+            'transitive_subgoals': self.stack_indices(mid_indices),
+            'transitive_offsets': mid_offsets.astype(np.float32),
+            'transitive_valids': transitive_valids,
         }
 
 
@@ -428,6 +499,100 @@ class PixelReplayBuffer:
                 np.mean(self.rewards[indices] >= 0.0), dtype=np.float32
             ),
         }
+
+    def state_dict(self) -> dict[str, Any]:
+        slots = np.flatnonzero(self.episode_ids >= 0).astype(np.int64)
+        live_frame_ids = sorted(self._frames)
+        return {
+            'format_version': 1,
+            'capacity': self.capacity,
+            'raw_image_shape': self.raw_image_shape,
+            'action_shape': tuple(int(value) for value in self.actions.shape[1:]),
+            'frame_stack': self.frame_stack,
+            'pointer': self.pointer,
+            'size': self.size,
+            'next_frame_id': self._next_frame_id,
+            'slots': slots,
+            'observation_frame_ids': self.observation_frame_ids[slots].copy(),
+            'next_frame_ids': self.next_frame_ids[slots].copy(),
+            'behavior_goal_frame_ids': self.behavior_goal_frame_ids[slots].copy(),
+            'actions': self.actions[slots].copy(),
+            'rewards': self.rewards[slots].copy(),
+            'masks': self.masks[slots].copy(),
+            'episode_ids': self.episode_ids[slots].copy(),
+            'timesteps': self.timesteps[slots].copy(),
+            'frames': {int(fid): self._frames[fid].copy() for fid in live_frame_ids},
+            'frame_references': {
+                int(fid): int(self._frame_references[fid]) for fid in live_frame_ids
+            },
+            'episode_slots': {
+                int(episode): list(entries)
+                for episode, entries in self._episode_slots.items()
+            },
+            'episode_goal_ids': {
+                int(episode): int(frame_id)
+                for episode, frame_id in self._episode_goal_ids.items()
+            },
+            'rng_state': self.rng.bit_generator.state,
+        }
+
+    def load_state_dict(self, state: Mapping[str, Any]) -> None:
+        if int(state['capacity']) != self.capacity:
+            raise ValueError(
+                f'Replay capacity mismatch: ckpt={state["capacity"]} vs '
+                f'buffer={self.capacity}.'
+            )
+        if tuple(state['raw_image_shape']) != self.raw_image_shape:
+            raise ValueError('Replay image_shape mismatch.')
+        if int(state['frame_stack']) != self.frame_stack:
+            raise ValueError('Replay frame_stack mismatch.')
+        slots = np.asarray(state['slots'], dtype=np.int64)
+        if len(slots) != int(state['size']):
+            raise ValueError(
+                f'Compact replay slot count {len(slots)} does not match '
+                f'size {state["size"]}.'
+            )
+        self.observation_frame_ids.fill(-1)
+        self.next_frame_ids.fill(-1)
+        self.behavior_goal_frame_ids.fill(-1)
+        self.actions.fill(0.0)
+        self.rewards.fill(0.0)
+        self.masks.fill(1.0)
+        self.episode_ids.fill(-1)
+        self.timesteps.fill(-1)
+        self.observation_frame_ids[slots] = np.asarray(
+            state['observation_frame_ids'], dtype=np.int64
+        )
+        self.next_frame_ids[slots] = np.asarray(state['next_frame_ids'], dtype=np.int64)
+        self.behavior_goal_frame_ids[slots] = np.asarray(
+            state['behavior_goal_frame_ids'], dtype=np.int64
+        )
+        self.actions[slots] = np.asarray(state['actions'], dtype=np.float32)
+        self.rewards[slots] = np.asarray(state['rewards'], dtype=np.float32)
+        self.masks[slots] = np.asarray(state['masks'], dtype=np.float32)
+        self.episode_ids[slots] = np.asarray(state['episode_ids'], dtype=np.int64)
+        self.timesteps[slots] = np.asarray(state['timesteps'], dtype=np.int64)
+        self.pointer = int(state['pointer'])
+        self.size = int(state['size'])
+        self._next_frame_id = int(state['next_frame_id'])
+        self._frames = {
+            int(fid): np.asarray(frame, dtype=np.uint8).copy()
+            for fid, frame in dict(state['frames']).items()
+        }
+        self._frame_references = {
+            int(fid): int(count)
+            for fid, count in dict(state['frame_references']).items()
+        }
+        self._episode_slots = defaultdict(list)
+        for episode, entries in dict(state['episode_slots']).items():
+            self._episode_slots[int(episode)] = [
+                (int(timestep), int(slot)) for timestep, slot in entries
+            ]
+        self._episode_goal_ids = {
+            int(episode): int(frame_id)
+            for episode, frame_id in dict(state['episode_goal_ids']).items()
+        }
+        self.rng.bit_generator.state = state['rng_state']
 
 
 __all__ = [

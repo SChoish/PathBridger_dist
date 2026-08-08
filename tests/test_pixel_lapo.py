@@ -58,6 +58,13 @@ def test_pixel_loader_and_sampler_enforce_action_free_uint8_boundary():
         'goal_indices',
         'path_indices',
         'path_observations',
+        'value_goals',
+        'value_offsets',
+        'base_goals',
+        'base_offsets',
+        'transitive_subgoals',
+        'transitive_offsets',
+        'transitive_valids',
     }
     assert np.all(batch['goal_indices'] > batch['indices'])
     assert np.all(
@@ -255,7 +262,7 @@ def test_pixel_evaluation_preserves_images_and_any_step_success():
 
 
 def test_pixel_manifest_is_isolated_and_has_locked_dimensions(tmp_path):
-    expected = {'p0_smoke': 3, 'pilot': 12, 'screening': 40}
+    expected = {'pilot': 12, 'screening': 40}
     for name, count in expected.items():
         rows = build_rows(root=tmp_path, python='python', suite_name=name)
         assert len(rows) == count

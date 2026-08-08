@@ -49,15 +49,14 @@ steps `0, 10k, 25k, 50k, 100k, 250k, 500k, 1M` where applicable.
 
 The isolated manifest generator exposes:
 
-- `p0_smoke`: 3 environments x 1 seed = 3 runs.
 - `pilot`: 4 environments x 3 seeds = 12 runs.
 - `screening`: 8 environments x 5 seeds = 40 runs.
 
 Generate a manifest without launching it:
 
 ```bash
-python scripts/make_pixel_lapo_manifest.py --suite=p0_smoke \
-  --output=manifests/pixel_lapo_p0.csv
+python scripts/make_pixel_lapo_manifest.py --suite=pilot \
+  --output=manifests/pixel_lapo_pilot.csv
 ```
 
 No generated pixel manifest is consumed by the existing state queue scripts.

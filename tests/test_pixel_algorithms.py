@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import jax
 import numpy as np
+import pytest
 
 from agents.online_idm import parameter_digest
 from agents.pixel_registry import (
@@ -9,6 +10,11 @@ from agents.pixel_registry import (
     create_pixel_algorithm,
     get_pixel_config,
     pixel_algorithm_metadata,
+    pixel_method_scope,
+)
+from agents.pixel_trl_critic_locks import (
+    PIXEL_TRL_CRITIC_LOCKS,
+    trl_critic_lock_for_env,
 )
 from scripts.make_pixel_manifest import SUITES, build_rows
 from utils.af_checkpoints import load_af_checkpoint, restore_af_agent, save_af_checkpoint
@@ -90,6 +96,43 @@ def test_pixel_registry_declares_information_and_online_update_boundaries():
             'goal_conditioned_adaptation',
             'proposed',
         }
+        scope = pixel_method_scope(name)
+        assert tuple(pixel_algorithm_metadata(name).online_modules_updated) == (
+            scope['online_trainable_modules']
+        )
+
+    assert pixel_method_scope('pixel_pathbridger_online_idm') == {
+        'offline_trainable_modules': (
+            'encoder',
+            'bridge',
+            'world_decoder',
+            'value',
+        ),
+        'online_trainable_modules': ('idm',),
+        'online_frozen_modules': (
+            'encoder',
+            'target_encoder',
+            'bridge',
+            'world_decoder',
+            'value',
+            'target_value',
+        ),
+    }
+    assert pixel_method_scope('gc_pixel_lapo_decoder')[
+        'online_trainable_modules'
+    ] == ('decoder',)
+    assert pixel_method_scope('gc_pixel_drqv2')[
+        'offline_trainable_modules'
+    ] == ()
+    assert 'encoder' in pixel_method_scope('vip_style_frozen_gc_drqv2')[
+        'online_frozen_modules'
+    ]
+    assert 'encoder' in pixel_method_scope('vip_style_finetuned_gc_drqv2')[
+        'online_trainable_modules'
+    ]
+    assert pixel_method_scope('gc_pixel_apv_style_drq')[
+        'online_frozen_modules'
+    ] == ('video_predictor', 'world_decoder')
 
 
 def test_pixel_registry_keeps_legacy_names_as_honest_aliases():
@@ -99,6 +142,32 @@ def test_pixel_registry_keeps_legacy_names_as_honest_aliases():
     assert pixel_algorithm_metadata('gc_pixel_apv').algorithm == (
         'gc_pixel_apv_style_drq'
     )
+
+
+def test_pixel_method_names_reject_conflicting_training_regimes():
+    images = _pixels()[:2]
+
+    frozen_vip = _config('vip_style_frozen_gc_drqv2')
+    frozen_vip['freeze_encoder_online'] = False
+    with pytest.raises(ValueError, match='requires freeze_encoder_online=True'):
+        create_pixel_algorithm(
+            'vip_style_frozen_gc_drqv2',
+            seed=0,
+            example_images=images,
+            action_dim=2,
+            config=frozen_vip,
+        )
+
+    apv = _config('gc_pixel_apv_style_drq')
+    apv['pretraining'] = 'none'
+    with pytest.raises(ValueError, match="requires pretraining='apv'"):
+        create_pixel_algorithm(
+            'gc_pixel_apv_style_drq',
+            seed=0,
+            example_images=images,
+            action_dim=2,
+            config=apv,
+        )
 
 
 def test_pixel_pathbridger_freezes_offline_path_and_updates_only_idm_online():
@@ -113,14 +182,17 @@ def test_pixel_pathbridger_freezes_offline_path_and_updates_only_idm_online():
         action_dim=2,
         config=config,
     )
-    offline_names = ('encoder', 'bridge', 'world_decoder')
+    offline_names = ('encoder', 'bridge', 'world_decoder', 'value')
     offline_before = {
         module: parameter_digest(agent.network.params[f'modules_{module}'])
         for module in offline_names
     }
     idm_before = parameter_digest(agent.network.params['modules_idm'])
-    agent, offline_info = agent.offline_update(data.sample(2, path_horizon=5))
+    agent, offline_info = agent.offline_update(
+        data.sample(2, path_horizon=5, discount=0.99, value_geom_sample=True)
+    )
     assert np.isfinite(float(offline_info['loss/total']))
+    assert np.isfinite(float(offline_info['value/loss']))
     assert any(
         parameter_digest(agent.network.params[f'modules_{module}'])
         != offline_before[module]
@@ -130,7 +202,7 @@ def test_pixel_pathbridger_freezes_offline_path_and_updates_only_idm_online():
 
     frozen_before_online = {
         module: parameter_digest(agent.network.params[f'modules_{module}'])
-        for module in (*offline_names, 'target_encoder')
+        for module in (*offline_names, 'target_encoder', 'target_value')
     }
     batch = data.sample(2, path_horizon=5)
     batch['actions'] = np.array([[0.2, -0.3], [0.1, -0.4]], np.float32)
@@ -235,11 +307,34 @@ def test_generic_pixel_checkpoint_round_trip(tmp_path):
 
 
 def test_pixel_manifest_matches_all_algorithms_and_locked_dimensions(tmp_path):
-    expected = {'p0_smoke': 18, 'pilot': 72, 'screening': 240}
+    expected = {'pilot': 72, 'screening': 240}
     for name, count in expected.items():
         rows = build_rows(root=tmp_path, python='python', suite_name=name)
         assert len(rows) == count
         assert {row['algorithm'] for row in rows} == set(PIXEL_ALGORITHMS)
         assert all('train_pixel.py' in row['command'] for row in rows)
         assert all('train_af.py' not in row['command'] for row in rows)
+        assert all('--resume_keep=1' in row['command'] for row in rows)
+        assert all('--save_replay' in row['command'] for row in rows)
+        assert all('--dataset_dir=' in row['command'] for row in rows)
     assert len(SUITES['screening']['seeds']) == 5
+
+
+def test_trl_critic_locks_cover_visual_suite_and_match_paper_lambda():
+    assert set(PIXEL_TRL_CRITIC_LOCKS) >= {
+        'visual-antmaze-large-navigate-v0',
+        'visual-cube-double-play-v0',
+        'visual-puzzle-4x4-play-v0',
+        'visual-scene-play-v0',
+    }
+    assert trl_critic_lock_for_env('visual-antmaze-large-navigate-v0')[
+        'value_distance_weight_power'
+    ] == 0.0
+    assert trl_critic_lock_for_env('visual-puzzle-4x4-play-v0')[
+        'value_distance_weight_power'
+    ] == 2.0
+    for lock in PIXEL_TRL_CRITIC_LOCKS.values():
+        assert lock['expectile'] == 0.7
+        assert lock['value_p_trajgoal'] == 1.0
+        assert lock['value_p_curgoal'] == 0.0
+        assert lock['value_p_randomgoal'] == 0.0

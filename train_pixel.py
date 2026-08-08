@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import random
+import signal
 import time
 from pathlib import Path
 
@@ -18,9 +19,15 @@ from agents.pixel_registry import (
     PIXEL_ALGORITHMS,
     create_pixel_algorithm,
     pixel_algorithm_metadata,
+    pixel_method_scope,
 )
+from agents.pixel_trl_critic_locks import trl_critic_lock_for_env
 from envs.env_utils import make_pixel_env_and_datasets
-from utils.af_checkpoints import save_af_checkpoint
+from utils.af_checkpoints import (
+    load_af_checkpoint,
+    restore_af_agent,
+    save_af_checkpoint,
+)
 from utils.evaluation import DEFAULT_TASK_IDS, _info_success, _max_episode_steps
 from utils.log_utils import CsvLogger, get_exp_name
 from utils.pixel_data import (
@@ -90,6 +97,119 @@ flags.DEFINE_string(
 )
 flags.DEFINE_integer('eval_episodes', 10, 'Episodes per task; zero disables evaluation.')
 flags.DEFINE_bool('use_tqdm', True, 'Display progress bars.')
+flags.DEFINE_string(
+    'restore_path',
+    '',
+    'Optional checkpoint (.pkl) or checkpoints/ directory for resume.',
+)
+flags.DEFINE_integer(
+    'restore_step',
+    -1,
+    'Checkpoint step; -1 infers from path or latest matching file.',
+)
+flags.DEFINE_bool(
+    'resume_in_place',
+    True,
+    'When restoring, append into the same run_dir inferred from the checkpoint.',
+)
+flags.DEFINE_integer(
+    'resume_interval',
+    50_000,
+    'Periodic resume_step_*.pkl interval online; 0 disables periodic resume saves.',
+)
+flags.DEFINE_integer('resume_keep', 2, 'Number of resume_step_*.pkl files to retain.')
+flags.DEFINE_bool(
+    'save_replay',
+    False,
+    'Include replay in periodic resume checkpoints. Soft-stop always saves replay.',
+)
+
+
+def _install_soft_stop(stop_requested: dict) -> None:
+    def _request_stop(signum, _frame):
+        if stop_requested['flag']:
+            return
+        stop_requested['flag'] = True
+        stop_requested['signum'] = int(signum)
+        print(
+            f'[signal] signum={signum} — will emergency-save after current step',
+            flush=True,
+        )
+
+    signal.signal(signal.SIGTERM, _request_stop)
+    signal.signal(signal.SIGINT, _request_stop)
+    try:
+        signal.signal(signal.SIGHUP, _request_stop)
+    except (ValueError, OSError):
+        pass
+
+
+def _resolve_restore_path(path: str, step: int) -> tuple[str | None, int | None]:
+    if not path:
+        return None, None
+    candidate = Path(path)
+    if candidate.is_dir():
+        if step >= 0:
+            for name in (
+                f'resume_step_{step}.pkl',
+                f'step_{step}.pkl',
+                f'offline_step_{step}.pkl',
+            ):
+                target = candidate / name
+                if target.is_file():
+                    return str(target), step
+            raise FileNotFoundError(
+                f'No resume/step/offline checkpoint for step {step} under {candidate}'
+            )
+        matches = sorted(
+            list(candidate.glob('resume_step_*.pkl'))
+            + list(candidate.glob('step_*.pkl'))
+            + list(candidate.glob('offline_step_*.pkl')),
+            key=lambda item: item.stat().st_mtime,
+        )
+        if not matches:
+            raise FileNotFoundError(f'No step_*.pkl under {candidate}')
+        ckpt = matches[-1]
+        return str(ckpt), int(ckpt.stem.rsplit('_', 1)[-1])
+    if candidate.is_file():
+        if step < 0:
+            stem = candidate.stem
+            if stem.startswith(('step_', 'resume_step_', 'offline_step_')):
+                step = int(stem.rsplit('_', 1)[-1])
+            else:
+                step = 0
+        return str(candidate), step
+    raise FileNotFoundError(path)
+
+
+def _checkpoint_run_dir(path: str | Path) -> Path:
+    checkpoint = Path(path).resolve()
+    if checkpoint.parent.name != 'checkpoints':
+        raise ValueError(
+            'In-place resume requires a checkpoint under a run '
+            f'checkpoints directory, got {checkpoint}.'
+        )
+    return checkpoint.parent.parent
+
+
+def _rotate_resume_checkpoints(checkpoint_dir: Path, keep: int) -> None:
+    if keep < 1:
+        raise ValueError('resume_keep must be positive.')
+    paths = sorted(
+        checkpoint_dir.glob('resume_step_*.pkl'),
+        key=lambda path: int(path.stem.rsplit('_', 1)[-1]),
+    )
+    for path in paths[:-keep]:
+        path.unlink()
+
+
+def _write_emergency_marker(run_dir: Path, step: int, signum: int | None, phase: str) -> None:
+    marker = run_dir / f'EMERGENCY_SAVE_{phase}_step{step}'
+    marker.write_text(f'signal={signum} phase={phase} step={step}\n', encoding='utf-8')
+    print(
+        f'[signal] emergency_save_done phase={phase} step={step} signum={signum}',
+        flush=True,
+    )
 
 
 def _host_metrics(info):
@@ -115,7 +235,9 @@ def _stable_hash(payload) -> str:
 def _frame(value, *, name: str) -> np.ndarray:
     result = np.asarray(value)
     if result.ndim != 3 or result.shape[-1] != 3 or result.dtype != np.uint8:
-        raise ValueError(f'{name} must be an HWC uint8 RGB frame, got {result.shape}/{result.dtype}.')
+        raise ValueError(
+            f'{name} must be an HWC uint8 RGB frame, got {result.shape}/{result.dtype}.'
+        )
     return result
 
 
@@ -126,29 +248,28 @@ def _write_metadata(path: Path, payload: dict) -> None:
 
 
 def _offline_module_names(algorithm: str) -> tuple[str, ...]:
-    if algorithm == 'pixel_pathbridger_online_idm':
-        return ('encoder', 'bridge', 'world_decoder')
-    if algorithm == 'gc_pixel_lapo_decoder':
-        return ('latent_model', 'latent_policy')
-    if algorithm.startswith('vip_'):
-        return ('encoder',)
-    if algorithm == 'gc_pixel_apv_style_drq':
-        return ('encoder', 'video_predictor', 'world_decoder')
-    return ()
+    return pixel_method_scope(algorithm)['offline_trainable_modules']
 
 
 def _frozen_module_names(algorithm: str) -> tuple[str, ...]:
-    if algorithm == 'pixel_pathbridger_online_idm':
-        return ('encoder', 'target_encoder', 'bridge', 'world_decoder')
-    if algorithm == 'gc_pixel_lapo_decoder':
-        return ('latent_model', 'latent_policy')
-    if algorithm == 'vip_style_frozen_gc_drqv2':
-        return ('encoder', 'target_encoder')
-    return ()
+    return pixel_method_scope(algorithm)['online_frozen_modules']
 
 
 def _module_digest(agent, name: str) -> str:
     return parameter_digest(agent.network.params[f'modules_{name}'])
+
+
+def _sample_offline_batch(pixel_data, batch_size: int, config: dict):
+    kwargs = {'path_horizon': int(config.get('path_horizon', 5))}
+    if 'value_distance_weight_power' in config or 'discount' in config:
+        kwargs.update(
+            discount=float(config.get('discount', 0.99)),
+            value_geom_sample=bool(config.get('value_geom_sample', True)),
+            value_p_curgoal=float(config.get('value_p_curgoal', 0.0)),
+            value_p_trajgoal=float(config.get('value_p_trajgoal', 1.0)),
+            value_p_randomgoal=float(config.get('value_p_randomgoal', 0.0)),
+        )
+    return pixel_data.sample(batch_size, **kwargs)
 
 
 def _make_env_and_data(algorithm: str):
@@ -196,6 +317,28 @@ def main(_):
         raise ValueError('frame_stack must be positive.')
     if not 0.0 <= FLAGS.her_probability <= 1.0:
         raise ValueError('her_probability must lie in [0, 1].')
+    if FLAGS.resume_keep < 1:
+        raise ValueError('resume_keep must be positive.')
+
+    stop_requested = {'flag': False, 'signum': None}
+    _install_soft_stop(stop_requested)
+
+    restore_file, restore_step = _resolve_restore_path(
+        FLAGS.restore_path, int(FLAGS.restore_step)
+    )
+    restore_payload = None
+    if restore_file is not None:
+        restore_payload = load_af_checkpoint(restore_file)
+        if str(restore_payload.get('algorithm')) != str(FLAGS.algorithm):
+            raise ValueError(
+                f'Restore algorithm mismatch: ckpt={restore_payload.get("algorithm")} '
+                f'vs flags={FLAGS.algorithm}'
+            )
+        print(
+            f'[resume] loaded {restore_file} phase={restore_payload.get("phase")} '
+            f'step={restore_payload.get("step")}',
+            flush=True,
+        )
 
     random.seed(FLAGS.seed)
     np.random.seed(FLAGS.seed)
@@ -203,6 +346,7 @@ def main(_):
     exploration_rng = np.random.default_rng(FLAGS.seed + 91_009)
     algorithm = str(FLAGS.algorithm)
     algorithm_metadata = pixel_algorithm_metadata(algorithm)
+    method_scope = pixel_method_scope(algorithm)
     env, pixel_data, example_images = _make_env_and_data(algorithm)
 
     action_shape = tuple(int(value) for value in env.action_space.shape)
@@ -216,6 +360,9 @@ def main(_):
     if not isinstance(overrides, dict):
         raise ValueError('config_json must decode to a JSON object.')
     overrides.setdefault('frame_stack', int(FLAGS.frame_stack))
+    if algorithm == 'pixel_pathbridger_online_idm':
+        for key, value in trl_critic_lock_for_env(FLAGS.env_name).items():
+            overrides.setdefault(key, value)
     agent, config = create_pixel_algorithm(
         algorithm,
         seed=FLAGS.seed,
@@ -247,54 +394,121 @@ def main(_):
         raise ValueError(f'{algorithm} is online-only and cannot use offline_steps.')
 
     exp_name = get_exp_name(FLAGS.seed, env_name=FLAGS.env_name, agent_name=algorithm)
-    run_dir = (
-        Path(FLAGS.save_dir).resolve()
-        / 'pixel_o2o'
-        / FLAGS.run_group
-        / exp_name
-    )
+    resume_in_place = bool(restore_file and FLAGS.resume_in_place)
+    if resume_in_place:
+        run_dir = _checkpoint_run_dir(restore_file)
+    else:
+        run_dir = (
+            Path(FLAGS.save_dir).resolve()
+            / 'pixel_o2o'
+            / FLAGS.run_group
+            / exp_name
+        )
     checkpoint_dir = run_dir / 'checkpoints'
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-    if algorithm == 'gc_pixel_lapo_decoder':
+    restore_phase = str(restore_payload.get('phase')) if restore_payload else ''
+    restore_runtime = (restore_payload or {}).get('runtime') or {}
+    offline_start = 1
+    lapo_stage_start = 1
+    skip_offline = restore_phase == 'online'
+    if restore_payload is not None and restore_phase == 'offline':
+        agent = restore_af_agent(agent, restore_payload)
+        offline_start = int(restore_payload['step']) + 1
+        lapo_stage_start = int(restore_runtime.get('lapo_stage', 1))
+        if algorithm == 'gc_pixel_lapo_decoder' and lapo_stage_start == 2:
+            # stage2 steps are 1-indexed within the stage.
+            offline_start = int(restore_runtime.get('stage_step', restore_payload['step'])) + 1
+
+    def save_offline_checkpoint(step: int, *, lapo_stage: int | None = None, stage_step: int | None = None):
+        runtime = {
+            'offline_step': int(step),
+            'lapo_stage': int(lapo_stage) if lapo_stage is not None else None,
+            'stage_step': int(stage_step) if stage_step is not None else int(step),
+        }
+        save_af_checkpoint(
+            checkpoint_dir / f'offline_step_{step}.pkl',
+            algorithm=algorithm,
+            agent=agent,
+            step=step,
+            config=config,
+            metadata={'phase': 'offline', 'algorithm': algorithm},
+            runtime=runtime,
+            phase='offline',
+        )
+
+    if not skip_offline and algorithm == 'gc_pixel_lapo_decoder':
+        absolute_step = 0
         for stage, steps in ((1, stage1_steps), (2, stage2_steps)):
-            logger = CsvLogger(run_dir / f'offline_stage{stage}.csv')
-            iterator = range(1, steps + 1)
+            if stage < lapo_stage_start:
+                absolute_step += steps
+                continue
+            stage_begin = offline_start if stage == lapo_stage_start else 1
+            logger = CsvLogger(
+                run_dir / f'offline_stage{stage}.csv',
+                resume=resume_in_place and stage_begin > 1,
+            )
+            iterator = range(stage_begin, steps + 1)
             if FLAGS.use_tqdm and steps:
                 iterator = tqdm.tqdm(
                     iterator, desc=f'{algorithm}-stage{stage}', dynamic_ncols=True
                 )
-            for step in iterator:
+            for stage_step in iterator:
+                absolute_step = (stage1_steps if stage == 2 else 0) + stage_step
                 agent, info = agent.offline_update(
-                    pixel_data.sample(
-                        batch_size,
-                        path_horizon=int(config.get('path_horizon', 5)),
-                    ),
+                    _sample_offline_batch(pixel_data, batch_size, config),
                     stage=stage,
                 )
-                if step % FLAGS.log_interval == 0 or step == steps:
-                    logger.log(_host_metrics(info), step)
+                if stage_step % FLAGS.log_interval == 0 or stage_step == steps:
+                    logger.log(_host_metrics(info), absolute_step)
+                if stop_requested['flag']:
+                    save_offline_checkpoint(
+                        absolute_step, lapo_stage=stage, stage_step=stage_step
+                    )
+                    _write_emergency_marker(
+                        run_dir, absolute_step, stop_requested['signum'], 'offline'
+                    )
+                    logger.close()
+                    print(f'Run soft-stopped (offline) at {run_dir}', flush=True)
+                    return
             logger.close()
-    elif offline_steps:
-        logger = CsvLogger(run_dir / 'offline.csv')
-        iterator = range(1, offline_steps + 1)
+            offline_start = 1
+    elif not skip_offline and offline_steps:
+        logger = CsvLogger(
+            run_dir / 'offline.csv',
+            resume=resume_in_place and offline_start > 1,
+        )
+        iterator = range(offline_start, offline_steps + 1)
         if FLAGS.use_tqdm:
             iterator = tqdm.tqdm(iterator, desc=f'{algorithm}-offline', dynamic_ncols=True)
         for step in iterator:
             agent, info = agent.offline_update(
-                pixel_data.sample(
-                    batch_size,
-                    path_horizon=int(config.get('path_horizon', 5)),
-                )
+                _sample_offline_batch(pixel_data, batch_size, config)
             )
             if step % FLAGS.log_interval == 0 or step == offline_steps:
                 logger.log(_host_metrics(info), step)
+            if stop_requested['flag']:
+                save_offline_checkpoint(step)
+                _write_emergency_marker(
+                    run_dir, step, stop_requested['signum'], 'offline'
+                )
+                logger.close()
+                print(f'Run soft-stopped (offline) at {run_dir}', flush=True)
+                return
         logger.close()
+    elif skip_offline and restore_payload is not None:
+        agent = restore_af_agent(agent, restore_payload)
 
     frozen_initial = {
         name: _module_digest(agent, name)
         for name in _frozen_module_names(algorithm)
     }
+    if restore_payload is not None and restore_phase == 'online':
+        parent_meta = restore_payload.get('metadata') or {}
+        parent_digests = parent_meta.get('frozen_module_initial_digests')
+        if parent_digests:
+            frozen_initial = {key: str(value) for key, value in parent_digests.items()}
+
     eval_steps = _parse_eval_steps(FLAGS.eval_steps, FLAGS.online_steps)
     image_shape = tuple(int(value) for value in example_images.shape[1:])
     protocol_payload = {
@@ -335,6 +549,10 @@ def main(_):
             [] if pixel_data is None else list(pixel_data.offline_fields_seen)
         ),
         'offline_modules_trained': list(_offline_module_names(algorithm)),
+        'online_modules_trained': list(
+            method_scope['online_trainable_modules']
+        ),
+        'online_modules_frozen': list(method_scope['online_frozen_modules']),
         'online_data_fields_used': [
             'observations',
             'next_observations',
@@ -361,7 +579,41 @@ def main(_):
         'config': config,
         'frozen_module_initial_digests': frozen_initial,
         'run_completed': False,
+        'dataset_dir': str(FLAGS.dataset_dir or ''),
+        'trl_critic_lock': {
+            'value_distance_weight_power': float(
+                config.get('value_distance_weight_power', 0.0)
+            ),
+            'discount': float(config.get('discount', 0.99)),
+            'expectile': float(config.get('expectile', 0.7)),
+            'value_geom_sample': bool(config.get('value_geom_sample', True)),
+            'value_p_curgoal': float(config.get('value_p_curgoal', 0.0)),
+            'value_p_trajgoal': float(config.get('value_p_trajgoal', 1.0)),
+            'value_p_randomgoal': float(config.get('value_p_randomgoal', 0.0)),
+            'endpoint_value_scale': float(
+                config.get('endpoint_value_scale', 10.0)
+            ),
+        }
+        if algorithm == 'pixel_pathbridger_online_idm'
+        else None,
     }
+    if restore_file is not None:
+        resume_events = list((restore_payload.get('metadata') or {}).get('resume_events', []))
+        resume_events.append(
+            {
+                'checkpoint': str(Path(restore_file).resolve()),
+                'resume_step': int(restore_payload['step']),
+                'phase': restore_phase,
+                'in_place': resume_in_place,
+                'timestamp': int(time.time()),
+            }
+        )
+        run_metadata.update(
+            resume_checkpoint=str(Path(restore_file).resolve()),
+            resume_step=int(restore_payload['step']),
+            resume_in_place=resume_in_place,
+            resume_events=resume_events,
+        )
 
     replay = PixelReplayBuffer(
         FLAGS.replay_capacity,
@@ -370,6 +622,23 @@ def main(_):
         seed=FLAGS.seed,
         frame_stack=FLAGS.frame_stack,
     )
+    online_start_step = 1
+    if restore_payload is not None and restore_phase == 'online':
+        if restore_payload.get('replay') is not None:
+            replay.load_state_dict(restore_payload['replay'])
+        else:
+            print(
+                '[resume] warning: online ckpt has no replay; buffer starts empty',
+                flush=True,
+            )
+        online_start_step = int(restore_payload['step']) + 1
+        if restore_runtime.get('task_rng_state') is not None:
+            task_rng.bit_generator.state = restore_runtime['task_rng_state']
+        if restore_runtime.get('exploration_rng_state') is not None:
+            exploration_rng.bit_generator.state = restore_runtime[
+                'exploration_rng_state'
+            ]
+
     run_metadata['replay_allocated_bytes'] = replay.allocated_bytes
     _write_metadata(run_dir / 'metadata.json', run_metadata)
 
@@ -378,8 +647,14 @@ def main(_):
         import ogbench
 
         eval_env = ogbench.make_env_and_datasets(FLAGS.env_name, env_only=True)
-    online_logger = CsvLogger(run_dir / 'online.csv')
-    eval_logger = CsvLogger(run_dir / 'eval.csv')
+    online_logger = CsvLogger(
+        run_dir / 'online.csv',
+        resume=resume_in_place and online_start_step > 1,
+    )
+    eval_logger = CsvLogger(
+        run_dir / 'eval.csv',
+        resume=resume_in_place and online_start_step > 1,
+    )
     max_episode_steps = _max_episode_steps(env)
     episode_id = 0
     timestep = 0
@@ -390,6 +665,21 @@ def main(_):
     observation = _frame(observation, name='observation')
     goal = _frame(reset_info['goal'], name='goal')
     frame_history = [observation.copy()]
+    if restore_payload is not None and restore_phase == 'online' and restore_runtime:
+        episode_id = int(restore_runtime.get('episode_id', episode_id)) + 1
+        timestep = 0
+        task_id = int(task_rng.choice(DEFAULT_TASK_IDS))
+        observation, reset_info = env.reset(
+            options={'task_id': task_id, 'render_goal': False}
+        )
+        observation = _frame(observation, name='observation')
+        goal = _frame(reset_info['goal'], name='goal')
+        frame_history = [observation.copy()]
+        print(
+            f'[resume] fresh episode_id={episode_id} task_id={task_id} '
+            '(mid-episode env state not restored)',
+            flush=True,
+        )
     start_time = time.time()
     last_info = {}
 
@@ -409,6 +699,16 @@ def main(_):
             'offline_modules_frozen_verified': True,
         }
 
+    def _runtime_state(step: int) -> dict:
+        return {
+            'online_step': int(step),
+            'episode_id': int(episode_id),
+            'timestep': int(timestep),
+            'task_id': int(task_id),
+            'task_rng_state': task_rng.bit_generator.state,
+            'exploration_rng_state': exploration_rng.bit_generator.state,
+        }
+
     def evaluate_and_save(step: int) -> None:
         metadata = checkpoint_metadata()
         if eval_env is not None:
@@ -426,12 +726,37 @@ def main(_):
             step=step,
             config=config,
             metadata=metadata,
+            phase='online',
         )
 
-    if 0 in eval_steps:
+    def save_resume_checkpoint(step: int, *, force_replay: bool = False) -> None:
+        include_replay = bool(force_replay or FLAGS.save_replay)
+        save_af_checkpoint(
+            checkpoint_dir / f'resume_step_{step}.pkl',
+            algorithm=algorithm,
+            agent=agent,
+            step=step,
+            config=config,
+            metadata=checkpoint_metadata(),
+            replay_state=replay.state_dict() if include_replay else None,
+            runtime=_runtime_state(step),
+            phase='online',
+        )
+        _rotate_resume_checkpoints(checkpoint_dir, int(FLAGS.resume_keep))
+
+    if 0 in eval_steps and online_start_step <= 1:
         evaluate_and_save(0)
 
-    iterator = range(1, FLAGS.online_steps + 1)
+    if online_start_step > FLAGS.online_steps:
+        print(
+            f'[resume] already past online_steps={FLAGS.online_steps}; nothing to do',
+            flush=True,
+        )
+        online_logger.close()
+        eval_logger.close()
+        return
+
+    iterator = range(online_start_step, FLAGS.online_steps + 1)
     if FLAGS.use_tqdm and FLAGS.online_steps:
         iterator = tqdm.tqdm(iterator, desc=f'{algorithm}-online', dynamic_ncols=True)
     for step in iterator:
@@ -504,6 +829,34 @@ def main(_):
             online_logger.log(metrics, step)
         if step in eval_steps:
             evaluate_and_save(step)
+
+        emergency = bool(stop_requested['flag'])
+        periodic_resume = bool(
+            FLAGS.resume_interval > 0
+            and (
+                step % int(FLAGS.resume_interval) == 0
+                or step == FLAGS.online_steps
+            )
+            and (FLAGS.save_replay or emergency)
+        )
+        # Soft-stop always writes a replay-bearing resume ckpt.
+        if emergency or (periodic_resume and FLAGS.save_replay):
+            save_resume_checkpoint(step, force_replay=emergency)
+        elif (
+            FLAGS.resume_interval > 0
+            and step % int(FLAGS.resume_interval) == 0
+            and not FLAGS.save_replay
+        ):
+            # Lightweight agent-only resume marker when replay dump is disabled.
+            save_resume_checkpoint(step, force_replay=False)
+        if emergency:
+            _write_emergency_marker(
+                run_dir, step, stop_requested['signum'], 'online'
+            )
+            online_logger.close()
+            eval_logger.close()
+            print(f'Run soft-stopped (online) at {run_dir}', flush=True)
+            return
 
     if FLAGS.online_steps not in eval_steps:
         evaluate_and_save(FLAGS.online_steps)

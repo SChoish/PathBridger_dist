@@ -92,7 +92,7 @@ boundaries, and exact online-updated modules. Online learning is not globally
 restricted to an IDM; only the proposed entry freezes its visual path prior and
 updates a separately initialized IDM.
 
-Run one method and generate the full six-method smoke manifest with:
+Run one method and generate the full six-method formal pilot manifest with:
 
 ```bash
 python train_pixel.py \
@@ -100,7 +100,7 @@ python train_pixel.py \
   --env_name=visual-antmaze-medium-navigate-v0 \
   --online_steps=250000 --seed=0
 python scripts/make_pixel_manifest.py \
-  --suite=p0_smoke --output=manifests/pixel_p0.csv
+  --suite=pilot --output=manifests/pixel_pilot.csv
 ```
 
 Visual offline data is never downloaded implicitly; pass
