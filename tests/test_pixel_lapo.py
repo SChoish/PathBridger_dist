@@ -81,6 +81,19 @@ def test_pixel_loader_and_sampler_enforce_action_free_uint8_boundary():
         )
 
 
+def test_pixel_loader_full_offline_keeps_only_actions_and_pixels():
+    raw = {
+        'observations': _pixels(),
+        'terminals': np.array([0, 0, 1, 0, 0, 1], np.float32),
+        'actions': np.ones((6, 2), np.float32),
+        'rewards': np.ones(6, np.float32),
+        'qpos': np.ones((6, 4), np.float32),
+    }
+    dataset = _as_pixel_dataset(raw, split='training', action_free=False)
+    assert set(dataset) == {'observations', 'terminals', 'actions'}
+    assert dataset['actions'].dtype == np.float32
+
+
 def test_compact_double_terminal_markers_keep_last_valid_transitions():
     data = ActionFreePixelTrajectoryData(
         {

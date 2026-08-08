@@ -466,7 +466,25 @@ class PixelPathBridgerAgent(flax.struct.PyTreeNode):
                 axis=-1,
             )
             feature_loss = feature_errors.mean(axis=1).mean()
-            total = value_loss + endpoint_loss + feature_loss
+            if bool(self.config.get('offline_action_free', False)):
+                idm_loss = jnp.zeros((), dtype=feature_loss.dtype)
+                idm_info = {}
+            else:
+                if 'actions' not in batch:
+                    raise KeyError('Full offline pixel PBF batch requires actions.')
+                following = self.network.select('encoder')(
+                    batch['next_observations'], params=params
+                )
+                predicted_actions = self.network.select('idm')(
+                    current, following, params=params
+                )
+                squared_errors = jnp.square(predicted_actions - batch['actions'])
+                idm_loss = jnp.sum(squared_errors, axis=-1).mean()
+                idm_info = {
+                    'idm/loss': idm_loss,
+                    'idm/action_mse': squared_errors.mean(),
+                }
+            total = value_loss + endpoint_loss + feature_loss + idm_loss
             info = {
                 'loss/total': total,
                 'bridge/loss': feature_loss,
@@ -475,18 +493,22 @@ class PixelPathBridgerAgent(flax.struct.PyTreeNode):
                 'endpoint/flow_error_mean': flow_errors.mean(),
                 'endpoint/weight_mean': endpoint_weights.mean(),
                 'endpoint/value_gap_mean': value_gap.mean(),
+                **idm_info,
                 **value_info,
             }
             return total, info
 
-        network, info = self.network.apply_loss_fn(
-            loss_fn,
-            trainable_modules=(
+        trainable_modules = [
                 'encoder',
                 'endpoint',
                 'bridge',
                 'value',
-            ),
+        ]
+        if not bool(self.config.get('offline_action_free', False)):
+            trainable_modules.append('idm')
+        network, info = self.network.apply_loss_fn(
+            loss_fn,
+            trainable_modules=tuple(trainable_modules),
         )
         network = self._ema_update(
             network,
@@ -560,8 +582,47 @@ class PixelPathBridgerAgent(flax.struct.PyTreeNode):
 
     @partial(
         jax.jit,
-        static_argnames=('temperature', 'num_candidates', 'endpoint_temperature'),
+        static_argnames=('num_candidates', 'temperature', 'action_temperature'),
     )
+    def sample_action_chunks(
+        self,
+        observations,
+        goals,
+        seed=None,
+        num_candidates=None,
+        temperature=None,
+        action_temperature=0.0,
+    ):
+        if seed is None:
+            seed = jax.random.PRNGKey(0)
+        endpoint_seed, action_seed = jax.random.split(seed)
+        if num_candidates is None:
+            num_candidates = int(self.config['eval_num_candidates'])
+        if temperature is None:
+            temperature = float(self.config['eval_temperature'])
+        current = self.network.select('encoder')(observations)
+        goal = self.network.select('encoder')(goals)
+        endpoint = self._select_endpoint(
+            current,
+            goal,
+            endpoint_seed,
+            num_candidates=int(num_candidates),
+            temperature=float(temperature),
+        )
+        path = self.network.select('bridge')(current, endpoint)
+        current_states = jnp.concatenate(
+            [current[:, None, :], path[:, :-1, :]], axis=1
+        )
+        actions = self.network.select('idm')(
+            current_states.reshape((-1, current.shape[-1])),
+            path.reshape((-1, current.shape[-1])),
+        ).reshape((current.shape[0], int(self.config['path_horizon']), -1))
+        if action_temperature > 0.0:
+            actions = actions + float(action_temperature) * float(
+                self.config['exploration_std']
+            ) * jax.random.normal(action_seed, actions.shape)
+        return jnp.clip(actions, -1.0, 1.0)
+
     def sample_actions(
         self,
         observations,
@@ -571,29 +632,16 @@ class PixelPathBridgerAgent(flax.struct.PyTreeNode):
         num_candidates=None,
         endpoint_temperature=None,
     ):
-        if seed is None:
-            seed = jax.random.PRNGKey(0)
-        endpoint_seed, action_seed = jax.random.split(seed)
-        if num_candidates is None:
-            num_candidates = int(self.config['eval_num_candidates'])
-        if endpoint_temperature is None:
-            endpoint_temperature = float(self.config['eval_temperature'])
-        current = self.network.select('encoder')(observations)
-        goal = self.network.select('encoder')(goals)
-        endpoint = self._select_endpoint(
-            current,
-            goal,
-            endpoint_seed,
-            num_candidates=int(num_candidates),
-            temperature=float(endpoint_temperature),
-        )
-        path = self.network.select('bridge')(current, endpoint)
-        actions = self.network.select('idm')(current, path[:, 0])
-        if temperature > 0.0:
-            actions = actions + float(temperature) * float(
-                self.config['exploration_std']
-            ) * jax.random.normal(action_seed, actions.shape)
-        return jnp.clip(actions, -1.0, 1.0)
+        """Compatibility API returning the first action of a planned chunk."""
+
+        return self.sample_action_chunks(
+            observations,
+            goals,
+            seed=seed,
+            num_candidates=num_candidates,
+            temperature=endpoint_temperature,
+            action_temperature=temperature,
+        )[:, 0, :]
 
     @classmethod
     def create(cls, seed, example_images, action_dim, config):
@@ -733,6 +781,7 @@ def get_config():
             offline_batch_size=128,
             online_batch_size=256,
             offline_steps=100_000,
+            offline_action_free=False,
             # TRL / PathBridger critic locks (override per env in the tune queue).
             discount=0.99,
             expectile=0.7,

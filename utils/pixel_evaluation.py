@@ -29,7 +29,7 @@ def evaluate_pixel_policy(
     episodes_per_task: int = 10,
     seed: int = 0,
 ) -> dict[str, float | int]:
-    """Evaluate ``sample_actions(images, goal_images, seed)`` without flattening."""
+    """Evaluate pixels, executing PBF chunks and one-step actions otherwise."""
 
     task_ids = tuple(int(value) for value in task_ids)
     if not task_ids:
@@ -65,25 +65,47 @@ def evaluate_pixel_policy(
             while step < max_steps and not (terminated or truncated):
                 rng, action_rng = jax.random.split(rng)
                 policy_observation = stack_pixel_history(history, frame_stack)
-                action = policy.sample_actions(
-                    policy_observation[None, ...],
-                    policy_goal[None, ...],
-                    seed=action_rng,
-                    temperature=0.0,
-                )
-                action = np.asarray(jax.device_get(action), dtype=np.float32)
-                if action.ndim != 2 or action.shape[0] != 1:
-                    raise ValueError(
-                        'Pixel policy must return [1, action_dim], '
-                        f'got {action.shape}.'
+                if hasattr(policy, 'sample_action_chunks'):
+                    actions = policy.sample_action_chunks(
+                        policy_observation[None, ...],
+                        policy_goal[None, ...],
+                        seed=action_rng,
                     )
-                observation, _, terminated, truncated, info = env.step(
-                    np.clip(action[0], action_low, action_high)
-                )
-                observation = _frame(observation, name='observation')
-                history.append(observation.copy())
-                success = success or _info_success(info)
-                step += 1
+                    actions = np.asarray(
+                        jax.device_get(actions), dtype=np.float32
+                    )
+                    if actions.ndim != 3 or actions.shape[0] != 1:
+                        raise ValueError(
+                            'Pixel PBF must return [1, 5, action_dim], '
+                            f'got {actions.shape}.'
+                        )
+                    action_chunk = actions[0]
+                else:
+                    actions = policy.sample_actions(
+                        policy_observation[None, ...],
+                        policy_goal[None, ...],
+                        seed=action_rng,
+                        temperature=0.0,
+                    )
+                    actions = np.asarray(
+                        jax.device_get(actions), dtype=np.float32
+                    )
+                    if actions.ndim != 2 or actions.shape[0] != 1:
+                        raise ValueError(
+                            'Pixel policy must return [1, action_dim], '
+                            f'got {actions.shape}.'
+                        )
+                    action_chunk = actions
+                for action in action_chunk:
+                    if step >= max_steps or terminated or truncated:
+                        break
+                    observation, _, terminated, truncated, info = env.step(
+                        np.clip(action, action_low, action_high)
+                    )
+                    observation = _frame(observation, name='observation')
+                    history.append(observation.copy())
+                    success = success or _info_success(info)
+                    step += 1
             successes.append(float(success))
         rate = float(np.mean(successes))
         metrics[f'task_{task_id}_success'] = rate

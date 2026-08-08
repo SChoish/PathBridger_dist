@@ -22,7 +22,7 @@ from agents.pixel_trl_critic_locks import (
 from agents.pixel_pathbridger import ImpalaSmallEncoder
 from scripts.make_pixel_manifest import SUITES, build_rows
 from utils.af_checkpoints import load_af_checkpoint, restore_af_agent, save_af_checkpoint
-from utils.pixel_data import ActionFreePixelTrajectoryData
+from utils.pixel_data import ActionFreePixelTrajectoryData, PixelTrajectoryData
 
 
 def _pixels(seed=0):
@@ -64,7 +64,7 @@ def _config(name):
     )
     if name == 'gc_pixel_lapo_decoder':
         config.update(num_codebooks=2, num_codes=8, code_dim=4)
-    if name == 'pixel_pathbridger_online_idm':
+    if name in ('pixel_pbf', 'pixel_pathbridger_online_idm'):
         config.update(
             value_hidden_dims=(16,),
             endpoint_horizon=5,
@@ -83,6 +83,7 @@ def _online_batch(data):
 
 def test_pixel_registry_declares_information_and_online_update_boundaries():
     assert PIXEL_ALGORITHMS == (
+        'pixel_pbf',
         'pixel_pathbridger_online_idm',
         'gc_pixel_lapo_decoder',
         'gc_pixel_drqv2',
@@ -105,6 +106,7 @@ def test_pixel_registry_declares_information_and_online_update_boundaries():
             'online_only',
             'goal_conditioned_adaptation',
             'proposed',
+            'full_action',
         }
         scope = pixel_method_scope(name)
         assert tuple(pixel_algorithm_metadata(name).online_modules_updated) == (
@@ -128,6 +130,10 @@ def test_pixel_registry_declares_information_and_online_update_boundaries():
             'target_value',
         ),
     }
+    assert pixel_method_scope('pixel_pbf')['offline_trainable_modules'] == (
+        'encoder', 'endpoint', 'bridge', 'value', 'idm'
+    )
+    assert pixel_method_scope('pixel_pbf')['online_trainable_modules'] == ()
     assert pixel_method_scope('gc_pixel_lapo_decoder')[
         'online_trainable_modules'
     ] == ('decoder',)
@@ -234,6 +240,46 @@ def test_pixel_pathbridger_freezes_offline_path_and_updates_only_idm_online():
         temperature=0.0,
     )
     assert actions.shape == (2, 2)
+    chunks = agent.sample_action_chunks(
+        batch['observations'],
+        batch['goals'],
+        seed=jax.random.PRNGKey(3),
+    )
+    assert chunks.shape == (2, 5, 2)
+
+
+def test_full_offline_pixel_pbf_trains_idm_from_dataset_actions():
+    name = 'pixel_pbf'
+    data = PixelTrajectoryData(
+        {
+            'observations': _pixels(),
+            'terminals': np.array([0, 0, 0, 0, 0, 1], np.float32),
+            'actions': np.linspace(-0.5, 0.5, 12, dtype=np.float32).reshape(6, 2),
+        },
+        seed=2,
+        frame_stack=3,
+    )
+    config = _config(name)
+    config.update(idm_hidden_dims=(16,), path_horizon=5, frame_stack=3)
+    agent, _ = create_pixel_algorithm(
+        name,
+        seed=0,
+        example_images=data.example_images,
+        action_dim=2,
+        config=config,
+    )
+    before = parameter_digest(agent.network.params['modules_idm'])
+    batch = data.sample(
+        2,
+        path_horizon=5,
+        endpoint_horizon=5,
+        discount=0.99,
+        value_geom_sample=True,
+    )
+    agent, info = agent.offline_update(batch)
+    assert np.isfinite(float(info['loss/total']))
+    assert np.isfinite(float(info['idm/loss']))
+    assert parameter_digest(agent.network.params['modules_idm']) != before
 
 
 def test_vip_frozen_and_finetuned_have_distinct_online_encoder_behavior():
@@ -356,7 +402,9 @@ def test_pixel_manifest_matches_all_algorithms_and_locked_dimensions(tmp_path):
     for name, count in expected.items():
         rows = build_rows(root=tmp_path, python='python', suite_name=name)
         assert len(rows) == count
-        assert {row['algorithm'] for row in rows} == set(PIXEL_ALGORITHMS)
+        assert {row['algorithm'] for row in rows} == set(PIXEL_ALGORITHMS) - {
+            'pixel_pbf'
+        }
         assert all('train_pixel.py' in row['command'] for row in rows)
         assert all('train_af.py' not in row['command'] for row in rows)
         assert all('--resume_keep=1' in row['command'] for row in rows)

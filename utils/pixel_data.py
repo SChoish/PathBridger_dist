@@ -311,6 +311,35 @@ class ActionFreePixelTrajectoryData:
         return result
 
 
+class PixelTrajectoryData(ActionFreePixelTrajectoryData):
+    """Full offline pixel trajectories with actions but no privileged state."""
+
+    def __init__(
+        self,
+        dataset: Mapping[str, Any],
+        *,
+        seed: int = 0,
+        frame_stack: int = 1,
+    ):
+        if 'actions' not in dataset:
+            raise ValueError('Full offline pixel trajectories require actions.')
+        actions = np.asarray(dataset['actions'], dtype=np.float32)
+        if actions.ndim != 2 or len(actions) != len(dataset['observations']):
+            raise ValueError(
+                'Full offline pixel actions must have shape [N, A], got '
+                f'{actions.shape}.'
+            )
+        super().__init__(dataset, seed=seed, frame_stack=frame_stack)
+        self.actions = actions.view()
+        self.actions.setflags(write=False)
+        self.offline_fields_seen = ('observations', 'terminals', 'actions')
+
+    def sample(self, batch_size: int, **kwargs) -> dict[str, np.ndarray]:
+        batch = super().sample(batch_size, **kwargs)
+        batch['actions'] = self.actions[batch['indices']]
+        return batch
+
+
 class PixelReplayBuffer:
     """Episode-aware indexed raw-frame replay with future-image HER."""
 
@@ -654,6 +683,7 @@ class PixelReplayBuffer:
 
 __all__ = [
     'ActionFreePixelTrajectoryData',
+    'PixelTrajectoryData',
     'PixelEpisodeIndex',
     'PixelReplayBuffer',
     'repeat_pixel_frame',

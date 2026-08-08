@@ -32,6 +32,7 @@ from utils.evaluation import DEFAULT_TASK_IDS, _info_success, _max_episode_steps
 from utils.log_utils import CsvLogger, get_exp_name
 from utils.pixel_data import (
     ActionFreePixelTrajectoryData,
+    PixelTrajectoryData,
     PixelReplayBuffer,
     repeat_pixel_frame,
     stack_pixel_history,
@@ -277,12 +278,15 @@ def _sample_offline_batch(pixel_data, batch_size: int, config: dict):
 def _make_env_and_data(algorithm: str):
     metadata = pixel_algorithm_metadata(algorithm)
     if metadata.offline_fields_seen:
+        full_offline = algorithm == 'pixel_pbf'
         env, train_dataset, _ = make_pixel_env_and_datasets(
             FLAGS.env_name,
             dataset_dir=FLAGS.dataset_dir or None,
             allow_download=FLAGS.allow_dataset_download,
+            action_free=not full_offline,
         )
-        data = ActionFreePixelTrajectoryData(
+        data_cls = PixelTrajectoryData if full_offline else ActionFreePixelTrajectoryData
+        data = data_cls(
             train_dataset,
             seed=FLAGS.seed,
             frame_stack=FLAGS.frame_stack,
@@ -362,7 +366,7 @@ def main(_):
     if not isinstance(overrides, dict):
         raise ValueError('config_json must decode to a JSON object.')
     overrides.setdefault('frame_stack', int(FLAGS.frame_stack))
-    if algorithm == 'pixel_pathbridger_online_idm':
+    if algorithm in ('pixel_pbf', 'pixel_pathbridger_online_idm'):
         overrides = apply_pixel_pbf_locks(FLAGS.env_name, overrides)
     agent, config = create_pixel_algorithm(
         algorithm,
@@ -596,7 +600,7 @@ def main(_):
             'value_learning_rate': float(config['value_learning_rate']),
             'value_tau': float(config['value_tau']),
         }
-        if algorithm == 'pixel_pathbridger_online_idm'
+        if algorithm in ('pixel_pbf', 'pixel_pathbridger_online_idm')
         else None,
         'pixel_pbf_tune': {
             'encoder': str(config['encoder']),
@@ -608,7 +612,7 @@ def main(_):
             'path_horizon': int(config['path_horizon']),
             'endpoint_flow_steps': int(config['endpoint_flow_steps']),
         }
-        if algorithm == 'pixel_pathbridger_online_idm'
+        if algorithm in ('pixel_pbf', 'pixel_pathbridger_online_idm')
         else None,
     }
     if restore_file is not None:
@@ -696,6 +700,7 @@ def main(_):
         )
     start_time = time.time()
     last_info = {}
+    pending_action_chunk: list[np.ndarray] = []
 
     def assert_frozen_modules() -> None:
         for name, expected in frozen_initial.items():
@@ -777,7 +782,25 @@ def main(_):
         policy_observation = stack_pixel_history(frame_history, FLAGS.frame_stack)
         policy_goal = repeat_pixel_frame(goal, FLAGS.frame_stack)
         if step <= FLAGS.random_steps:
+            pending_action_chunk.clear()
             action = exploration_rng.uniform(action_low, action_high).astype(np.float32)
+        elif algorithm == 'pixel_pathbridger_online_idm':
+            if not pending_action_chunk:
+                planned = np.asarray(
+                    jax.device_get(
+                        agent.sample_action_chunks(
+                            policy_observation[None, ...],
+                            policy_goal[None, ...],
+                            seed=jax.random.PRNGKey(
+                                FLAGS.seed * 1_000_003 + step
+                            ),
+                            action_temperature=1.0,
+                        )[0]
+                    ),
+                    dtype=np.float32,
+                )
+                pending_action_chunk.extend(planned)
+            action = pending_action_chunk.pop(0)
         else:
             action = np.asarray(
                 jax.device_get(
@@ -822,6 +845,7 @@ def main(_):
             last_info = {**last_info, **replay_info}
 
         if terminated or truncated or timestep >= max_episode_steps:
+            pending_action_chunk.clear()
             episode_id += 1
             timestep = 0
             task_id = int(task_rng.choice(DEFAULT_TASK_IDS))

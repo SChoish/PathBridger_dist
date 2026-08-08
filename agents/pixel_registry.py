@@ -14,6 +14,7 @@ from utils.provenance import AlgorithmMetadata
 
 
 PIXEL_ALGORITHMS = (
+    'pixel_pbf',
     'pixel_pathbridger_online_idm',
     'gc_pixel_lapo_decoder',
     'gc_pixel_drqv2',
@@ -22,6 +23,7 @@ PIXEL_ALGORITHMS = (
     'gc_pixel_apv_style_drq',
 )
 PIXEL_ALGORITHM_ALIASES = {
+    'pixel_pathbridger': 'pixel_pbf',
     'gc_pixel_lapo': 'gc_pixel_lapo_decoder',
     'vip_frozen_gc_drqv2': 'vip_style_frozen_gc_drqv2',
     'vip_finetuned_gc_drqv2': 'vip_style_finetuned_gc_drqv2',
@@ -32,6 +34,25 @@ PIXEL_ALGORITHM_ALIASES = {
 # gradient updates are listed separately from target-network EMA updates; the
 # latter are intentionally not reported as trainable method modules.
 PIXEL_METHOD_SCOPES = {
+    'pixel_pbf': {
+        'offline_trainable_modules': (
+            'encoder',
+            'endpoint',
+            'bridge',
+            'value',
+            'idm',
+        ),
+        'online_trainable_modules': (),
+        'online_frozen_modules': (
+            'encoder',
+            'target_encoder',
+            'endpoint',
+            'bridge',
+            'value',
+            'target_value',
+            'idm',
+        ),
+    },
     'pixel_pathbridger_online_idm': {
         'offline_trainable_modules': (
             'encoder',
@@ -100,6 +121,8 @@ PIXEL_METHOD_SCOPES = {
 }
 
 _PIXEL_METHOD_CONFIG_CONTRACTS = {
+    'pixel_pbf': {'offline_action_free': False},
+    'pixel_pathbridger_online_idm': {'offline_action_free': True},
     'gc_pixel_drqv2': {
         'pretraining': 'none',
         'freeze_encoder_online': False,
@@ -148,8 +171,10 @@ def _validate_method_config(name: str, config: dict[str, Any]) -> None:
 
 def get_pixel_config(name: str) -> dict[str, Any]:
     name = canonical_pixel_algorithm(name)
-    if name == 'pixel_pathbridger_online_idm':
-        return pathbridger_config().to_dict()
+    if name in ('pixel_pbf', 'pixel_pathbridger_online_idm'):
+        config = pathbridger_config().to_dict()
+        config['offline_action_free'] = name == 'pixel_pathbridger_online_idm'
+        return config
     if name == 'gc_pixel_lapo_decoder':
         return lapo_config().to_dict()
     if name == 'gc_pixel_drqv2':
@@ -176,7 +201,7 @@ def create_pixel_algorithm(
     if config:
         resolved.update(config)
     _validate_method_config(name, resolved)
-    if name == 'pixel_pathbridger_online_idm':
+    if name in ('pixel_pbf', 'pixel_pathbridger_online_idm'):
         return (
             PixelPathBridgerAgent.create(
                 seed, example_images, action_dim, resolved
@@ -199,6 +224,21 @@ def create_pixel_algorithm(
 def pixel_algorithm_metadata(name: str) -> AlgorithmMetadata:
     name = canonical_pixel_algorithm(name)
     records = {
+        'pixel_pbf': dict(
+            port_kind='full_action',
+            paper_url='',
+            official_repo_url=None,
+            official_repo_commit=None,
+            offline_fields_seen=('observations', 'terminals', 'actions'),
+            online_modules_updated=(),
+            uses_offline_actions=True,
+            implementation_notes=(
+                'Full-data offline PBF from pb_bundle with an IMPALA-small '
+                'pixel encoder and EMA target encoder. TransV, rectified-flow '
+                'endpoint proposal, endpoint-pinned bridge, and IDM are '
+                'trained jointly from offline images and actions.'
+            ),
+        ),
         'pixel_pathbridger_online_idm': dict(
             port_kind='proposed',
             paper_url='',

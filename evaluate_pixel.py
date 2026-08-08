@@ -23,6 +23,14 @@ flags.DEFINE_string('checkpoint', '', 'Exact train_pixel.py checkpoint path.')
 flags.DEFINE_integer('episodes', 50, 'Episodes per official task.')
 flags.DEFINE_integer('seed', 0, 'Evaluation seed.')
 flags.DEFINE_string('output_path', '', 'Optional JSON output.')
+flags.DEFINE_integer(
+    'num_candidates', -1, 'PBF endpoint candidates; -1 uses checkpoint config.'
+)
+flags.DEFINE_float(
+    'endpoint_temperature',
+    -1.0,
+    'PBF endpoint temperature; negative uses checkpoint config.',
+)
 
 
 def main(_):
@@ -47,7 +55,14 @@ def main(_):
     observation, info = env.reset(
         seed=FLAGS.seed, options={'task_id': 1, 'render_goal': False}
     )
-    frame_stack = int(payload['config'].get('frame_stack', 1))
+    config = dict(payload['config'])
+    if FLAGS.num_candidates >= 0:
+        if FLAGS.num_candidates < 1:
+            raise ValueError('--num_candidates must be positive or -1.')
+        config['eval_num_candidates'] = int(FLAGS.num_candidates)
+    if FLAGS.endpoint_temperature >= 0.0:
+        config['eval_temperature'] = float(FLAGS.endpoint_temperature)
+    frame_stack = int(config.get('frame_stack', 1))
     examples = np.stack(
         [
             repeat_pixel_frame(np.asarray(observation, dtype=np.uint8), frame_stack),
@@ -59,7 +74,7 @@ def main(_):
         seed=FLAGS.seed,
         example_images=examples,
         action_dim=int(np.prod(env.action_space.shape)),
-        config=payload['config'],
+        config=config,
     )
     agent = restore_af_agent(template, payload)
     metrics = evaluate_pixel_policy(
@@ -74,6 +89,8 @@ def main(_):
         'env_name': metadata['env_name'],
         'port_kind': metadata['port_kind'],
         'protocol_id': metadata['protocol_id'],
+        'num_candidates': int(config.get('eval_num_candidates', 1)),
+        'endpoint_temperature': float(config.get('eval_temperature', 0.0)),
         **metrics,
     }
     output = json.dumps(result, indent=2, sort_keys=True)

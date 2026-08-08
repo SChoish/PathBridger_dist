@@ -1,8 +1,8 @@
 """OGBench environment and compact state/pixel dataset loading.
 
-The state and visual entry points are intentionally separate.  In particular,
-the visual loader drops actions and every non-whitelisted field before a pixel
-algorithm can receive the offline data.
+The state and visual entry points are intentionally separate.  The visual
+loader exposes either a strict action-free view or a full-action view while
+always dropping rewards, simulator state, and every other privileged field.
 """
 
 from __future__ import annotations
@@ -81,8 +81,10 @@ def _as_state_dataset(raw: Mapping[str, Any], *, split: str) -> Dataset:
     return dataset
 
 
-def _as_pixel_dataset(raw: Mapping[str, Any], *, split: str) -> Dataset:
-    """Build the strict offline pixel view before returning to an algorithm."""
+def _as_pixel_dataset(
+    raw: Mapping[str, Any], *, split: str, action_free: bool = True
+) -> Dataset:
+    """Build either the strict action-free or full offline pixel view."""
 
     if 'observations' not in raw or 'terminals' not in raw:
         raise ValueError(
@@ -103,9 +105,19 @@ def _as_pixel_dataset(raw: Mapping[str, Any], *, split: str) -> Dataset:
         raise ValueError(
             f'{split} visual observations and terminals have different lengths.'
         )
-    # This is the action-free information boundary.  Do not pass `raw` to
-    # Dataset.create: it normally contains offline actions and rewards.
-    return Dataset.create(observations=observations, terminals=terminals)
+    fields = {'observations': observations, 'terminals': terminals}
+    if not action_free:
+        if 'actions' not in raw:
+            raise ValueError(f'{split} full pixel data must contain actions.')
+        actions = np.asarray(raw['actions'], dtype=np.float32)
+        if actions.ndim != 2 or len(actions) != len(observations):
+            raise ValueError(
+                f'{split} pixel actions must have shape [N, A], got '
+                f'{actions.shape} for N={len(observations)}.'
+            )
+        fields['actions'] = actions
+    # Never expose qpos, qvel, rewards, or other privileged NPZ fields.
+    return Dataset.create(**fields)
 
 
 def _local_npz_paths(
@@ -206,13 +218,14 @@ def make_pixel_env_and_datasets(
     dataset_dir: str | Path | None = None,
     *,
     allow_download: bool = False,
+    action_free: bool = True,
     **env_kwargs: Any,
 ) -> tuple[Any, Dataset, Dataset]:
-    """Create an OGBench visual environment and strict action-free datasets.
+    """Create an OGBench visual environment and strict pixel datasets.
 
     This entry point accepts only ``visual-*`` OGBench tasks, keeps RGB arrays
-    as compact ``uint8`` values, and returns exactly ``observations`` and
-    ``terminals`` for both offline splits.
+    as compact ``uint8`` values.  ``action_free=True`` returns only images and
+    terminals; full offline mode additionally returns actions.
     """
 
     if 'visual-' not in str(dataset_name).lower():
@@ -264,8 +277,8 @@ def make_pixel_env_and_datasets(
         )
     return (
         env,
-        _as_pixel_dataset(train_raw, split='training'),
-        _as_pixel_dataset(val_raw, split='validation'),
+        _as_pixel_dataset(train_raw, split='training', action_free=action_free),
+        _as_pixel_dataset(val_raw, split='validation', action_free=action_free),
     )
 
 
