@@ -19,7 +19,11 @@ from agents.pixel_trl_critic_locks import (
     apply_pixel_pbf_locks,
     trl_critic_lock_for_env,
 )
-from agents.pixel_pathbridger import ImpalaSmallEncoder
+from agents.pixel_pathbridger import (
+    CompactImpalaPathEncoder,
+    ImpalaSmallEncoder,
+    _crop_with_offsets,
+)
 from scripts.make_pixel_manifest import SUITES, build_rows
 from utils.af_checkpoints import load_af_checkpoint, restore_af_agent, save_af_checkpoint
 from utils.pixel_data import ActionFreePixelTrajectoryData, PixelTrajectoryData
@@ -69,6 +73,8 @@ def _config(name):
             value_hidden_dims=(16,),
             endpoint_horizon=5,
             endpoint_flow_steps=2,
+            path_rep_dim=4,
+            p_aug=0.0,
         )
     if name in ('pixel_hiql', 'pixel_ota'):
         config.update(
@@ -199,6 +205,9 @@ def test_full_offline_pixel_pbf_trains_idm_from_dataset_actions():
         action_dim=2,
         config=config,
     )
+    assert isinstance(
+        agent.network.model_def.modules['encoder'], CompactImpalaPathEncoder
+    )
     before = parameter_digest(agent.network.params['modules_idm'])
     batch = data.sample(
         2,
@@ -216,6 +225,170 @@ def test_full_offline_pixel_pbf_trains_idm_from_dataset_actions():
     assert np.isfinite(float(info['loss/total']))
     assert np.isfinite(float(info['idm/loss']))
     assert parameter_digest(agent.network.params['modules_idm']) != before
+
+
+def test_pixel_pbf_compact_representation_and_geometry_gradient_routing():
+    data = PixelTrajectoryData(
+        {
+            'observations': _pixels(),
+            'terminals': np.array([0, 0, 0, 0, 0, 1], np.float32),
+            'actions': np.linspace(-0.5, 0.5, 12, dtype=np.float32).reshape(6, 2),
+        },
+        seed=3,
+        frame_stack=1,
+    )
+    config = _config('pixel_pbf')
+    assert config['normalize_path_rep'] is True
+    assert config['stop_planner_rep_grad'] is True
+    assert config['geometry_target_source'] == 'online'
+    agent, _ = create_pixel_algorithm(
+        'pixel_pbf',
+        seed=4,
+        example_images=data.example_images,
+        action_dim=2,
+        config=config,
+    )
+    encoded = agent.network.select('encoder')(data.example_images)
+    assert encoded.shape == (2, 4)
+    assert np.allclose(
+        np.linalg.norm(np.asarray(encoded), axis=-1), np.sqrt(4), atol=1e-5
+    )
+    path = agent.latent_path(
+        data.example_images[:1],
+        data.example_images[1:2],
+        seed=jax.random.PRNGKey(8),
+        num_candidates=2,
+        endpoint_temperature=0.25,
+    )
+    assert np.allclose(
+        np.linalg.norm(np.asarray(path), axis=-1), np.sqrt(4), atol=1e-5
+    )
+
+    batch = data.sample(
+        2,
+        path_horizon=5,
+        endpoint_horizon=5,
+        discount=0.99,
+        value_geom_sample=True,
+    )
+    # Digest comparisons are GPU-nondeterministic; check the architectural
+    # invariant directly: endpoint/bridge losses must not train the encoder.
+    assert float(agent.planner_encoder_grad_norm(batch)) < 1e-5
+    changed_geometry = dict(batch)
+    changed_geometry['endpoint_targets'] = 255 - batch['endpoint_targets']
+    changed_geometry['bridge_targets'] = 255 - batch['bridge_targets']
+    assert float(agent.planner_encoder_grad_norm(changed_geometry)) < 1e-5
+
+    updated, info = agent.offline_update(batch)
+    changed, changed_info = agent.offline_update(changed_geometry)
+    assert parameter_digest(updated.network.params['modules_endpoint']) != (
+        parameter_digest(changed.network.params['modules_endpoint'])
+    )
+    for key in (
+        'repr/cross_sample_std',
+        'repr/effective_rank',
+        'repr/one_step_distance',
+        'repr/random_pair_distance',
+        'idm/mean_action_baseline_mse',
+        'action/abs_mean',
+        'action/std',
+    ):
+        assert np.isfinite(float(info[key]))
+        assert np.isfinite(float(changed_info[key]))
+
+
+def test_pixel_pbf_fast_update_skips_log_only_diagnostics():
+    data = PixelTrajectoryData(
+        {
+            'observations': _pixels(),
+            'terminals': np.array([0, 0, 0, 0, 0, 1], np.float32),
+            'actions': np.linspace(-0.5, 0.5, 12, dtype=np.float32).reshape(6, 2),
+        },
+        seed=5,
+        frame_stack=1,
+    )
+    config = _config('pixel_pbf')
+    agent, _ = create_pixel_algorithm(
+        'pixel_pbf',
+        seed=6,
+        example_images=data.example_images,
+        action_dim=2,
+        config=config,
+    )
+    batch = data.sample(
+        2,
+        path_horizon=5,
+        endpoint_horizon=5,
+        discount=0.99,
+        value_geom_sample=True,
+    )
+    _, info = agent.offline_update(batch, full_metrics=False)
+    assert np.isfinite(float(info['loss/total']))
+    assert 'repr/effective_rank' not in info
+    assert 'idm/mean_action_baseline_mse' not in info
+    assert 'endpoint/value_gap_mean' not in info
+
+
+def test_pixel_pbf_random_crop_is_consistent_across_path_images():
+    image = np.arange(8 * 8 * 3, dtype=np.uint8).reshape(8, 8, 3)
+    images = np.stack([image, image])
+    paths = np.repeat(images[:, None], 5, axis=1)
+    offsets = np.array([[0, 6], [5, 1]], dtype=np.int32)
+    cropped_images = np.asarray(_crop_with_offsets(images, offsets))
+    cropped_paths = np.asarray(_crop_with_offsets(paths, offsets))
+    assert np.array_equal(cropped_paths[:, 0], cropped_images)
+    assert np.array_equal(cropped_paths[:, 4], cropped_images)
+
+
+def test_legacy_raw_pixel_pbf_config_keeps_checkpoint_parameter_tree(tmp_path):
+    config = _config('pixel_pbf')
+    for key in (
+        'path_rep_dim',
+        'normalize_path_rep',
+        'stop_planner_rep_grad',
+        'geometry_target_source',
+        'log_rep_diagnostics',
+    ):
+        config.pop(key)
+    config['legacy_raw_representation'] = True
+    agent, resolved = create_pixel_algorithm(
+        'pixel_pbf',
+        seed=5,
+        example_images=_pixels()[:2],
+        action_dim=2,
+        config=config,
+    )
+    encoder_params = agent.network.params['modules_encoder']
+    assert isinstance(agent.network.model_def.modules['encoder'], ImpalaSmallEncoder)
+    assert 'visual_encoder' not in encoder_params
+    assert resolved['path_rep_dim'] == resolved['feature_dim']
+    assert resolved['normalize_path_rep'] is False
+    checkpoint = tmp_path / 'legacy.pkl'
+    legacy_payload_config = dict(config)
+    legacy_payload_config.pop('legacy_raw_representation')
+    save_af_checkpoint(
+        checkpoint,
+        algorithm='pixel_pbf',
+        agent=agent,
+        step=17,
+        config=legacy_payload_config,
+        metadata={'observation_modality': 'rgb_uint8'},
+    )
+    payload = load_af_checkpoint(checkpoint)
+    restore_config = dict(payload['config'])
+    assert 'path_rep_dim' not in restore_config
+    restore_config['legacy_raw_representation'] = True
+    template, _ = create_pixel_algorithm(
+        'pixel_pbf',
+        seed=6,
+        example_images=_pixels()[:2],
+        action_dim=2,
+        config=restore_config,
+    )
+    restored = restore_af_agent(template, payload)
+    assert parameter_digest(restored.network.params) == parameter_digest(
+        agent.network.params
+    )
 
 
 @pytest.mark.parametrize('name', ('pixel_hiql', 'pixel_ota'))
@@ -394,6 +567,18 @@ def test_pixel_manifest_matches_all_algorithms_and_locked_dimensions(tmp_path):
         assert all('--resume_keep=1' in row['command'] for row in rows)
         assert all('--save_replay' in row['command'] for row in rows)
         assert all('--dataset_dir=' in row['command'] for row in rows)
+    lapo_rows = build_rows(
+        root=tmp_path,
+        python='python',
+        suite_name='pilot',
+        algorithm='gc_pixel_lapo_decoder',
+    )
+    assert len(lapo_rows) == 12
+    assert {row['algorithm'] for row in lapo_rows} == {'gc_pixel_lapo_decoder'}
+    assert all(
+        '--algorithm=gc_pixel_lapo_decoder' in row['command']
+        for row in lapo_rows
+    )
     assert len(SUITES['screening']['seeds']) == 5
 
 
@@ -436,6 +621,13 @@ def test_pixel_pbf_search_grid_and_locks_are_explicit():
     assert locked['endpoint_horizon'] == 40
     assert locked['encoder'] == 'impala_small'
     assert locked['feature_dim'] == 512
+    assert locked['path_rep_dim'] == 32
+    assert locked['normalize_path_rep'] is True
+    assert locked['stop_planner_rep_grad'] is True
+    assert locked['geometry_target_source'] == 'online'
+    assert locked['offline_batch_size'] == 256
+    assert locked['frame_stack'] == 1
+    assert locked['p_aug'] == 0.5
     assert locked['path_horizon'] == 5
     assert locked['endpoint_value_scale'] == 5.0
     with pytest.raises(ValueError, match='Only gap and'):
@@ -489,3 +681,24 @@ def test_pixel_pbf_sampler_uses_k_endpoint_and_first_five_bridge_targets():
     assert np.array_equal(
         batch['transitive_valids'], (batch['value_offsets'] > 5).astype(np.float32)
     )
+
+
+def test_pixel_pbf_non_geometric_future_sampler_matches_state_formula():
+    frames = np.zeros((8, 32, 32, 3), dtype=np.uint8)
+    data = ActionFreePixelTrajectoryData(
+        {
+            'observations': frames,
+            'terminals': np.array([0, 0, 0, 0, 0, 0, 0, 1], np.float32),
+        },
+        seed=123,
+    )
+    indices = np.array([0, 2, 5], dtype=np.int64)
+    expected_rng = np.random.default_rng(123)
+    distances = expected_rng.random(len(indices))
+    expected_goals = np.round(
+        (indices + 1) * distances + 7 * (1.0 - distances)
+    ).astype(np.int64)
+    offsets = data._sample_future_offsets(
+        indices, discount=0.99, geom_sample=False
+    )
+    assert np.array_equal(indices + offsets, expected_goals)

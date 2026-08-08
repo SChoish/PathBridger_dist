@@ -94,9 +94,14 @@ flags.DEFINE_integer('log_interval', 1_000, 'CSV logging interval.')
 flags.DEFINE_string(
     'eval_steps',
     '0,10000,25000,50000,100000,250000,500000,1000000',
-    'Comma-separated online evaluation/checkpoint steps.',
+    'Comma-separated evaluation/checkpoint steps (offline and/or online).',
 )
 flags.DEFINE_integer('eval_episodes', 10, 'Episodes per task; zero disables evaluation.')
+flags.DEFINE_integer(
+    'final_eval_episodes',
+    -1,
+    'Episodes per task at the final offline/online step; -1 uses eval_episodes.',
+)
 flags.DEFINE_bool('use_tqdm', True, 'Display progress bars.')
 flags.DEFINE_string(
     'restore_path',
@@ -226,6 +231,18 @@ def _parse_eval_steps(value: str, maximum: int) -> tuple[int, ...]:
     if any(step < 0 for step in steps):
         raise ValueError('eval_steps cannot contain negative values.')
     return tuple(step for step in steps if step <= maximum)
+
+
+def _episodes_for_eval_step(step: int, *, final_step: int) -> int:
+    if int(FLAGS.eval_episodes) <= 0:
+        return 0
+    if (
+        int(FLAGS.final_eval_episodes) >= 0
+        and int(step) == int(final_step)
+        and int(final_step) > 0
+    ):
+        return int(FLAGS.final_eval_episodes)
+    return int(FLAGS.eval_episodes)
 
 
 def _stable_hash(payload) -> str:
@@ -361,7 +378,7 @@ def main(_):
     task_rng = np.random.default_rng(FLAGS.seed + 17_003)
     exploration_rng = np.random.default_rng(FLAGS.seed + 91_009)
     algorithm = str(FLAGS.algorithm)
-    if algorithm in ('pixel_hiql', 'pixel_ota'):
+    if algorithm in ('pixel_pbf', 'pixel_hiql', 'pixel_ota'):
         if FLAGS.online_steps != 0:
             raise ValueError(
                 f'{algorithm} is an offline baseline; run with --online_steps=0.'
@@ -386,13 +403,22 @@ def main(_):
     if not isinstance(overrides, dict):
         raise ValueError('config_json must decode to a JSON object.')
     overrides.setdefault('frame_stack', int(FLAGS.frame_stack))
-    if algorithm in ('pixel_hiql', 'pixel_ota'):
+    if algorithm in ('pixel_pbf', 'pixel_hiql', 'pixel_ota'):
         is_manipulation = any(
             token in FLAGS.env_name for token in ('cube', 'scene', 'puzzle')
         )
         overrides.setdefault('p_aug', 0.5 if is_manipulation else 0.0)
+    if algorithm in ('pixel_hiql', 'pixel_ota'):
         overrides.setdefault('subgoal_steps', 10 if is_manipulation else 25)
     if algorithm == 'pixel_pbf':
+        if restore_payload is not None and 'path_rep_dim' not in dict(
+            restore_payload.get('config') or {}
+        ):
+            raise ValueError(
+                'Legacy raw-512 pixel PBF checkpoints are evaluation-only. '
+                'Start a fresh compact-representation run instead of resuming '
+                'the collapsed architecture.'
+            )
         overrides = apply_pixel_pbf_locks(FLAGS.env_name, overrides)
     agent, config = create_pixel_algorithm(
         algorithm,
@@ -485,6 +511,48 @@ def main(_):
             phase='offline',
         )
 
+    offline_eval_steps = (
+        _parse_eval_steps(FLAGS.eval_steps, offline_steps)
+        if (not skip_offline and offline_steps and FLAGS.eval_episodes > 0)
+        else ()
+    )
+    eval_env = None
+    offline_eval_logger = None
+    if offline_eval_steps or (FLAGS.eval_episodes > 0 and FLAGS.online_steps > 0):
+        import ogbench
+
+        eval_env = ogbench.make_env_and_datasets(FLAGS.env_name, env_only=True)
+    if offline_eval_steps:
+        offline_eval_logger = CsvLogger(
+            run_dir / 'eval.csv',
+            resume=resume_in_place and offline_start > 1,
+        )
+
+    def evaluate_offline_and_save(step: int) -> None:
+        episodes = _episodes_for_eval_step(step, final_step=offline_steps)
+        if episodes > 0 and eval_env is not None:
+            metrics = evaluate_pixel_policy(
+                agent,
+                eval_env,
+                episodes_per_task=episodes,
+                seed=FLAGS.seed,
+            )
+            if offline_eval_logger is not None:
+                offline_eval_logger.log(metrics, step)
+        save_af_checkpoint(
+            checkpoint_dir / f'step_{step}.pkl',
+            algorithm=algorithm,
+            agent=agent,
+            step=step,
+            config=config,
+            metadata={
+                'phase': 'offline',
+                'algorithm': algorithm,
+                'eval_episodes_per_task': int(episodes),
+            },
+            phase='offline',
+        )
+
     if not skip_offline and algorithm == 'gc_pixel_lapo_decoder':
         absolute_step = 0
         for stage, steps in ((1, stage1_steps), (2, stage2_steps)):
@@ -530,6 +598,7 @@ def main(_):
         if FLAGS.use_tqdm:
             iterator = tqdm.tqdm(iterator, desc=f'{algorithm}-offline', dynamic_ncols=True)
         for step in iterator:
+            do_log = step % FLAGS.log_interval == 0 or step == offline_steps
             offline_batch = _sample_offline_batch(
                 pixel_data,
                 batch_size,
@@ -541,20 +610,28 @@ def main(_):
                     offline_batch,
                     device_pixel_frames,
                     device_pixel_initials,
+                    full_metrics=do_log,
                 )
             else:
                 agent, info = agent.offline_update(offline_batch)
-            if step % FLAGS.log_interval == 0 or step == offline_steps:
+            if do_log:
                 logger.log(_host_metrics(info), step)
+            if step in offline_eval_steps:
+                evaluate_offline_and_save(step)
             if stop_requested['flag']:
                 save_offline_checkpoint(step)
                 _write_emergency_marker(
                     run_dir, step, stop_requested['signum'], 'offline'
                 )
                 logger.close()
+                if offline_eval_logger is not None:
+                    offline_eval_logger.close()
                 print(f'Run soft-stopped (offline) at {run_dir}', flush=True)
                 return
         logger.close()
+        if offline_eval_logger is not None:
+            offline_eval_logger.close()
+            offline_eval_logger = None
     elif skip_offline and restore_payload is not None:
         agent = restore_af_agent(agent, restore_payload)
 
@@ -580,8 +657,13 @@ def main(_):
         'replay_capacity': int(FLAGS.replay_capacity),
         'frame_stack': int(FLAGS.frame_stack),
         'her_probability': float(FLAGS.her_probability),
-        'eval_steps': list(eval_steps),
+        'eval_steps': sorted(set(list(eval_steps) + list(offline_eval_steps))),
         'eval_episodes_per_task': int(FLAGS.eval_episodes),
+        'final_eval_episodes_per_task': int(
+            FLAGS.final_eval_episodes
+            if FLAGS.final_eval_episodes >= 0
+            else FLAGS.eval_episodes
+        ),
         'evaluation_task_ids': list(DEFAULT_TASK_IDS),
     }
     protocol_id = f'{PROTOCOL_VERSION}:{_stable_hash(protocol_payload)[:16]}'
@@ -669,6 +751,11 @@ def main(_):
         'pixel_pbf_tune': {
             'encoder': str(config['encoder']),
             'feature_dim': int(config['feature_dim']),
+            'path_rep_dim': int(config['path_rep_dim']),
+            'normalize_path_rep': bool(config['normalize_path_rep']),
+            'stop_planner_rep_grad': bool(config['stop_planner_rep_grad']),
+            'geometry_target_source': str(config['geometry_target_source']),
+            'p_aug': float(config['p_aug']),
             'gap': float(config['endpoint_value_scale']),
             'num_candidates': int(config['eval_num_candidates']),
             'endpoint_temperature': float(config['eval_temperature']),
@@ -724,8 +811,7 @@ def main(_):
     run_metadata['replay_allocated_bytes'] = replay.allocated_bytes
     _write_metadata(run_dir / 'metadata.json', run_metadata)
 
-    eval_env = None
-    if FLAGS.eval_episodes > 0:
+    if eval_env is None and FLAGS.eval_episodes > 0 and FLAGS.online_steps > 0:
         import ogbench
 
         eval_env = ogbench.make_env_and_datasets(FLAGS.env_name, env_only=True)
@@ -735,7 +821,9 @@ def main(_):
     )
     eval_logger = CsvLogger(
         run_dir / 'eval.csv',
-        resume=resume_in_place and online_start_step > 1,
+        resume=resume_in_place and (
+            online_start_step > 1 or bool(offline_eval_steps)
+        ),
     )
     max_episode_steps = _max_episode_steps(env)
     episode_id = 0
@@ -793,14 +881,19 @@ def main(_):
 
     def evaluate_and_save(step: int) -> None:
         metadata = checkpoint_metadata()
-        if eval_env is not None:
+        episodes = _episodes_for_eval_step(step, final_step=FLAGS.online_steps)
+        if eval_env is not None and episodes > 0:
             metrics = evaluate_pixel_policy(
                 agent,
                 eval_env,
-                episodes_per_task=FLAGS.eval_episodes,
+                episodes_per_task=episodes,
                 seed=FLAGS.seed,
             )
             eval_logger.log(metrics, step)
+        metadata = {
+            **metadata,
+            'eval_episodes_per_task': int(episodes),
+        }
         save_af_checkpoint(
             checkpoint_dir / f'step_{step}.pkl',
             algorithm=algorithm,
@@ -826,14 +919,27 @@ def main(_):
         )
         _rotate_resume_checkpoints(checkpoint_dir, int(FLAGS.resume_keep))
 
-    if 0 in eval_steps and online_start_step <= 1:
+    if FLAGS.online_steps > 0 and 0 in eval_steps and online_start_step <= 1:
         evaluate_and_save(0)
 
     if online_start_step > FLAGS.online_steps:
-        print(
-            f'[resume] already past online_steps={FLAGS.online_steps}; nothing to do',
-            flush=True,
-        )
+        if FLAGS.online_steps == 0:
+            final_metadata = checkpoint_metadata()
+            run_metadata.update(
+                frozen_module_final_digests=final_metadata[
+                    'frozen_module_final_digests'
+                ],
+                offline_modules_frozen_verified=True,
+                run_completed=True,
+            )
+            _write_metadata(run_dir / 'metadata.json', run_metadata)
+            print(f'Pixel offline-only run saved to {run_dir}', flush=True)
+        else:
+            print(
+                f'[resume] already past online_steps={FLAGS.online_steps}; '
+                'nothing to do',
+                flush=True,
+            )
         online_logger.close()
         eval_logger.close()
         return
@@ -940,8 +1046,16 @@ def main(_):
             print(f'Run soft-stopped (online) at {run_dir}', flush=True)
             return
 
-    if FLAGS.online_steps not in eval_steps:
+    if FLAGS.online_steps > 0 and FLAGS.online_steps not in eval_steps:
         evaluate_and_save(FLAGS.online_steps)
+    elif (
+        FLAGS.online_steps == 0
+        and offline_steps > 0
+        and offline_steps not in offline_eval_steps
+        and FLAGS.eval_episodes > 0
+    ):
+        # Offline-only runs with eval enabled but final step omitted from eval_steps.
+        evaluate_offline_and_save(offline_steps)
     final_metadata = checkpoint_metadata()
     run_metadata.update(
         frozen_module_final_digests=final_metadata['frozen_module_final_digests'],

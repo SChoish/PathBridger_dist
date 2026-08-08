@@ -229,7 +229,7 @@ class PathBridgerDataset:
         observations = np.asarray(self.dataset["observations"])
         if observations.ndim != 2:
             raise ValueError(
-                "PathBridger_dist supports state-vector observations only; "
+                "PathBridger supports state-vector observations only; "
                 f"expected observations with shape [N, D], got {observations.shape}."
             )
         if self.require_actions and "actions" not in self.dataset:

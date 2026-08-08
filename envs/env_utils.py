@@ -75,7 +75,7 @@ def _as_state_dataset(raw: Mapping[str, Any], *, split: str) -> Dataset:
     observations = np.asarray(dataset['observations'])
     if observations.ndim != 2:
         raise ValueError(
-            'PathBridger_dist is state-based: '
+            'PathBridger is state-based: '
             f'{split} observations must have shape [N, D], got {observations.shape}.'
         )
     return dataset

@@ -9,7 +9,6 @@ import pytest
 from agents.online_idm import parameter_digest
 from agents.pixel_lapo import PixelLAPOAgent, get_config
 from envs.env_utils import _as_pixel_dataset, make_pixel_env_and_datasets
-from scripts.make_pixel_lapo_manifest import ENVIRONMENTS, SUITES, build_rows
 from utils.pixel_data import ActionFreePixelTrajectoryData, PixelReplayBuffer
 from utils.pixel_evaluation import evaluate_pixel_policy
 
@@ -272,15 +271,3 @@ def test_pixel_evaluation_preserves_images_and_any_step_success():
     )
     assert metrics['overall_success'] == 1.0
     assert metrics['num_tasks'] == 2
-
-
-def test_pixel_manifest_is_isolated_and_has_locked_dimensions(tmp_path):
-    expected = {'pilot': 12, 'screening': 40}
-    for name, count in expected.items():
-        rows = build_rows(root=tmp_path, python='python', suite_name=name)
-        assert len(rows) == count
-        assert {row['algorithm'] for row in rows} == {'gc_pixel_lapo_decoder'}
-        assert all('train_pixel_lapo.py' in row['command'] for row in rows)
-        assert all('train_af.py' not in row['command'] for row in rows)
-    assert len(ENVIRONMENTS) == 8
-    assert len(SUITES['screening']['seeds']) == 5

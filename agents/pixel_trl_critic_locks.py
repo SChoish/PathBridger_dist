@@ -53,6 +53,12 @@ PIXEL_PBF_GAP_SEARCH = (5.0, 10.0)
 PIXEL_PBF_NT_SEARCH = ((1, 0.0), (2, 0.25), (16, 0.5), (32, 1.0))
 
 
+def _pixel_augmentation_probability(env_name: str) -> float:
+    return 0.5 if any(
+        token in env_name for token in ('cube', 'scene', 'puzzle')
+    ) else 0.0
+
+
 def trl_critic_lock_for_env(env_name: str) -> dict[str, Any]:
     if env_name not in PIXEL_TRL_CRITIC_LOCKS:
         raise KeyError(
@@ -68,6 +74,14 @@ def pixel_pbf_lock_for_env(env_name: str) -> dict[str, Any]:
         **critic,
         'encoder': 'impala_small',
         'feature_dim': 512,
+        'path_rep_dim': 32,
+        'normalize_path_rep': True,
+        'stop_planner_rep_grad': True,
+        'geometry_target_source': 'online',
+        'log_rep_diagnostics': True,
+        'frame_stack': 1,
+        'offline_batch_size': 256,
+        'p_aug': _pixel_augmentation_probability(env_name),
         'encoder_learning_rate': 3e-4,
         'path_horizon': 5,
         'endpoint_horizon': PIXEL_PBF_ENDPOINT_HORIZONS[env_name],

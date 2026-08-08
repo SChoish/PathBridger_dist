@@ -61,6 +61,10 @@ def main(_):
         seed=FLAGS.seed, options={'task_id': 1, 'render_goal': False}
     )
     config = dict(payload['config'])
+    if algorithm == 'pixel_pbf' and 'path_rep_dim' not in config:
+        # The first pixel-PBF checkpoints predate the compact normalized path
+        # representation. They remain evaluable with their original tree.
+        config['legacy_raw_representation'] = True
     if FLAGS.num_candidates >= 0:
         if FLAGS.num_candidates < 1:
             raise ValueError('--num_candidates must be positive or -1.')

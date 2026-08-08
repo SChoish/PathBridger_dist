@@ -55,7 +55,8 @@ The isolated manifest generator exposes:
 Generate a manifest without launching it:
 
 ```bash
-python scripts/make_pixel_lapo_manifest.py --suite=pilot \
+python scripts/make_pixel_manifest.py --suite=pilot \
+  --algorithm=gc_pixel_lapo_decoder \
   --output=manifests/pixel_lapo_pilot.csv
 ```
 
@@ -75,7 +76,7 @@ manifest generator never starts training or downloads data.
 Example development smoke after datasets are available:
 
 ```bash
-python train_pixel_lapo.py \
+python train_pixel.py --algorithm=gc_pixel_lapo_decoder \
   --env_name=visual-antmaze-medium-navigate-v0 \
   --lapo_stage1_steps=2 --lapo_stage2_steps=2 --online_steps=10 \
   --random_steps=10 --update_start=2 --replay_capacity=20 \

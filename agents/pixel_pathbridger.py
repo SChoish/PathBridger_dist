@@ -74,6 +74,30 @@ class ImpalaSmallEncoder(nn.Module):
         return MLP((self.feature_dim,), activate_final=True)(hidden)
 
 
+def _length_normalize(value: jnp.ndarray) -> jnp.ndarray:
+    """Normalize a compact path representation to radius ``sqrt(dim)``."""
+
+    norm = jnp.linalg.norm(value, axis=-1, keepdims=True)
+    return value / jnp.maximum(norm, 1e-6) * jnp.sqrt(value.shape[-1])
+
+
+class CompactImpalaPathEncoder(nn.Module):
+    """IMPALA visual features followed by a compact normalized path head."""
+
+    feature_dim: int = 512
+    path_rep_dim: int = 32
+
+    @nn.compact
+    def __call__(self, images):
+        features = ImpalaSmallEncoder(
+            self.feature_dim, name='visual_encoder'
+        )(images)
+        representation = nn.Dense(
+            self.path_rep_dim, name='path_projector'
+        )(features)
+        return _length_normalize(representation)
+
+
 def _stack_resident_frames(frames, initial_for_state, indices, frame_stack: int):
     """Build channel-stacked observations from a device-resident frame store."""
 
@@ -92,6 +116,35 @@ def _stack_resident_frames(frames, initial_for_state, indices, frame_stack: int)
         frame_stack * frames.shape[3],
     )
     return pixels.reshape((*indices.shape, *pixels.shape[1:]))
+
+
+def _crop_with_offsets(images, offsets, padding: int = 3):
+    """Apply one episode-consistent DrQ crop offset per sampled transition."""
+
+    images = jnp.asarray(images)
+    if images.ndim not in (4, 5):
+        raise ValueError(f'Expected [B,H,W,C] or [B,T,H,W,C], got {images.shape}.')
+    height, width, channels = images.shape[-3:]
+
+    def crop_one(image, offset):
+        padded = jnp.pad(
+            image,
+            ((padding, padding), (padding, padding), (0, 0)),
+            mode='edge',
+        )
+        return jax.lax.dynamic_slice(
+            padded,
+            (offset[0], offset[1], 0),
+            (height, width, channels),
+        )
+
+    if images.ndim == 4:
+        return jax.vmap(crop_one)(images, offsets)
+
+    def crop_path(path, offset):
+        return jax.vmap(lambda image: crop_one(image, offset))(path)
+
+    return jax.vmap(crop_path)(images, offsets)
 
 
 class LatentPathBridge(nn.Module):
@@ -211,7 +264,7 @@ def _expectile_bce(
 
 
 class PixelPathBridgerAgent(flax.struct.PyTreeNode):
-    """Action-free latent path learner with latent TransV and online-only IDM."""
+    """Pixel PBF with latent TransV, flow endpoints, bridge, and IDM."""
 
     rng: Any
     network: TrainState
@@ -244,6 +297,68 @@ class PixelPathBridgerAgent(flax.struct.PyTreeNode):
 
     def _encode(self, images, params=None, *, module: str = 'encoder'):
         return self.network.select(module)(images, params=params)
+
+    def _project_path_rep(self, value):
+        if bool(self.config.get('normalize_path_rep', False)):
+            return _length_normalize(value)
+        return value
+
+    def _augment_batch(self, batch, seed):
+        """Use the same random crop for every image belonging to one row."""
+
+        probability = float(self.config.get('p_aug', 0.0))
+        if probability <= 0.0:
+            return batch
+        apply_seed, offset_seed = jax.random.split(seed)
+        offsets = jax.random.randint(
+            offset_seed,
+            (batch['observations'].shape[0], 2),
+            minval=0,
+            maxval=7,
+            dtype=jnp.int32,
+        )
+        apply_crop = jax.random.bernoulli(apply_seed, probability)
+        image_keys = (
+            'observations',
+            'next_observations',
+            'value_goals',
+            'base_goals',
+            'transitive_subgoals',
+            'endpoint_goals',
+            'endpoint_targets',
+            'bridge_targets',
+        )
+        augmented = dict(batch)
+        for key in image_keys:
+            if key not in batch:
+                continue
+            cropped = _crop_with_offsets(batch[key], offsets)
+            augmented[key] = jax.lax.select(apply_crop, cropped, batch[key])
+        return augmented
+
+    @staticmethod
+    def _representation_diagnostics(current, following):
+        """Cheap collapse indicators for the compact path representation."""
+
+        centered = current - current.mean(axis=0, keepdims=True)
+        covariance = centered.T @ centered / jnp.maximum(current.shape[0] - 1, 1)
+        eigenvalues = jnp.maximum(jnp.linalg.eigvalsh(covariance), 0.0)
+        probabilities = eigenvalues / jnp.maximum(eigenvalues.sum(), 1e-8)
+        effective_rank = jnp.exp(
+            -jnp.sum(probabilities * jnp.log(jnp.maximum(probabilities, 1e-8)))
+        )
+        random_pairs = jnp.roll(current, shift=1, axis=0)
+        return {
+            'repr/cross_sample_std': jnp.mean(jnp.std(current, axis=0)),
+            'repr/effective_rank': effective_rank,
+            'repr/norm': jnp.linalg.norm(current, axis=-1).mean(),
+            'repr/one_step_distance': jnp.linalg.norm(
+                following - current, axis=-1
+            ).mean(),
+            'repr/random_pair_distance': jnp.linalg.norm(
+                random_pairs - current, axis=-1
+            ).mean(),
+        }
 
     def value_loss(self, batch, grad_params, features=None):
         discount = jnp.asarray(self.config['discount'], dtype=jnp.float32)
@@ -407,7 +522,7 @@ class PixelPathBridgerAgent(flax.struct.PyTreeNode):
                 repeated_current, repeated_goals, flat, time
             )
             flat = flat + velocity / flow_steps
-        endpoints = repeated_current + flat
+        endpoints = self._project_path_rep(repeated_current + flat)
         return endpoints.reshape(batch_size, num_candidates, feature_dim)
 
     def _select_endpoint(
@@ -506,127 +621,232 @@ class PixelPathBridgerAgent(flax.struct.PyTreeNode):
             materialized['actions'] = batch['actions']
         return materialized
 
-    def _offline_update_impl(self, batch):
-        path_horizon = int(self.config['path_horizon'])
-        new_rng, noise_rng, time_rng = jax.random.split(self.rng, 3)
+    def _encode_offline_bundle(self, batch, params, path_horizon: int):
+        """Encode the offline batch into online/target feature bundles."""
 
-        def loss_fn(params):
-            online_images = [
-                batch['observations'],
-                batch['value_goals'],
-                batch['base_goals'],
-                batch['transitive_subgoals'],
-                batch['endpoint_goals'],
+        geometry_source = str(
+            self.config.get('geometry_target_source', 'target')
+        )
+        online_images = [
+            batch['observations'],
+            batch['value_goals'],
+            batch['base_goals'],
+            batch['transitive_subgoals'],
+            batch['endpoint_goals'],
+        ]
+        if not bool(self.config.get('offline_action_free', False)):
+            online_images.append(batch['next_observations'])
+        path_images = batch['bridge_targets']
+        flat_path_images = path_images.reshape((-1, *path_images.shape[2:]))
+        if geometry_source == 'online':
+            online_images.extend([batch['endpoint_targets'], flat_path_images])
+        online_features = self.network.select('encoder')(
+            jnp.concatenate(online_images, axis=0), params=params
+        )
+        batch_size = batch['observations'].shape[0]
+        regular_online_parts = 5 + int(
+            not bool(self.config.get('offline_action_free', False))
+        )
+        online_parts = [
+            online_features[index * batch_size : (index + 1) * batch_size]
+            for index in range(regular_online_parts)
+        ]
+        current, value_goal, base_goal, subgoal, goal = online_parts[:5]
+        following = None
+        if not bool(self.config.get('offline_action_free', False)):
+            following = online_parts[5]
+        if geometry_source == 'online':
+            geometry_start = regular_online_parts * batch_size
+            target_endpoint = online_features[
+                geometry_start : geometry_start + batch_size
             ]
-            if not bool(self.config.get('offline_action_free', False)):
-                online_images.append(batch['next_observations'])
-            online_features = self.network.select('encoder')(
-                jnp.concatenate(online_images, axis=0), params=params
+            target_path = online_features[geometry_start + batch_size :].reshape(
+                (-1, path_horizon, current.shape[-1])
             )
-            online_parts = jnp.split(
-                online_features, len(online_images), axis=0
-            )
-            current, value_goal, base_goal, subgoal, goal = online_parts[:5]
-
-            path_images = batch['bridge_targets']
-            flat_path_images = path_images.reshape(
-                (-1, *path_images.shape[2:])
-            )
-            target_images = [
-                batch['observations'],
-                batch['transitive_subgoals'],
-                batch['value_goals'],
-                batch['base_goals'],
-                batch['endpoint_targets'],
-                flat_path_images,
-            ]
-            target_features = self.network.select('target_encoder')(
-                jnp.concatenate(target_images, axis=0)
-            )
-            batch_size = current.shape[0]
-            target_current = target_features[0 * batch_size : 1 * batch_size]
-            target_subgoal = target_features[1 * batch_size : 2 * batch_size]
-            target_value_goal = target_features[2 * batch_size : 3 * batch_size]
-            target_base_goal = target_features[3 * batch_size : 4 * batch_size]
+        target_images = [
+            batch['observations'],
+            batch['transitive_subgoals'],
+            batch['value_goals'],
+            batch['base_goals'],
+        ]
+        if geometry_source == 'target':
+            target_images.extend([batch['endpoint_targets'], flat_path_images])
+        target_features = self.network.select('target_encoder')(
+            jnp.concatenate(target_images, axis=0)
+        )
+        target_current = target_features[0 * batch_size : 1 * batch_size]
+        target_subgoal = target_features[1 * batch_size : 2 * batch_size]
+        target_value_goal = target_features[2 * batch_size : 3 * batch_size]
+        target_base_goal = target_features[3 * batch_size : 4 * batch_size]
+        if geometry_source == 'target':
             target_endpoint = target_features[4 * batch_size : 5 * batch_size]
             target_path = target_features[5 * batch_size :].reshape(
                 (-1, path_horizon, current.shape[-1])
             )
+        return {
+            'current': current,
+            'value_goal': value_goal,
+            'base_goal': base_goal,
+            'subgoal': subgoal,
+            'goal': goal,
+            'following': following,
+            'target_current': target_current,
+            'target_subgoal': target_subgoal,
+            'target_value_goal': target_value_goal,
+            'target_base_goal': target_base_goal,
+            'target_endpoint': target_endpoint,
+            'target_path': target_path,
+        }
+
+    def _planner_regression_loss(
+        self,
+        params,
+        *,
+        current,
+        goal,
+        target_endpoint,
+        target_path,
+        noise_rng,
+        time_rng,
+    ):
+        """Endpoint-flow + bridge losses with production stop-gradient routing.
+
+        Feature/action reductions use a mean over the last axis so loss scale is
+        independent of ``path_rep_dim`` / action dimension.
+        """
+
+        planner_current = current
+        planner_goal = goal
+        if bool(self.config.get('stop_planner_rep_grad', False)):
+            planner_current = jax.lax.stop_gradient(planner_current)
+            planner_goal = jax.lax.stop_gradient(planner_goal)
+        target_endpoint = jax.lax.stop_gradient(target_endpoint)
+        target_path = jax.lax.stop_gradient(target_path)
+        endpoint_weights, value_gap = self._endpoint_weights(
+            planner_current, planner_goal, target_endpoint
+        )
+        displacement_targets = jax.lax.stop_gradient(
+            target_endpoint - planner_current
+        )
+        noise = jax.random.normal(
+            noise_rng,
+            displacement_targets.shape,
+            dtype=displacement_targets.dtype,
+        )
+        times = jax.random.uniform(
+            time_rng,
+            (displacement_targets.shape[0], 1),
+            dtype=displacement_targets.dtype,
+        )
+        noisy = (1.0 - times) * noise + times * displacement_targets
+        target_velocity = displacement_targets - noise
+        predicted_velocity = self.network.select('endpoint')(
+            planner_current, planner_goal, noisy, times, params=params
+        )
+        flow_errors = jnp.mean(
+            jnp.square(predicted_velocity - target_velocity), axis=-1
+        )
+        endpoint_loss = jnp.mean(endpoint_weights * flow_errors)
+        predicted_path = self._project_path_rep(
+            self.network.select('bridge')(
+                planner_current, target_endpoint, params=params
+            )
+        )
+        feature_errors = jnp.mean(
+            jnp.abs(predicted_path - target_path),
+            axis=-1,
+        )
+        feature_loss = feature_errors.mean(axis=1).mean()
+        return endpoint_loss + feature_loss, {
+            'endpoint_loss': endpoint_loss,
+            'feature_loss': feature_loss,
+            'flow_errors': flow_errors,
+            'feature_errors': feature_errors,
+            'endpoint_weights': endpoint_weights,
+            'value_gap': value_gap,
+        }
+
+    def _offline_update_impl(self, batch, *, full_metrics: bool = True):
+        path_horizon = int(self.config['path_horizon'])
+        new_rng, noise_rng, time_rng, aug_rng = jax.random.split(self.rng, 4)
+        batch = self._augment_batch(batch, aug_rng)
+
+        def loss_fn(params):
+            features = self._encode_offline_bundle(batch, params, path_horizon)
+            current = features['current']
+            following = features['following']
             value_loss, value_info = self.value_loss(
                 batch,
                 params,
                 features={
                     'current': current,
-                    'value_goals': value_goal,
-                    'base_goals': base_goal,
-                    'subgoals': subgoal,
-                    'target_current': target_current,
-                    'target_subgoals': target_subgoal,
-                    'target_value_goals': target_value_goal,
-                    'target_base_goals': target_base_goal,
+                    'value_goals': features['value_goal'],
+                    'base_goals': features['base_goal'],
+                    'subgoals': features['subgoal'],
+                    'target_current': features['target_current'],
+                    'target_subgoals': features['target_subgoal'],
+                    'target_value_goals': features['target_value_goal'],
+                    'target_base_goals': features['target_base_goal'],
                 },
             )
-            endpoint_weights, value_gap = self._endpoint_weights(
-                current, goal, target_endpoint
+            planner_loss, planner_info = self._planner_regression_loss(
+                params,
+                current=current,
+                goal=features['goal'],
+                target_endpoint=features['target_endpoint'],
+                target_path=features['target_path'],
+                noise_rng=noise_rng,
+                time_rng=time_rng,
             )
-            displacement_targets = jax.lax.stop_gradient(
-                target_endpoint - current
-            )
-            noise = jax.random.normal(
-                noise_rng,
-                displacement_targets.shape,
-                dtype=displacement_targets.dtype,
-            )
-            times = jax.random.uniform(
-                time_rng,
-                (displacement_targets.shape[0], 1),
-                dtype=displacement_targets.dtype,
-            )
-            noisy = (1.0 - times) * noise + times * displacement_targets
-            target_velocity = displacement_targets - noise
-            predicted_velocity = self.network.select('endpoint')(
-                current, goal, noisy, times, params=params
-            )
-            flow_errors = jnp.sum(
-                jnp.square(predicted_velocity - target_velocity), axis=-1
-            )
-            endpoint_loss = jnp.mean(endpoint_weights * flow_errors)
-            predicted_path = self.network.select('bridge')(
-                current, jax.lax.stop_gradient(target_endpoint), params=params
-            )
-            feature_errors = jnp.sum(
-                jnp.abs(predicted_path - jax.lax.stop_gradient(target_path)),
-                axis=-1,
-            )
-            feature_loss = feature_errors.mean(axis=1).mean()
+            endpoint_loss = planner_info['endpoint_loss']
+            feature_loss = planner_info['feature_loss']
             if bool(self.config.get('offline_action_free', False)):
                 idm_loss = jnp.zeros((), dtype=feature_loss.dtype)
                 idm_info = {}
             else:
                 if 'actions' not in batch:
                     raise KeyError('Full offline pixel PBF batch requires actions.')
-                following = online_parts[5]
                 predicted_actions = self.network.select('idm')(
                     current, following, params=params
                 )
                 squared_errors = jnp.square(predicted_actions - batch['actions'])
-                idm_loss = jnp.sum(squared_errors, axis=-1).mean()
-                idm_info = {
-                    'idm/loss': idm_loss,
-                    'idm/action_mse': squared_errors.mean(),
-                }
-            total = value_loss + endpoint_loss + feature_loss + idm_loss
+                idm_loss = squared_errors.mean()
+                idm_info = {'idm/loss': idm_loss}
+                if full_metrics:
+                    idm_info.update({
+                        'idm/action_mse': squared_errors.mean(),
+                        'idm/mean_action_baseline_mse': jnp.mean(
+                            jnp.square(
+                                batch['actions']
+                                - batch['actions'].mean(axis=0, keepdims=True)
+                            )
+                        ),
+                        'action/abs_mean': jnp.mean(jnp.abs(predicted_actions)),
+                        'action/std': jnp.std(predicted_actions),
+                    })
+            total = value_loss + planner_loss + idm_loss
             info = {
                 'loss/total': total,
                 'bridge/loss': feature_loss,
-                'bridge/prefix_l1': feature_errors.mean(),
-                'endpoint/flow_matching_loss': endpoint_loss,
-                'endpoint/flow_error_mean': flow_errors.mean(),
-                'endpoint/weight_mean': endpoint_weights.mean(),
-                'endpoint/value_gap_mean': value_gap.mean(),
                 **idm_info,
                 **value_info,
             }
+            if full_metrics:
+                info.update({
+                    'bridge/prefix_l1': planner_info['feature_errors'].mean(),
+                    'endpoint/flow_matching_loss': endpoint_loss,
+                    'endpoint/flow_error_mean': planner_info['flow_errors'].mean(),
+                    'endpoint/weight_mean': planner_info['endpoint_weights'].mean(),
+                    'endpoint/value_gap_mean': planner_info['value_gap'].mean(),
+                })
+            if (
+                full_metrics
+                and following is not None
+                and bool(self.config.get('log_rep_diagnostics', False))
+            ):
+                info.update(
+                    self._representation_diagnostics(current, following)
+                )
             return total, info
 
         trainable_modules = ['encoder', 'endpoint', 'bridge', 'value']
@@ -651,15 +871,46 @@ class PixelPathBridgerAgent(flax.struct.PyTreeNode):
         return self.replace(network=network, rng=new_rng), info
 
     @partial(jax.jit, static_argnames=())
-    def offline_update(self, batch):
-        return self._offline_update_impl(batch)
+    def planner_encoder_grad_norm(self, batch):
+        """L2 norm of encoder grads from endpoint+bridge only (≈0 when routed)."""
 
-    @partial(jax.jit, static_argnames=())
-    def offline_update_indexed(self, batch, frames, initial_for_state):
+        path_horizon = int(self.config['path_horizon'])
+        _, noise_rng, time_rng, aug_rng = jax.random.split(self.rng, 4)
+        batch = self._augment_batch(batch, aug_rng)
+
+        def planner_loss(params):
+            features = self._encode_offline_bundle(batch, params, path_horizon)
+            loss, _ = self._planner_regression_loss(
+                params,
+                current=features['current'],
+                goal=features['goal'],
+                target_endpoint=features['target_endpoint'],
+                target_path=features['target_path'],
+                noise_rng=noise_rng,
+                time_rng=time_rng,
+            )
+            return loss
+
+        grads = jax.grad(planner_loss)(self.network.params)
+        return optax.tree.norm(grads['modules_encoder'])
+
+    @partial(jax.jit, static_argnames=('full_metrics',))
+    def offline_update(self, batch, *, full_metrics: bool = True):
+        return self._offline_update_impl(batch, full_metrics=full_metrics)
+
+    @partial(jax.jit, static_argnames=('full_metrics',))
+    def offline_update_indexed(
+        self,
+        batch,
+        frames,
+        initial_for_state,
+        *,
+        full_metrics: bool = True,
+    ):
         materialized = self._materialize_indexed_batch(
             batch, frames, initial_for_state
         )
-        return self._offline_update_impl(materialized)
+        return self._offline_update_impl(materialized, full_metrics=full_metrics)
 
     @partial(jax.jit, static_argnames=())
     def online_update(self, batch):
@@ -718,7 +969,9 @@ class PixelPathBridgerAgent(flax.struct.PyTreeNode):
             num_candidates=int(num_candidates),
             temperature=float(endpoint_temperature),
         )
-        return self.network.select('bridge')(current, endpoint)
+        return self._project_path_rep(
+            self.network.select('bridge')(current, endpoint)
+        )
 
     @partial(
         jax.jit,
@@ -749,7 +1002,9 @@ class PixelPathBridgerAgent(flax.struct.PyTreeNode):
             num_candidates=int(num_candidates),
             temperature=float(temperature),
         )
-        path = self.network.select('bridge')(current, endpoint)
+        path = self._project_path_rep(
+            self.network.select('bridge')(current, endpoint)
+        )
         current_states = jnp.concatenate(
             [current[:, None, :], path[:, :-1, :]], axis=1
         )
@@ -786,6 +1041,18 @@ class PixelPathBridgerAgent(flax.struct.PyTreeNode):
     @classmethod
     def create(cls, seed, example_images, action_dim, config):
         config = dict(config)
+        legacy_representation = bool(
+            config.pop('legacy_raw_representation', False)
+        )
+        if legacy_representation:
+            # Pre-revision checkpoints used the raw IMPALA output. Preserve
+            # their exact parameter tree for standalone evaluation.
+            config['path_rep_dim'] = int(config['feature_dim'])
+            config['normalize_path_rep'] = False
+            config['stop_planner_rep_grad'] = False
+            config['geometry_target_source'] = 'target'
+            config['log_rep_diagnostics'] = False
+            config.setdefault('p_aug', 0.0)
         path_horizon = int(config['path_horizon'])
         endpoint_horizon = int(config['endpoint_horizon'])
         if path_horizon < 1 or endpoint_horizon < path_horizon:
@@ -809,6 +1076,13 @@ class PixelPathBridgerAgent(flax.struct.PyTreeNode):
                 f'{expected_channels}] for frame_stack={config["frame_stack"]}.'
             )
         feature_dim = int(config['feature_dim'])
+        path_rep_dim = int(config['path_rep_dim'])
+        if path_rep_dim < 2:
+            raise ValueError('path_rep_dim must be at least two.')
+        if str(config['geometry_target_source']) not in ('online', 'target'):
+            raise ValueError("geometry_target_source must be 'online' or 'target'.")
+        if not 0.0 <= float(config.get('p_aug', 0.0)) <= 1.0:
+            raise ValueError('p_aug must lie in [0, 1].')
         if config.get('encoder') != 'impala_small':
             raise ValueError(
                 "Pixel PBF requires encoder='impala_small', got "
@@ -818,16 +1092,24 @@ class PixelPathBridgerAgent(flax.struct.PyTreeNode):
         value_hidden = tuple(
             config.get('value_hidden_dims', config['hidden_dims'])
         )
-        encoder = ImpalaSmallEncoder(feature_dim)
+        if bool(config['normalize_path_rep']):
+            encoder = CompactImpalaPathEncoder(feature_dim, path_rep_dim)
+        else:
+            if path_rep_dim != feature_dim:
+                raise ValueError(
+                    'A non-normalized representation requires '
+                    'path_rep_dim == feature_dim.'
+                )
+            encoder = ImpalaSmallEncoder(feature_dim)
         bridge = LatentPathBridge(
-            feature_dim=feature_dim,
+            feature_dim=path_rep_dim,
             path_horizon=path_horizon,
             endpoint_horizon=endpoint_horizon,
             hidden_dims=hidden_dims,
             layer_norm=bool(config.get('bridge_layer_norm', True)),
         )
         endpoint = LatentFlowEndpoint(
-            feature_dim=feature_dim,
+            feature_dim=path_rep_dim,
             hidden_dims=hidden_dims,
             layer_norm=bool(config.get('bridge_layer_norm', True)),
         )
@@ -857,7 +1139,7 @@ class PixelPathBridgerAgent(flax.struct.PyTreeNode):
                 'idm': idm,
             }
         )
-        features = jnp.zeros((len(images), feature_dim), jnp.float32)
+        features = jnp.zeros((len(images), path_rep_dim), jnp.float32)
         rng = jax.random.PRNGKey(int(seed))
         rng, init_rng = jax.random.split(rng)
         params = model.init(
@@ -899,9 +1181,16 @@ class PixelPathBridgerAgent(flax.struct.PyTreeNode):
 def get_config():
     return ml_collections.ConfigDict(
         dict(
-            frame_stack=3,
+            frame_stack=1,
             encoder='impala_small',
             feature_dim=512,
+            path_rep_dim=32,
+            normalize_path_rep=True,
+            stop_planner_rep_grad=True,
+            geometry_target_source='online',
+            log_rep_diagnostics=True,
+            # Env-specific in train_pixel / pixel_pbf locks (manip=0.5, maze=0.0).
+            p_aug=0.0,
             hidden_dims=(512, 512, 512),
             bridge_layer_norm=True,
             value_hidden_dims=(512, 512, 512),
@@ -915,12 +1204,12 @@ def get_config():
             encoder_learning_rate=3e-4,
             value_learning_rate=3e-4,
             idm_learning_rate=3e-4,
-            tau=0.01,
+            tau=0.005,
             value_tau=0.005,
             exploration_std=0.1,
-            offline_batch_size=128,
+            offline_batch_size=256,
             online_batch_size=256,
-            offline_steps=100_000,
+            offline_steps=500_000,
             offline_action_free=False,
             # TRL / PathBridger critic locks (override per env in the tune queue).
             discount=0.99,
@@ -938,6 +1227,7 @@ def get_config():
 
 
 __all__ = [
+    'CompactImpalaPathEncoder',
     'LatentInverseDynamics',
     'ImpalaSmallEncoder',
     'LatentFlowEndpoint',

@@ -79,34 +79,33 @@ The aggregate output keeps action-free, online-only, and full-action upper-bound
 groups separate.  Reference repositories and audited commits are pinned in
 `third_party_refs.json`.
 
-## Action-free pixel benchmark
+## Pixel PBF
 
-The isolated `pixel_o2o_v3` track implements the proposed
-`gc_pixel_lapo_decoder`, online-only
-`gc_pixel_drqv2`, frozen and fine-tuned VIP-style GC-DrQ-v2 adaptations, and
-`gc_pixel_apv_style_drq`. All methods use episode-safe three-frame histories
-and a frame-indexed replay with future-image HER. Baseline names deliberately
-distinguish the controlled OGBench adaptations from native LAPO PPO and
-DreamerV2 APV reproductions. Metadata records provenance, information
-boundaries, and exact online-updated modules. Online learning is not globally
-restricted to an IDM; only the proposed entry freezes its visual path prior and
-updates a separately initialized IDM.
+`pixel_pbf` is the full-action visual counterpart of state PBF. It uses an
+IMPALA-small visual tower, a 32-D length-normalized path representation, a
+TransV/value target EMA, rectified-flow endpoint proposal, an endpoint-pinned
+five-step bridge, and an offline IDM. Endpoint/bridge losses cannot update the
+visual representation; only TransV and IDM do. Manipulation runs use one-frame
+observations, coherent random crops with probability 0.5, batch size 256, and
+500k updates. The raw frame dataset remains GPU-resident and sampled batches
+transfer only compact indices and actions.
+Collapse diagnostics are evaluated only on CSV log steps; ordinary updates use
+the same objective without log-only reductions or covariance eigendecomposition.
 
-Run one method and generate the full six-method formal pilot manifest with:
+Run one production configuration or the GPU smoke test with:
 
 ```bash
 python train_pixel.py \
-  --algorithm=pixel_pbf \
-  --env_name=visual-antmaze-medium-navigate-v0 \
-  --online_steps=250000 --seed=0
-python scripts/make_pixel_manifest.py \
-  --suite=pilot --output=manifests/pixel_pilot.csv
+  --algorithm=pixel_pbf --env_name=visual-cube-double-play-v0 \
+  --offline_steps=500000 --online_steps=0 --frame_stack=1 --seed=0
+PYTHONPATH=. python scripts/smoke_pixel_pbf_gpu.py
 ```
 
 Visual offline data is never downloaded implicitly; pass
 `--allow_dataset_download=true` only when intended. See
-[`docs/pixel_benchmark_protocol.md`](docs/pixel_benchmark_protocol.md) for the
-six algorithms, budgets, run counts, and adaptation caveats.
+[`docs/pixel_pbf.md`](docs/pixel_pbf.md) for the exact architecture, production
+locks, and diagnostic gate. The strict action-free pixel track lives in the
+canonical `PathBridger_AF` repository.
 
 This is the compact, actor-free distribution of PathBridger for state-based
 offline goal-conditioned reinforcement learning on OGBench.

@@ -157,9 +157,14 @@ class ActionFreePixelTrajectoryData:
             offsets = np.minimum(offsets, remaining).astype(np.int64)
             offsets = np.maximum(offsets, 1)
         else:
-            offsets = 1 + np.floor(
-                self.rng.random(len(indices)) * remaining
+            # Match the state PathBridgerDataset actor-goal sampler exactly:
+            # draw continuously between the next state and episode final, then
+            # round to the nearest stored state.
+            distances = self.rng.random(len(indices))
+            goal_indices = np.round(
+                (indices + 1) * distances + finals * (1.0 - distances)
             ).astype(np.int64)
+            offsets = goal_indices - indices
         return offsets
 
     def sample(

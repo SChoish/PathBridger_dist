@@ -215,12 +215,10 @@ def create_pixel_algorithm(
         resolved.update(config)
     _validate_method_config(name, resolved)
     if name == 'pixel_pbf':
-        return (
-            PixelPathBridgerAgent.create(
-                seed, example_images, action_dim, resolved
-            ),
-            resolved,
+        agent = PixelPathBridgerAgent.create(
+            seed, example_images, action_dim, resolved
         )
+        return agent, dict(agent.config)
     if name in ('pixel_hiql', 'pixel_ota'):
         agent_cls = PixelHIQLAgent if name == 'pixel_hiql' else PixelOTAAgent
         return (
@@ -253,9 +251,11 @@ def pixel_algorithm_metadata(name: str) -> AlgorithmMetadata:
             uses_offline_actions=True,
             implementation_notes=(
                 'Full-data offline PBF from pb_bundle with an IMPALA-small '
-                'pixel encoder and EMA target encoder. TransV, rectified-flow '
-                'endpoint proposal, endpoint-pinned bridge, and IDM are '
-                'trained jointly from offline images and actions.'
+                'visual tower, a 32-D length-normalized path representation, '
+                'and an EMA target used only for TransV bootstrapping. The '
+                'representation is trained by TransV and IDM; rectified-flow '
+                'endpoint and endpoint-pinned bridge inputs/targets are '
+                'stop-gradient to prevent visual collapse.'
             ),
         ),
         'pixel_hiql': dict(

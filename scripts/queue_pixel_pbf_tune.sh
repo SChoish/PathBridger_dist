@@ -1,21 +1,28 @@
 #!/usr/bin/env bash
-# Full-data offline pixel PBF: 8 gap anchors, then 32 checkpoint-only N/T evaluations.
+# Compact pixel PBF: seed0 train+NT eval, then seed1. Default concurrency = 2 (1/GPU).
 set +e
 set -uo pipefail
 
 REPO="${REPO:-/home/ext_csv/PathBridger}"
 PY="${PY:-/home/ext_csv/miniconda3/envs/offrl/bin/python}"
 SAVE_DIR="${SAVE_DIR:-/raid/ext_csv/PathBridger/exp}"
-LOGROOT="${LOGROOT:-/raid/ext_csv/PathBridger/nohup_logs/pixel_pbf_full_offline_tune}"
+LOGROOT="${LOGROOT:-/raid/ext_csv/PathBridger/nohup_logs/pixel_pbf_compact_p3_tune}"
 DATASET_DIR="${DATASET_DIR:-/raid/ext_csv/datasets/ogbench_visual}"
 # shellcheck disable=SC2206
 GPU_LIST=(${GPU_LIST:-0 1})
-SLOTS_PER_GPU="${SLOTS_PER_GPU:-2}"
-RUN_GROUP="${RUN_GROUP:-pixel_pbf_full_gap_nt_s0}"
-OFFLINE_STEPS="${OFFLINE_STEPS:-1000000}"
-EVAL_EPISODES="${EVAL_EPISODES:-50}"
+SLOTS_PER_GPU="${SLOTS_PER_GPU:-1}"
+RUN_GROUP_BASE="${RUN_GROUP_BASE:-pixel_pbf_compact_p3_gap_nt}"
+OFFLINE_STEPS="${OFFLINE_STEPS:-500000}"
+# Mid-train eval every 250k with 10 eps/task; final offline step uses 25.
+EVAL_STEPS="${EVAL_STEPS:-250000,500000}"
+EVAL_EPISODES="${EVAL_EPISODES:-10}"
+FINAL_EVAL_EPISODES="${FINAL_EVAL_EPISODES:-25}"
+# Post-hoc NT search episodes (per task) on the final step_*.pkl.
+NT_EVAL_EPISODES="${NT_EVAL_EPISODES:-25}"
 AUTO_RESUME="${AUTO_RESUME:-1}"
-SEED="${SEED:-0}"
+# shellcheck disable=SC2206
+SEEDS=(${SEEDS:-0 1})
+ALLOW_DIRTY_SOURCE="${ALLOW_DIRTY_SOURCE:-0}"
 POLL_SEC="${POLL_SEC:-20}"
 CPU_STRIDE="${CPU_STRIDE:-16}"
 CPU_BASE0="${CPU_BASE0:-0}"
@@ -119,15 +126,24 @@ clean_stop() {
 trap 'touch "$LOGROOT/STOP"; clean_stop' INT TERM
 
 source_is_fixed() {
-  [[ "$(git rev-parse HEAD)" == "$SOURCE_COMMIT" ]] && git diff --quiet
+  [[ "$(git rev-parse HEAD)" == "$SOURCE_COMMIT" ]] || return 1
+  if [[ "$ALLOW_DIRTY_SOURCE" == "1" ]]; then
+    return 0
+  fi
+  git diff --quiet
 }
 
 find_checkpoint() {
-  local env="$1" gap="$2" root checkpoint
+  local env="$1" gap="$2" root checkpoint pattern
   root="$SAVE_DIR/pixel_o2o/${RUN_GROUP}_gap${gap}"
-  checkpoint=$(find "$root" -type f \
-    -path "*/pixel_pbf_${env}_sd$(printf '%03d' "$SEED")_*/checkpoints/step_0.pkl" \
+  pattern="*/pixel_pbf_${env}_sd$(printf '%03d' "$SEED")_*/checkpoints/step_${OFFLINE_STEPS}.pkl"
+  checkpoint=$(find "$root" -type f -path "$pattern" \
     -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -1 | cut -d' ' -f2-)
+  if [[ -z "$checkpoint" || ! -f "$checkpoint" ]]; then
+    pattern="*/pixel_pbf_${env}_sd$(printf '%03d' "$SEED")_*/checkpoints/step_*.pkl"
+    checkpoint=$(find "$root" -type f -path "$pattern" \
+      -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -1 | cut -d' ' -f2-)
+  fi
   [[ -n "$checkpoint" && -f "$checkpoint" ]] || return 1
   printf '%s\n' "$checkpoint"
 }
@@ -169,13 +185,16 @@ launch_job() {
 
   if [[ "$phase" == train ]]; then
     group="${RUN_GROUP}_gap${gap}"
-    cfg=$(printf '{"endpoint_value_scale":%s,"eval_num_candidates":1,"eval_temperature":0.0,"tune_tag":"full_offline_gap%s"}' "$gap" "$gap")
+    cfg=$(printf '{"endpoint_value_scale":%s,"eval_num_candidates":1,"eval_temperature":0.0,"tune_tag":"compact_p3_gap%s"}' "$gap" "$gap")
     cmd=("$PY" -u train_pixel.py
       --algorithm=pixel_pbf --env_name="$env" --seed="$SEED"
       --run_group="$group" --protocol_suite=pixel_pbf_full_offline_gap
       --dataset_dir="$DATASET_DIR" --save_dir="$SAVE_DIR"
       --offline_steps="$OFFLINE_STEPS" --online_steps=0 --random_steps=0
-      --eval_steps=0 --eval_episodes=0 --frame_stack=3
+      --eval_steps="$EVAL_STEPS"
+      --eval_episodes="$EVAL_EPISODES"
+      --final_eval_episodes="$FINAL_EVAL_EPISODES"
+      --frame_stack=1
       --resume_interval=0 --nouse_tqdm --config_json="$cfg")
     if [[ "$AUTO_RESUME" == 1 ]] && checkpoint=$(find_resume_checkpoint "$env" "$gap"); then
       log "RESUME env=$env gap=$gap checkpoint=$checkpoint"
@@ -187,7 +206,7 @@ launch_job() {
     }
     output="$LOGROOT/results/$key.json"
     cmd=("$PY" -u evaluate_pixel.py
-      --checkpoint="$checkpoint" --episodes="$EVAL_EPISODES" --seed="$SEED"
+      --checkpoint="$checkpoint" --episodes="$NT_EVAL_EPISODES" --seed="$SEED"
       --num_candidates="$n" --endpoint_temperature="$temp"
       --output_path="$output")
   fi
@@ -211,27 +230,39 @@ finish_phase() {
 }
 
 printf '%s\n' $$ >"$LOGROOT/orchestrator.pid"
-log "START commit=$SOURCE_COMMIT full_offline_jobs=8 eval_jobs=32 steps=$OFFLINE_STEPS"
-log "PHASE_START full_offline_train"
-for env in "${ENVS[@]}"; do
-  for gap in "${GAPS[@]}"; do
-    launch_job train "$env" "$gap" || break 2
+log "START commit=$SOURCE_COMMIT seeds=${SEEDS[*]} concurrent=$MAX steps=$OFFLINE_STEPS dirty=$ALLOW_DIRTY_SOURCE"
+rc=0
+for SEED in "${SEEDS[@]}"; do
+  RUN_GROUP="${RUN_GROUP_BASE}_s${SEED}"
+  PHASE_FAILED=0
+  log "SEED_START seed=$SEED run_group=$RUN_GROUP"
+  log "PHASE_START seed=$SEED full_offline_train jobs=$((${#ENVS[@]} * ${#GAPS[@]}))"
+  for env in "${ENVS[@]}"; do
+    for gap in "${GAPS[@]}"; do
+      launch_job train "$env" "$gap" || { rc=1; break 2; }
+    done
   done
-done
-
-if finish_phase; then
-  log "PHASE_START nt_evaluation"
+  if ! finish_phase; then
+    rc=1
+    log "SEED_FAILED seed=$SEED during train"
+    break
+  fi
+  log "PHASE_START seed=$SEED nt_evaluation"
   for env in "${ENVS[@]}"; do
     for gap in "${GAPS[@]}"; do
       for cell in "${NT_SEARCH[@]}"; do
         IFS='|' read -r n temp <<<"$cell"
-        launch_job eval "$env" "$gap" "$n" "$temp" || break 3
+        launch_job eval "$env" "$gap" "$n" "$temp" || { rc=1; break 3; }
       done
     done
   done
-  finish_phase
-fi
-rc=$?
+  if ! finish_phase; then
+    rc=1
+    log "SEED_FAILED seed=$SEED during eval"
+    break
+  fi
+  log "SEED_COMPLETE seed=$SEED"
+done
 if ((rc == 0)); then log "QUEUE_COMPLETE"; else log "QUEUE_STOPPED_OR_FAILED rc=$rc"; fi
 rm -f "$LOGROOT/orchestrator.pid"
 log "EXIT"

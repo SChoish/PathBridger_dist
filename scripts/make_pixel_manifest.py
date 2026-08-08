@@ -60,11 +60,16 @@ def build_rows(
     suite_name: str,
     run_group: str = '',
     dataset_dir: str = DEFAULT_DATASET_DIR,
+    algorithm: str = '',
 ):
     suite = SUITES[suite_name]
     group = run_group or suite['run_group']
+    algorithms = (algorithm,) if algorithm else suite['algorithms']
+    unknown = set(algorithms) - set(PIXEL_ALGORITHMS)
+    if unknown:
+        raise ValueError(f'Unknown pixel algorithms: {sorted(unknown)}')
     rows = []
-    for algorithm in suite['algorithms']:
+    for algorithm in algorithms:
         for environment in suite['environments']:
             for seed in suite['seeds']:
                 command = [
@@ -108,6 +113,12 @@ def main():
     parser.add_argument('--suite', choices=tuple(SUITES), default='pilot')
     parser.add_argument('--run_group', default='')
     parser.add_argument(
+        '--algorithm',
+        choices=PIXEL_ALGORITHMS,
+        default='',
+        help='Generate only one method; omit for the complete benchmark.',
+    )
+    parser.add_argument(
         '--dataset_dir',
         default=DEFAULT_DATASET_DIR,
         help='Local visual OGBench NPZ directory (train+val).',
@@ -120,6 +131,7 @@ def main():
         suite_name=args.suite,
         run_group=args.run_group,
         dataset_dir=args.dataset_dir,
+        algorithm=args.algorithm,
     )
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
