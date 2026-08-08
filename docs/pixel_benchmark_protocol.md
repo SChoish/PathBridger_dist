@@ -8,7 +8,6 @@ checkpoints, and aggregate tables.
 
 | Registry name | Offline input | Offline training | Online updates | Status |
 | --- | --- | --- | --- | --- |
-| `pixel_pathbridger_online_idm` | RGB, terminals | endpoint-pinned latent path bridge and visual encoder/decoder | IDM only | proposed visual PathBridger |
 | `gc_pixel_drqv2` | none | none | encoder, actor, critic | goal-image OGBench adaptation of DrQ-v2 |
 | `vip_style_frozen_gc_drqv2` | RGB, terminals | VIP-style temporal value encoder | actor, critic | controlled adaptation; encoder frozen online |
 | `vip_style_finetuned_gc_drqv2` | RGB, terminals | VIP-style temporal value encoder | encoder, actor, critic | controlled adaptation; encoder fine-tuned online |

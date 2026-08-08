@@ -15,7 +15,6 @@ from utils.provenance import AlgorithmMetadata
 
 PIXEL_ALGORITHMS = (
     'pixel_pbf',
-    'pixel_pathbridger_online_idm',
     'gc_pixel_lapo_decoder',
     'gc_pixel_drqv2',
     'vip_style_frozen_gc_drqv2',
@@ -51,23 +50,6 @@ PIXEL_METHOD_SCOPES = {
             'value',
             'target_value',
             'idm',
-        ),
-    },
-    'pixel_pathbridger_online_idm': {
-        'offline_trainable_modules': (
-            'encoder',
-            'endpoint',
-            'bridge',
-            'value',
-        ),
-        'online_trainable_modules': ('idm',),
-        'online_frozen_modules': (
-            'encoder',
-            'target_encoder',
-            'endpoint',
-            'bridge',
-            'value',
-            'target_value',
         ),
     },
     'gc_pixel_lapo_decoder': {
@@ -122,7 +104,6 @@ PIXEL_METHOD_SCOPES = {
 
 _PIXEL_METHOD_CONFIG_CONTRACTS = {
     'pixel_pbf': {'offline_action_free': False},
-    'pixel_pathbridger_online_idm': {'offline_action_free': True},
     'gc_pixel_drqv2': {
         'pretraining': 'none',
         'freeze_encoder_online': False,
@@ -171,9 +152,9 @@ def _validate_method_config(name: str, config: dict[str, Any]) -> None:
 
 def get_pixel_config(name: str) -> dict[str, Any]:
     name = canonical_pixel_algorithm(name)
-    if name in ('pixel_pbf', 'pixel_pathbridger_online_idm'):
+    if name == 'pixel_pbf':
         config = pathbridger_config().to_dict()
-        config['offline_action_free'] = name == 'pixel_pathbridger_online_idm'
+        config['offline_action_free'] = False
         return config
     if name == 'gc_pixel_lapo_decoder':
         return lapo_config().to_dict()
@@ -201,7 +182,7 @@ def create_pixel_algorithm(
     if config:
         resolved.update(config)
     _validate_method_config(name, resolved)
-    if name in ('pixel_pbf', 'pixel_pathbridger_online_idm'):
+    if name == 'pixel_pbf':
         return (
             PixelPathBridgerAgent.create(
                 seed, example_images, action_dim, resolved
@@ -237,22 +218,6 @@ def pixel_algorithm_metadata(name: str) -> AlgorithmMetadata:
                 'pixel encoder and EMA target encoder. TransV, rectified-flow '
                 'endpoint proposal, endpoint-pinned bridge, and IDM are '
                 'trained jointly from offline images and actions.'
-            ),
-        ),
-        'pixel_pathbridger_online_idm': dict(
-            port_kind='proposed',
-            paper_url='',
-            official_repo_url=None,
-            official_repo_commit=None,
-            offline_fields_seen=('observations', 'terminals'),
-            online_modules_updated=('idm',),
-            implementation_notes=(
-                'Proposed visual extension: latent TransV critic (TRL-locked '
-                'lam/expectile/discount/value_p) plus an action-free '
-                'flow-matched endpoint proposer and latent path bridge are '
-                'frozen online, while a '
-                'separately initialized IDM is grounded from new RGB/action '
-                'transitions.'
             ),
         ),
         'gc_pixel_lapo_decoder': dict(

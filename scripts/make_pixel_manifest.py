@@ -18,7 +18,6 @@ ENVIRONMENTS = (
     'visual-scene-play-v0',
 )
 PIXEL_ALGORITHMS = (
-    'pixel_pathbridger_online_idm',
     'gc_pixel_lapo_decoder',
     'gc_pixel_drqv2',
     'vip_style_frozen_gc_drqv2',

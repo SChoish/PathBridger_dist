@@ -82,7 +82,7 @@ groups separate.  Reference repositories and audited commits are pinned in
 ## Action-free pixel benchmark
 
 The isolated `pixel_o2o_v3` track implements the proposed
-`pixel_pathbridger_online_idm`, `gc_pixel_lapo_decoder`, online-only
+`gc_pixel_lapo_decoder`, online-only
 `gc_pixel_drqv2`, frozen and fine-tuned VIP-style GC-DrQ-v2 adaptations, and
 `gc_pixel_apv_style_drq`. All methods use episode-safe three-frame histories
 and a frame-indexed replay with future-image HER. Baseline names deliberately
@@ -96,7 +96,7 @@ Run one method and generate the full six-method formal pilot manifest with:
 
 ```bash
 python train_pixel.py \
-  --algorithm=pixel_pathbridger_online_idm \
+  --algorithm=pixel_pbf \
   --env_name=visual-antmaze-medium-navigate-v0 \
   --online_steps=250000 --seed=0
 python scripts/make_pixel_manifest.py \

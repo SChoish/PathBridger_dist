@@ -64,7 +64,7 @@ def _config(name):
     )
     if name == 'gc_pixel_lapo_decoder':
         config.update(num_codebooks=2, num_codes=8, code_dim=4)
-    if name in ('pixel_pbf', 'pixel_pathbridger_online_idm'):
+    if name == 'pixel_pbf':
         config.update(
             value_hidden_dims=(16,),
             endpoint_horizon=5,
@@ -84,7 +84,6 @@ def _online_batch(data):
 def test_pixel_registry_declares_information_and_online_update_boundaries():
     assert PIXEL_ALGORITHMS == (
         'pixel_pbf',
-        'pixel_pathbridger_online_idm',
         'gc_pixel_lapo_decoder',
         'gc_pixel_drqv2',
         'vip_style_frozen_gc_drqv2',
@@ -113,23 +112,6 @@ def test_pixel_registry_declares_information_and_online_update_boundaries():
             scope['online_trainable_modules']
         )
 
-    assert pixel_method_scope('pixel_pathbridger_online_idm') == {
-        'offline_trainable_modules': (
-            'encoder',
-            'endpoint',
-            'bridge',
-            'value',
-        ),
-        'online_trainable_modules': ('idm',),
-        'online_frozen_modules': (
-            'encoder',
-            'target_encoder',
-            'endpoint',
-            'bridge',
-            'value',
-            'target_value',
-        ),
-    }
     assert pixel_method_scope('pixel_pbf')['offline_trainable_modules'] == (
         'encoder', 'endpoint', 'bridge', 'value', 'idm'
     )
@@ -184,68 +166,6 @@ def test_pixel_method_names_reject_conflicting_training_regimes():
             action_dim=2,
             config=apv,
         )
-
-
-def test_pixel_pathbridger_freezes_offline_path_and_updates_only_idm_online():
-    name = 'pixel_pathbridger_online_idm'
-    data = _stacked_data()
-    config = _config(name)
-    config.update(idm_hidden_dims=(16,), path_horizon=5, frame_stack=3)
-    agent, _ = create_pixel_algorithm(
-        name,
-        seed=0,
-        example_images=data.example_images,
-        action_dim=2,
-        config=config,
-    )
-    offline_names = ('encoder', 'endpoint', 'bridge', 'value')
-    offline_before = {
-        module: parameter_digest(agent.network.params[f'modules_{module}'])
-        for module in offline_names
-    }
-    idm_before = parameter_digest(agent.network.params['modules_idm'])
-    agent, offline_info = agent.offline_update(
-        data.sample(
-            2,
-            path_horizon=5,
-            endpoint_horizon=5,
-            discount=0.99,
-            value_geom_sample=True,
-        )
-    )
-    assert np.isfinite(float(offline_info['loss/total']))
-    assert np.isfinite(float(offline_info['value/loss']))
-    assert any(
-        parameter_digest(agent.network.params[f'modules_{module}'])
-        != offline_before[module]
-        for module in offline_names
-    )
-    assert parameter_digest(agent.network.params['modules_idm']) == idm_before
-
-    frozen_before_online = {
-        module: parameter_digest(agent.network.params[f'modules_{module}'])
-        for module in (*offline_names, 'target_encoder', 'target_value')
-    }
-    batch = data.sample(2, path_horizon=5)
-    batch['actions'] = np.array([[0.2, -0.3], [0.1, -0.4]], np.float32)
-    agent, online_info = agent.online_update(batch)
-    assert np.isfinite(float(online_info['loss/total']))
-    assert parameter_digest(agent.network.params['modules_idm']) != idm_before
-    for module, digest in frozen_before_online.items():
-        assert parameter_digest(agent.network.params[f'modules_{module}']) == digest
-    actions = agent.sample_actions(
-        batch['observations'],
-        batch['goals'],
-        seed=jax.random.PRNGKey(3),
-        temperature=0.0,
-    )
-    assert actions.shape == (2, 2)
-    chunks = agent.sample_action_chunks(
-        batch['observations'],
-        batch['goals'],
-        seed=jax.random.PRNGKey(3),
-    )
-    assert chunks.shape == (2, 5, 2)
 
 
 def test_full_offline_pixel_pbf_trains_idm_from_dataset_actions():
@@ -369,7 +289,7 @@ def test_generic_pixel_checkpoint_round_trip(tmp_path):
 
 
 def test_pixel_pbf_anchor_restore_keeps_branch_nt_config(tmp_path):
-    name = 'pixel_pathbridger_online_idm'
+    name = 'pixel_pbf'
     config = _config(name)
     images = _pixels()[:2]
     anchor, _ = create_pixel_algorithm(
@@ -382,8 +302,8 @@ def test_pixel_pbf_anchor_restore_keeps_branch_nt_config(tmp_path):
         agent=anchor,
         step=0,
         config=config,
-        metadata={'phase': 'online'},
-        phase='online',
+        metadata={'phase': 'offline'},
+        phase='offline',
     )
     branch_config = {**config, 'eval_num_candidates': 16, 'eval_temperature': 0.5}
     branch, _ = create_pixel_algorithm(
@@ -398,7 +318,7 @@ def test_pixel_pbf_anchor_restore_keeps_branch_nt_config(tmp_path):
 
 
 def test_pixel_manifest_matches_all_algorithms_and_locked_dimensions(tmp_path):
-    expected = {'pilot': 72, 'screening': 240}
+    expected = {'pilot': 60, 'screening': 200}
     for name, count in expected.items():
         rows = build_rows(root=tmp_path, python='python', suite_name=name)
         assert len(rows) == count

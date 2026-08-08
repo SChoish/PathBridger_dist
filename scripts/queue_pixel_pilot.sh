@@ -51,7 +51,6 @@ if [[ -e "$LOGROOT/STOP" ]]; then
 fi
 
 ALGOS=(
-  pixel_pathbridger_online_idm
   gc_pixel_lapo_decoder
   gc_pixel_drqv2
   vip_style_frozen_gc_drqv2

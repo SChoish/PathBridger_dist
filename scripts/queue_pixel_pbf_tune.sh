@@ -3,10 +3,10 @@
 set +e
 set -uo pipefail
 
-REPO="${REPO:-/home/ext_csv/PathBridger_AF_pixel_lapo}"
+REPO="${REPO:-/home/ext_csv/PathBridger_dist_pixel_pbf}"
 PY="${PY:-/home/ext_csv/miniconda3/envs/offrl/bin/python}"
-SAVE_DIR="${SAVE_DIR:-$REPO/exp}"
-LOGROOT="${LOGROOT:-$REPO/nohup_logs/pixel_pbf_full_offline_tune}"
+SAVE_DIR="${SAVE_DIR:-/raid/ext_csv/PathBridger_dist_pixel_pbf/exp}"
+LOGROOT="${LOGROOT:-/raid/ext_csv/PathBridger_dist_pixel_pbf/nohup_logs/pixel_pbf_full_offline_tune}"
 DATASET_DIR="${DATASET_DIR:-/raid/ext_csv/datasets/ogbench_visual}"
 # shellcheck disable=SC2206
 GPU_LIST=(${GPU_LIST:-0 1})
