@@ -19,7 +19,7 @@
 #   --agent.eval_num_prefix_samples=4
 set -uo pipefail
 
-REPO="${REPO:-/home/ext_csv/PathBridger_dist}"
+REPO="${REPO:-/home/ext_csv/PathBridger}"
 PY="${PY:-/home/ext_csv/miniconda3/envs/offrl/bin/python}"
 PREFIX_MODEL="${PREFIX_MODEL:-low_rank_gaussian}"
 case "$PREFIX_MODEL" in

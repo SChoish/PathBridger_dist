@@ -4,7 +4,7 @@
 set +e
 set -uo pipefail
 
-REPO="${REPO:-/home/ext_csv/PathBridger_dist}"
+REPO="${REPO:-/home/ext_csv/PathBridger}"
 RUN_GROUP="${RUN_GROUP:-paper_s0_pbf_pathwt}"
 LOGROOT="${LOGROOT:-$REPO/nohup_logs/${RUN_GROUP}_gpu_eval_large_n}"
 TRAIN_LOGROOT="${TRAIN_LOGROOT:-$REPO/nohup_logs/${RUN_GROUP}}"

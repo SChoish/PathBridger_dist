@@ -4,7 +4,7 @@
 set +e
 set -uo pipefail
 
-REPO="${REPO:-/home/ext_csv/PathBridger_dist}"
+REPO="${REPO:-/home/ext_csv/PathBridger}"
 RUN_GROUP="${RUN_GROUP:-paper_s0_pbf_pathwt}"
 LOGROOT="${LOGROOT:-$REPO/nohup_logs/${RUN_GROUP}_cpu_eval}"
 WATCHER="${WATCHER:-$REPO/scripts/watch_cpu_eval_paper_s0_pbf_pathwt.sh}"

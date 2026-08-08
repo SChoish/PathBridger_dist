@@ -11,7 +11,7 @@
 set +e
 set -uo pipefail
 
-REPO="${REPO:-/home/ext_csv/PathBridger_dist}"
+REPO="${REPO:-/home/ext_csv/PathBridger}"
 PY="${PY:-/home/ext_csv/miniconda3/envs/offrl/bin/python}"
 RUN_GROUP="${RUN_GROUP:-paper_s0_pbf_pathwt}"
 EXP_ROOT="${EXP_ROOT:-$REPO/exp/pathbridger/${RUN_GROUP}}"

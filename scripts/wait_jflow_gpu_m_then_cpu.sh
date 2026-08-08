@@ -4,7 +4,7 @@
 set +e
 set -uo pipefail
 
-REPO="${REPO:-/home/ext_csv/PathBridger_dist}"
+REPO="${REPO:-/home/ext_csv/PathBridger}"
 GPU_LOG="${GPU_LOG:-$REPO/nohup_logs/paper_s0_pbf_jflow_m_sweep_gpu}"
 CPU_LOG="${CPU_LOG:-$REPO/nohup_logs/paper_s0_pbf_jflow_m_sweep}"
 POLL_SEC="${POLL_SEC:-30}"
@@ -37,7 +37,7 @@ gpu_busy() {
 pending_count() {
   /home/ext_csv/miniconda3/envs/offrl/bin/python - <<'PY'
 from pathlib import Path
-root = Path('/home/ext_csv/PathBridger_dist/exp/pathbridger/paper_s0_pbf_jflow')
+root = Path('/home/ext_csv/PathBridger/exp/pathbridger/paper_s0_pbf_jflow')
 n = 0
 for d in root.iterdir() if root.is_dir() else []:
     if not d.is_dir() or d.name.startswith('_'):

@@ -4,7 +4,7 @@
 set +e
 set -uo pipefail
 
-REPO="${REPO:-/home/ext_csv/PathBridger_AF_pixel_lapo}"
+REPO="${REPO:-/home/ext_csv/PathBridger}"
 PY="${PY:-/home/ext_csv/miniconda3/envs/offrl/bin/python}"
 LOGROOT="${LOGROOT:-$REPO/nohup_logs/pixel_pilot}"
 DATASET_DIR="${DATASET_DIR:-/raid/ext_csv/datasets/ogbench_visual}"

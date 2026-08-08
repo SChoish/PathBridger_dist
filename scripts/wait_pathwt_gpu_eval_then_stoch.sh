@@ -11,7 +11,7 @@
 set +e
 set -uo pipefail
 
-REPO="${REPO:-/home/ext_csv/PathBridger_dist}"
+REPO="${REPO:-/home/ext_csv/PathBridger}"
 PY="${PY:-/home/ext_csv/miniconda3/envs/offrl/bin/python}"
 CHAIN_LOGROOT="${CHAIN_LOGROOT:-$REPO/nohup_logs/paper_s0_pbf_stoch_chain}"
 POLL_SEC="${POLL_SEC:-60}"
