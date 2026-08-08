@@ -21,7 +21,7 @@ from agents.pixel_registry import (
     pixel_algorithm_metadata,
     pixel_method_scope,
 )
-from agents.pixel_trl_critic_locks import trl_critic_lock_for_env
+from agents.pixel_trl_critic_locks import apply_pixel_pbf_locks
 from envs.env_utils import make_pixel_env_and_datasets
 from utils.af_checkpoints import (
     load_af_checkpoint,
@@ -261,6 +261,8 @@ def _module_digest(agent, name: str) -> str:
 
 def _sample_offline_batch(pixel_data, batch_size: int, config: dict):
     kwargs = {'path_horizon': int(config.get('path_horizon', 5))}
+    if 'endpoint_horizon' in config:
+        kwargs['endpoint_horizon'] = int(config['endpoint_horizon'])
     if 'value_distance_weight_power' in config or 'discount' in config:
         kwargs.update(
             discount=float(config.get('discount', 0.99)),
@@ -361,8 +363,7 @@ def main(_):
         raise ValueError('config_json must decode to a JSON object.')
     overrides.setdefault('frame_stack', int(FLAGS.frame_stack))
     if algorithm == 'pixel_pathbridger_online_idm':
-        for key, value in trl_critic_lock_for_env(FLAGS.env_name).items():
-            overrides.setdefault(key, value)
+        overrides = apply_pixel_pbf_locks(FLAGS.env_name, overrides)
     agent, config = create_pixel_algorithm(
         algorithm,
         seed=FLAGS.seed,
@@ -590,9 +591,20 @@ def main(_):
             'value_p_curgoal': float(config.get('value_p_curgoal', 0.0)),
             'value_p_trajgoal': float(config.get('value_p_trajgoal', 1.0)),
             'value_p_randomgoal': float(config.get('value_p_randomgoal', 0.0)),
-            'endpoint_value_scale': float(
-                config.get('endpoint_value_scale', 10.0)
-            ),
+            'value_hidden_dims': list(config['value_hidden_dims']),
+            'value_layer_norm': bool(config['value_layer_norm']),
+            'value_learning_rate': float(config['value_learning_rate']),
+            'value_tau': float(config['value_tau']),
+        }
+        if algorithm == 'pixel_pathbridger_online_idm'
+        else None,
+        'pixel_pbf_tune': {
+            'gap': float(config['endpoint_value_scale']),
+            'num_candidates': int(config['eval_num_candidates']),
+            'endpoint_temperature': float(config['eval_temperature']),
+            'endpoint_horizon': int(config['endpoint_horizon']),
+            'path_horizon': int(config['path_horizon']),
+            'endpoint_flow_steps': int(config['endpoint_flow_steps']),
         }
         if algorithm == 'pixel_pathbridger_online_idm'
         else None,

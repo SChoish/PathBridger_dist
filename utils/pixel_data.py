@@ -167,32 +167,71 @@ class ActionFreePixelTrajectoryData:
         batch_size: int,
         *,
         path_horizon: int = 5,
+        endpoint_horizon: int | None = None,
         discount: float = 0.99,
         value_geom_sample: bool = True,
         value_p_curgoal: float = 0.0,
         value_p_trajgoal: float = 1.0,
         value_p_randomgoal: float = 0.0,
     ) -> dict[str, np.ndarray]:
-        choices = self.rng.integers(
-            0, len(self.episodes.transition_indices), size=int(batch_size)
-        )
-        indices = self.episodes.transition_indices[choices]
-        path_offsets = self._sample_future_offsets(
-            indices, discount=discount, geom_sample=False
-        )
-        goal_indices = indices + path_offsets
+        batch_size = int(batch_size)
+        if batch_size < 1:
+            raise ValueError('batch_size must be positive.')
         path_horizon = int(path_horizon)
         if path_horizon < 1:
             raise ValueError('path_horizon must be positive.')
-        fractions = np.arange(1, path_horizon + 1, dtype=np.float64)
-        fractions /= float(path_horizon)
-        path_indices = indices[:, None] + np.ceil(
-            (goal_indices - indices)[:, None] * fractions[None, :]
-        ).astype(np.int64)
-        path_observations = self.stack_indices(path_indices.reshape(-1)).reshape(
+
+        transition_indices = self.episodes.transition_indices
+        if endpoint_horizon is None:
+            valid_starts = transition_indices
+        else:
+            endpoint_horizon = int(endpoint_horizon)
+            if endpoint_horizon < path_horizon:
+                raise ValueError(
+                    'endpoint_horizon must be at least path_horizon, got '
+                    f'{endpoint_horizon} < {path_horizon}.'
+                )
+            valid_starts = transition_indices[
+                transition_indices + endpoint_horizon
+                <= self.episodes.terminal_for_state[transition_indices]
+            ]
+            if not len(valid_starts):
+                raise ValueError(
+                    'No pixel episode contains a full '
+                    f'horizon-{endpoint_horizon} PathBridger window.'
+                )
+        choices = self.rng.integers(
+            0, len(valid_starts), size=batch_size
+        )
+        indices = valid_starts[choices]
+        finals = self.episodes.terminal_for_state[indices]
+
+        # PathBridger's endpoint conditioning goal is an ordinary future state.
+        endpoint_goal_offsets = self._sample_future_offsets(
+            indices, discount=discount, geom_sample=False
+        )
+        endpoint_goal_indices = indices + endpoint_goal_offsets
+        if endpoint_horizon is None:
+            endpoint_target_indices = endpoint_goal_indices
+            fractions = np.arange(1, path_horizon + 1, dtype=np.float64)
+            fractions /= float(path_horizon)
+            bridge_indices = indices[:, None] + np.ceil(
+                endpoint_goal_offsets[:, None] * fractions[None, :]
+            ).astype(np.int64)
+        else:
+            endpoint_target_indices = np.minimum(
+                indices + endpoint_horizon, endpoint_goal_indices
+            )
+            bridge_indices = indices[:, None] + np.arange(
+                1, path_horizon + 1, dtype=np.int64
+            )[None, :]
+            bridge_indices = np.minimum(
+                bridge_indices, endpoint_target_indices[:, None]
+            )
+        bridge_targets = self.stack_indices(bridge_indices.reshape(-1)).reshape(
             len(indices), path_horizon, *self.image_shape
         )
-        successes = goal_indices == indices + 1
+        successes = endpoint_goal_indices == indices + 1
 
         mix = np.asarray(
             [value_p_curgoal, value_p_trajgoal, value_p_randomgoal],
@@ -224,34 +263,52 @@ class ActionFreePixelTrajectoryData:
             value_offsets[rand_mask] = np.maximum(
                 value_goal_indices[rand_mask] - indices[rand_mask], 0
             )
-        # Midpoint subgoal for latent TransV (between obs and value goal).
-        mid_offsets = np.maximum(value_offsets // 2, 0)
-        mid_indices = indices + mid_offsets
-        transitive_valids = (value_offsets > 1).astype(np.float32)
+        # TRL/PBF short anchors use a uniformly sampled offset in [1, 5].
+        remaining = finals - indices
+        base_max_offsets = np.minimum(5, remaining)
+        base_offsets = 1 + np.floor(
+            self.rng.random(len(indices)) * base_max_offsets
+        ).astype(np.int64)
+        base_indices = indices + base_offsets
 
-        return {
+        # Transitive splits are strictly internal and only active for pairs
+        # longer than the fixed five-step base horizon.
+        transitive_valids = value_offsets > 5
+        transitive_offsets = np.zeros(len(indices), dtype=np.int64)
+        if np.any(transitive_valids):
+            max_offsets = value_offsets[transitive_valids] - 1
+            transitive_offsets[transitive_valids] = 1 + np.floor(
+                self.rng.random(np.sum(transitive_valids)) * max_offsets
+            ).astype(np.int64)
+        transitive_indices = indices + transitive_offsets
+
+        result = {
             'observations': self.stack_indices(indices),
             'next_observations': self.stack_indices(indices + 1),
-            'goals': np.stack(
-                [
-                    repeat_pixel_frame(self.observations[index], self.frame_stack)
-                    for index in goal_indices
-                ]
-            ),
+            'goals': self.stack_indices(endpoint_goal_indices),
             'rewards': successes.astype(np.float32) - 1.0,
             'masks': 1.0 - successes.astype(np.float32),
             'indices': indices,
-            'goal_indices': goal_indices,
-            'path_indices': path_indices,
-            'path_observations': path_observations,
+            'goal_indices': endpoint_goal_indices,
+            'path_indices': bridge_indices,
+            'path_observations': bridge_targets,
             'value_goals': self.stack_indices(value_goal_indices),
             'value_offsets': value_offsets.astype(np.float32),
-            'base_goals': self.stack_indices(indices + 1),
-            'base_offsets': np.ones(len(indices), dtype=np.float32),
-            'transitive_subgoals': self.stack_indices(mid_indices),
-            'transitive_offsets': mid_offsets.astype(np.float32),
-            'transitive_valids': transitive_valids,
+            'base_goals': self.stack_indices(base_indices),
+            'base_offsets': base_offsets.astype(np.float32),
+            'transitive_subgoals': self.stack_indices(transitive_indices),
+            'transitive_offsets': transitive_offsets.astype(np.float32),
+            'transitive_valids': transitive_valids.astype(np.float32),
         }
+        if endpoint_horizon is not None:
+            result.update(
+                endpoint_goals=self.stack_indices(endpoint_goal_indices),
+                endpoint_targets=self.stack_indices(endpoint_target_indices),
+                bridge_targets=bridge_targets,
+                endpoint_goal_indices=endpoint_goal_indices,
+                endpoint_target_indices=endpoint_target_indices,
+            )
+        return result
 
 
 class PixelReplayBuffer:

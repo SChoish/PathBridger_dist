@@ -35,16 +35,16 @@ PIXEL_METHOD_SCOPES = {
     'pixel_pathbridger_online_idm': {
         'offline_trainable_modules': (
             'encoder',
+            'endpoint',
             'bridge',
-            'world_decoder',
             'value',
         ),
         'online_trainable_modules': ('idm',),
         'online_frozen_modules': (
             'encoder',
             'target_encoder',
+            'endpoint',
             'bridge',
-            'world_decoder',
             'value',
             'target_value',
         ),
@@ -209,7 +209,8 @@ def pixel_algorithm_metadata(name: str) -> AlgorithmMetadata:
             implementation_notes=(
                 'Proposed visual extension: latent TransV critic (TRL-locked '
                 'lam/expectile/discount/value_p) plus an action-free '
-                'endpoint-pinned latent path bridge are frozen online, while a '
+                'flow-matched endpoint proposer and latent path bridge are '
+                'frozen online, while a '
                 'separately initialized IDM is grounded from new RGB/action '
                 'transitions.'
             ),

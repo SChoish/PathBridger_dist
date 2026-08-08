@@ -14,64 +14,108 @@ import optax
 
 from agents.gc_actor_critic import _replace_subtree
 from agents.pixel_drq import DrQEncoder
-from agents.pixel_lapo import PixelDecoder
 from utils.flax_utils import ModuleDict, TrainState, nonpytree_field
-from utils.networks import MLP, default_init
+from utils.networks import MLP
 
 _VALUE_EPS = 1e-6
-_ENDPOINT_WEIGHT_CAP = 100.0
+_ENDPOINT_WEIGHT_CAP = 5.0
+_BRIDGE_ALPHA_POWER = 0.8
 
 
 class LatentPathBridge(nn.Module):
     feature_dim: int
     path_horizon: int = 5
-    hidden_dims: Sequence[int] = (256, 256)
+    endpoint_horizon: int = 25
+    hidden_dims: Sequence[int] = (512, 512, 512)
+    layer_norm: bool = True
 
     @nn.compact
-    def __call__(self, current_features, goal_features):
-        residual = MLP(
-            (*self.hidden_dims, self.path_horizon * self.feature_dim),
+    def __call__(self, current_features, endpoint_features):
+        indices = jnp.arange(1, self.path_horizon + 1, dtype=jnp.float32)
+        times = indices / jnp.asarray(self.endpoint_horizon, dtype=jnp.float32)
+        times = jnp.broadcast_to(
+            times[None, :], (current_features.shape[0], self.path_horizon)
+        )
+        current = jnp.broadcast_to(
+            current_features[:, None, :],
+            (current_features.shape[0], self.path_horizon, self.feature_dim),
+        )
+        displacement = endpoint_features - current_features
+        displacements = jnp.broadcast_to(
+            displacement[:, None, :], current.shape
+        )
+        residuals = MLP(
+            (*self.hidden_dims, self.feature_dim),
             activate_final=False,
+            layer_norm=self.layer_norm,
             name='residual_path',
-        )(jnp.concatenate([current_features, goal_features], axis=-1))
-        residual = residual.reshape(
-            (-1, self.path_horizon, self.feature_dim)
+        )(
+            jnp.concatenate(
+                [current, displacements, times[..., None]], axis=-1
+            )
         )
-        fractions = jnp.linspace(
-            1.0 / self.path_horizon, 1.0, self.path_horizon
-        )[None, :, None]
-        base = (
-            current_features[:, None, :] * (1.0 - fractions)
-            + goal_features[:, None, :] * fractions
+        alphas = jnp.power(times, _BRIDGE_ALPHA_POWER)
+        masks = times * (1.0 - times)
+        return (
+            current
+            + alphas[..., None] * displacements
+            + masks[..., None] * residuals
         )
-        # Endpoint pinning preserves the goal while the residual models the
-        # non-linear intermediate path.
-        return base + residual * (1.0 - fractions)
+
+
+class LatentFlowEndpoint(nn.Module):
+    """Conditional rectified-flow velocity for a K-step latent endpoint."""
+
+    feature_dim: int
+    hidden_dims: Sequence[int] = (512, 512, 512)
+    layer_norm: bool = True
+
+    @nn.compact
+    def __call__(
+        self,
+        current_features,
+        goal_features,
+        noisy_displacements,
+        times,
+    ):
+        times = jnp.asarray(times, dtype=jnp.float32)
+        if times.ndim == noisy_displacements.ndim - 1:
+            times = times[..., None]
+        inputs = jnp.concatenate(
+            [current_features, goal_features, noisy_displacements, times],
+            axis=-1,
+        )
+        return MLP(
+            (*self.hidden_dims, self.feature_dim),
+            activate_final=False,
+            layer_norm=self.layer_norm,
+            name='endpoint_velocity',
+        )(inputs)
 
 
 class LatentInverseDynamics(nn.Module):
     action_dim: int
     hidden_dims: Sequence[int] = (512, 512, 512)
+    layer_norm: bool = True
 
     @nn.compact
     def __call__(self, current_features, desired_next_features):
         inputs = jnp.concatenate(
             [current_features, desired_next_features], axis=-1
         )
-        return jnp.tanh(
-            MLP(
-                (*self.hidden_dims, self.action_dim),
-                activate_final=False,
-                kernel_init=default_init(0.01),
-                name='idm',
-            )(inputs)
-        )
+        return MLP(
+            (*self.hidden_dims, self.action_dim),
+            activate_final=False,
+            layer_norm=self.layer_norm,
+            name='idm',
+        )(inputs)
 
 
 class LatentTransitiveValue(nn.Module):
     """Bounded latent state-goal value returned as a logit."""
 
-    hidden_dims: Sequence[int] = (256, 256)
+    hidden_dims: Sequence[int] = (512, 512, 512)
+    layer_norm: bool = True
 
     @nn.compact
     def __call__(self, current_features, goal_features):
@@ -79,6 +123,7 @@ class LatentTransitiveValue(nn.Module):
         return MLP(
             (*self.hidden_dims, 1),
             activate_final=False,
+            layer_norm=self.layer_norm,
             name='latent_value',
         )(inputs).squeeze(-1)
 
@@ -132,13 +177,11 @@ class PixelPathBridgerAgent(flax.struct.PyTreeNode):
         discount = jnp.asarray(self.config['discount'], dtype=jnp.float32)
         expectile = float(self.config['expectile'])
         observations = batch['observations']
-        next_observations = batch['next_observations']
         value_goals = batch['value_goals']
         base_goals = batch['base_goals']
         subgoals = batch['transitive_subgoals']
 
         current = self._encode(observations, grad_params)
-        next_feats = self._encode(next_observations, grad_params)
         value_goal_feats = self._encode(value_goals, grad_params)
         base_goal_feats = self._encode(base_goals, grad_params)
         subgoal_feats = self._encode(subgoals, grad_params)
@@ -199,8 +242,8 @@ class PixelPathBridgerAgent(flax.struct.PyTreeNode):
 
         exact_left = jnp.power(discount, left_offsets)
         exact_right = jnp.power(discount, right_offsets)
-        mixed_left = jnp.where(left_offsets <= 1.0, exact_left, target_left)
-        mixed_right = jnp.where(right_offsets <= 1.0, exact_right, target_right)
+        mixed_left = jnp.where(left_offsets <= 5.0, exact_left, target_left)
+        mixed_right = jnp.where(right_offsets <= 5.0, exact_right, target_right)
         transitive_targets = jax.lax.stop_gradient(mixed_left * mixed_right)
         transitive_bce = _expectile_bce(
             transitive_logits, transitive_targets, expectile
@@ -212,8 +255,6 @@ class PixelPathBridgerAgent(flax.struct.PyTreeNode):
             transitive_valids * transitive_distance_weights * transitive_bce
         ) / jnp.maximum(jnp.sum(transitive_valids), 1.0)
 
-        # Keep next_feats in the graph so encoder sees 1-step transitions.
-        _ = next_feats
         loss = self_loss + base_loss + transitive_loss
         return loss, {
             'value/loss': loss,
@@ -246,9 +287,83 @@ class PixelPathBridgerAgent(flax.struct.PyTreeNode):
         )
         return jax.lax.stop_gradient(weights), jax.lax.stop_gradient(value_gap)
 
+    def _sample_endpoint_candidates(
+        self,
+        current,
+        goals,
+        seed,
+        *,
+        num_candidates: int,
+        temperature: float,
+    ):
+        batch_size, feature_dim = current.shape
+        noise = jax.random.normal(
+            seed,
+            (batch_size, num_candidates, feature_dim),
+            dtype=current.dtype,
+        )
+        displacements = jnp.asarray(temperature, current.dtype) * noise
+        repeated_current = jnp.broadcast_to(
+            current[:, None, :], displacements.shape
+        ).reshape(batch_size * num_candidates, feature_dim)
+        repeated_goals = jnp.broadcast_to(
+            goals[:, None, :], displacements.shape
+        ).reshape(batch_size * num_candidates, feature_dim)
+        flat = displacements.reshape(batch_size * num_candidates, feature_dim)
+        flow_steps = int(self.config['endpoint_flow_steps'])
+        for flow_step in range(flow_steps):
+            time = jnp.full(
+                (batch_size * num_candidates, 1),
+                flow_step / flow_steps,
+                dtype=current.dtype,
+            )
+            velocity = self.network.select('endpoint')(
+                repeated_current, repeated_goals, flat, time
+            )
+            flat = flat + velocity / flow_steps
+        endpoints = repeated_current + flat
+        return endpoints.reshape(batch_size, num_candidates, feature_dim)
+
+    def _select_endpoint(
+        self,
+        current,
+        goals,
+        seed,
+        *,
+        num_candidates: int,
+        temperature: float,
+    ):
+        candidates = self._sample_endpoint_candidates(
+            current,
+            goals,
+            seed,
+            num_candidates=num_candidates,
+            temperature=temperature,
+        )
+        batch_size, _, feature_dim = candidates.shape
+        flat_current = jnp.broadcast_to(
+            current[:, None, :], candidates.shape
+        ).reshape(-1, feature_dim)
+        flat_goals = jnp.broadcast_to(
+            goals[:, None, :], candidates.shape
+        ).reshape(-1, feature_dim)
+        flat_candidates = candidates.reshape(-1, feature_dim)
+        to_endpoint = jax.nn.sigmoid(
+            self.network.select('value')(flat_current, flat_candidates)
+        )
+        to_goal = jax.nn.sigmoid(
+            self.network.select('value')(flat_candidates, flat_goals)
+        )
+        scores = (to_endpoint * to_goal).reshape(batch_size, num_candidates)
+        best = jnp.argmax(scores, axis=1)
+        return jnp.take_along_axis(
+            candidates, best[:, None, None], axis=1
+        )[:, 0, :]
+
     @partial(jax.jit, static_argnames=())
     def offline_update(self, batch):
         path_horizon = int(self.config['path_horizon'])
+        new_rng, noise_rng, time_rng = jax.random.split(self.rng, 3)
 
         def loss_fn(params):
             value_loss, value_info = self.value_loss(batch, params)
@@ -256,59 +371,58 @@ class PixelPathBridgerAgent(flax.struct.PyTreeNode):
                 batch['observations'], params=params
             )
             goal = self.network.select('encoder')(
-                batch['goals'], params=params
+                batch['endpoint_goals'], params=params
             )
+            target_endpoint = self.network.select('target_encoder')(
+                batch['endpoint_targets']
+            )
+            endpoint_weights, value_gap = self._endpoint_weights(
+                current, goal, target_endpoint
+            )
+            displacement_targets = jax.lax.stop_gradient(
+                target_endpoint - current
+            )
+            noise = jax.random.normal(
+                noise_rng,
+                displacement_targets.shape,
+                dtype=displacement_targets.dtype,
+            )
+            times = jax.random.uniform(
+                time_rng,
+                (displacement_targets.shape[0], 1),
+                dtype=displacement_targets.dtype,
+            )
+            noisy = (1.0 - times) * noise + times * displacement_targets
+            target_velocity = displacement_targets - noise
+            predicted_velocity = self.network.select('endpoint')(
+                current, goal, noisy, times, params=params
+            )
+            flow_errors = jnp.sum(
+                jnp.square(predicted_velocity - target_velocity), axis=-1
+            )
+            endpoint_loss = jnp.mean(endpoint_weights * flow_errors)
             predicted_path = self.network.select('bridge')(
-                current, goal, params=params
+                current, jax.lax.stop_gradient(target_endpoint), params=params
             )
-            path_images = batch['path_observations']
+            path_images = batch['bridge_targets']
             flat_images = path_images.reshape((-1, *path_images.shape[2:]))
             target_path = self.network.select('target_encoder')(
                 flat_images
             ).reshape((-1, path_horizon, current.shape[-1]))
-            endpoint_weights, value_gap = self._endpoint_weights(
-                current, goal, predicted_path[:, -1]
+            feature_errors = jnp.sum(
+                jnp.abs(predicted_path - jax.lax.stop_gradient(target_path)),
+                axis=-1,
             )
-            feature_errors = jnp.mean(
-                jnp.square(
-                    predicted_path - jax.lax.stop_gradient(target_path)
-                ),
-                axis=(1, 2),
-            )
-            feature_loss = jnp.mean(endpoint_weights * feature_errors)
-            reconstructed = self.network.select('world_decoder')(
-                predicted_path.reshape((-1, current.shape[-1])),
-                params=params,
-            ).reshape(path_images.shape)
-            reconstruction_loss = jnp.mean(
-                jnp.square(
-                    reconstructed
-                    - jnp.asarray(path_images, dtype=jnp.float32) / 255.0
-                )
-            )
-            endpoint_loss = jnp.mean(
-                endpoint_weights * jnp.mean(
-                    jnp.square(predicted_path[:, -1] - goal), axis=-1
-                )
-            )
-            feature_std = jnp.std(current, axis=0)
-            variance_loss = jnp.mean(jnp.square(jax.nn.relu(1.0 - feature_std)))
-            total = (
-                value_loss
-                + feature_loss
-                + float(self.config['reconstruction_weight'])
-                * reconstruction_loss
-                + float(self.config['endpoint_weight']) * endpoint_loss
-                + float(self.config['variance_weight']) * variance_loss
-            )
+            feature_loss = feature_errors.mean(axis=1).mean()
+            total = value_loss + endpoint_loss + feature_loss
             info = {
                 'loss/total': total,
-                'path/feature_loss': feature_loss,
-                'path/reconstruction_loss': reconstruction_loss,
-                'path/endpoint_loss': endpoint_loss,
-                'path/variance_loss': variance_loss,
-                'path/endpoint_weight_mean': endpoint_weights.mean(),
-                'path/value_gap_mean': value_gap.mean(),
+                'bridge/loss': feature_loss,
+                'bridge/prefix_l1': feature_errors.mean(),
+                'endpoint/flow_matching_loss': endpoint_loss,
+                'endpoint/flow_error_mean': flow_errors.mean(),
+                'endpoint/weight_mean': endpoint_weights.mean(),
+                'endpoint/value_gap_mean': value_gap.mean(),
                 **value_info,
             }
             return total, info
@@ -317,8 +431,8 @@ class PixelPathBridgerAgent(flax.struct.PyTreeNode):
             loss_fn,
             trainable_modules=(
                 'encoder',
+                'endpoint',
                 'bridge',
-                'world_decoder',
                 'value',
             ),
         )
@@ -334,7 +448,7 @@ class PixelPathBridgerAgent(flax.struct.PyTreeNode):
             target='target_value',
             tau=float(self.config['value_tau']),
         )
-        return self.replace(network=network), info
+        return self.replace(network=network, rng=new_rng), info
 
     @partial(jax.jit, static_argnames=())
     def online_update(self, batch):
@@ -349,11 +463,12 @@ class PixelPathBridgerAgent(flax.struct.PyTreeNode):
                 current, following, params=params
             )
             errors = predicted - batch['actions']
-            loss = jnp.mean(jnp.sum(jnp.abs(errors), axis=-1))
+            squared_errors = jnp.square(errors)
+            loss = jnp.sum(squared_errors, axis=-1).mean()
             return loss, {
                 'loss/total': loss,
-                'idm/action_l1': jnp.mean(jnp.abs(errors)),
-                'idm/action_mse': jnp.mean(jnp.square(errors)),
+                'idm/loss': loss,
+                'idm/action_mse': squared_errors.mean(),
                 'idm/action_abs_mean': jnp.mean(jnp.abs(predicted)),
             }
 
@@ -362,29 +477,90 @@ class PixelPathBridgerAgent(flax.struct.PyTreeNode):
         )
         return self.replace(network=network), info
 
-    @partial(jax.jit, static_argnames=())
-    def latent_path(self, observations, goals):
-        current = self.network.select('encoder')(observations)
-        goal = self.network.select('encoder')(goals)
-        return self.network.select('bridge')(current, goal)
-
-    @partial(jax.jit, static_argnames=('temperature',))
-    def sample_actions(self, observations, goals, seed=None, temperature=0.0):
+    @partial(
+        jax.jit,
+        static_argnames=('num_candidates', 'endpoint_temperature'),
+    )
+    def latent_path(
+        self,
+        observations,
+        goals,
+        seed=None,
+        num_candidates=None,
+        endpoint_temperature=None,
+    ):
         if seed is None:
             seed = jax.random.PRNGKey(0)
+        if num_candidates is None:
+            num_candidates = int(self.config['eval_num_candidates'])
+        if endpoint_temperature is None:
+            endpoint_temperature = float(self.config['eval_temperature'])
         current = self.network.select('encoder')(observations)
         goal = self.network.select('encoder')(goals)
-        path = self.network.select('bridge')(current, goal)
+        endpoint = self._select_endpoint(
+            current,
+            goal,
+            seed,
+            num_candidates=int(num_candidates),
+            temperature=float(endpoint_temperature),
+        )
+        return self.network.select('bridge')(current, endpoint)
+
+    @partial(
+        jax.jit,
+        static_argnames=('temperature', 'num_candidates', 'endpoint_temperature'),
+    )
+    def sample_actions(
+        self,
+        observations,
+        goals,
+        seed=None,
+        temperature=0.0,
+        num_candidates=None,
+        endpoint_temperature=None,
+    ):
+        if seed is None:
+            seed = jax.random.PRNGKey(0)
+        endpoint_seed, action_seed = jax.random.split(seed)
+        if num_candidates is None:
+            num_candidates = int(self.config['eval_num_candidates'])
+        if endpoint_temperature is None:
+            endpoint_temperature = float(self.config['eval_temperature'])
+        current = self.network.select('encoder')(observations)
+        goal = self.network.select('encoder')(goals)
+        endpoint = self._select_endpoint(
+            current,
+            goal,
+            endpoint_seed,
+            num_candidates=int(num_candidates),
+            temperature=float(endpoint_temperature),
+        )
+        path = self.network.select('bridge')(current, endpoint)
         actions = self.network.select('idm')(current, path[:, 0])
         if temperature > 0.0:
             actions = actions + float(temperature) * float(
                 self.config['exploration_std']
-            ) * jax.random.normal(seed, actions.shape)
+            ) * jax.random.normal(action_seed, actions.shape)
         return jnp.clip(actions, -1.0, 1.0)
 
     @classmethod
     def create(cls, seed, example_images, action_dim, config):
         config = dict(config)
+        path_horizon = int(config['path_horizon'])
+        endpoint_horizon = int(config['endpoint_horizon'])
+        if path_horizon < 1 or endpoint_horizon < path_horizon:
+            raise ValueError(
+                'Require endpoint_horizon >= path_horizon >= 1, got '
+                f'{endpoint_horizon} and {path_horizon}.'
+            )
+        if int(config['endpoint_flow_steps']) < 1:
+            raise ValueError('endpoint_flow_steps must be positive.')
+        if int(config['eval_num_candidates']) < 1:
+            raise ValueError('eval_num_candidates must be positive.')
+        if float(config['eval_temperature']) < 0.0:
+            raise ValueError('eval_temperature cannot be negative.')
+        if not 0.0 < float(config['discount']) < 1.0:
+            raise ValueError('discount must lie in (0, 1).')
         images = jnp.asarray(example_images, dtype=jnp.uint8)
         expected_channels = 3 * int(config['frame_stack'])
         if images.ndim != 4 or images.shape[-1] != expected_channels:
@@ -400,23 +576,37 @@ class PixelPathBridgerAgent(flax.struct.PyTreeNode):
         encoder = DrQEncoder(feature_dim)
         bridge = LatentPathBridge(
             feature_dim=feature_dim,
-            path_horizon=int(config['path_horizon']),
+            path_horizon=path_horizon,
+            endpoint_horizon=endpoint_horizon,
             hidden_dims=hidden_dims,
+            layer_norm=bool(config.get('bridge_layer_norm', True)),
         )
-        world_decoder = PixelDecoder(tuple(int(v) for v in images.shape[1:]))
+        endpoint = LatentFlowEndpoint(
+            feature_dim=feature_dim,
+            hidden_dims=hidden_dims,
+            layer_norm=bool(config.get('bridge_layer_norm', True)),
+        )
         idm = LatentInverseDynamics(
-            int(action_dim), tuple(config['idm_hidden_dims'])
+            int(action_dim),
+            tuple(config['idm_hidden_dims']),
+            layer_norm=bool(config.get('idm_layer_norm', True)),
         )
-        value = LatentTransitiveValue(value_hidden)
+        value = LatentTransitiveValue(
+            value_hidden,
+            layer_norm=bool(config.get('value_layer_norm', True)),
+        )
         # Target modules need a distinct Flax instance. Reusing ``value`` here
         # binds only one of the two ModuleDict names and drops ``modules_value``.
-        target_value = LatentTransitiveValue(value_hidden)
+        target_value = LatentTransitiveValue(
+            value_hidden,
+            layer_norm=bool(config.get('value_layer_norm', True)),
+        )
         model = ModuleDict(
             {
                 'encoder': encoder,
                 'target_encoder': encoder,
+                'endpoint': endpoint,
                 'bridge': bridge,
-                'world_decoder': world_decoder,
                 'value': value,
                 'target_value': target_value,
                 'idm': idm,
@@ -429,8 +619,8 @@ class PixelPathBridgerAgent(flax.struct.PyTreeNode):
             init_rng,
             encoder=(images,),
             target_encoder=(images,),
+            endpoint=(features, features, features, jnp.zeros((len(images), 1))),
             bridge=(features, features),
-            world_decoder=(features,),
             value=(features, features),
             target_value=(features, features),
             idm=(features, features),
@@ -446,10 +636,8 @@ class PixelPathBridgerAgent(flax.struct.PyTreeNode):
             params,
             tx={
                 'encoder': optax.adam(float(config['encoder_learning_rate'])),
+                'endpoint': optax.adam(float(config['learning_rate'])),
                 'bridge': optax.adam(float(config['learning_rate'])),
-                'world_decoder': optax.adam(
-                    float(config['encoder_learning_rate'])
-                ),
                 'value': optax.adam(
                     float(config.get('value_learning_rate', config['learning_rate']))
                 ),
@@ -468,19 +656,21 @@ def get_config():
         dict(
             frame_stack=3,
             feature_dim=128,
-            hidden_dims=(256, 256),
-            value_hidden_dims=(256, 256),
+            hidden_dims=(512, 512, 512),
+            bridge_layer_norm=True,
+            value_hidden_dims=(512, 512, 512),
+            value_layer_norm=True,
             idm_hidden_dims=(512, 512, 512),
+            idm_layer_norm=True,
             path_horizon=5,
+            endpoint_horizon=25,
+            endpoint_flow_steps=8,
             learning_rate=3e-4,
             encoder_learning_rate=1e-4,
             value_learning_rate=3e-4,
-            idm_learning_rate=1e-3,
+            idm_learning_rate=3e-4,
             tau=0.01,
             value_tau=0.005,
-            reconstruction_weight=1.0,
-            endpoint_weight=1.0,
-            variance_weight=0.1,
             exploration_std=0.1,
             offline_batch_size=128,
             online_batch_size=256,
@@ -494,12 +684,15 @@ def get_config():
             value_p_curgoal=0.0,
             value_p_trajgoal=1.0,
             value_p_randomgoal=0.0,
+            eval_num_candidates=1,
+            eval_temperature=0.0,
         )
     )
 
 
 __all__ = [
     'LatentInverseDynamics',
+    'LatentFlowEndpoint',
     'LatentPathBridge',
     'LatentTransitiveValue',
     'PixelPathBridgerAgent',
