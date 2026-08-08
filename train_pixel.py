@@ -445,7 +445,7 @@ def main(_):
     if restore_payload is not None and restore_phase == 'offline':
         agent = restore_af_agent(agent, restore_payload)
         offline_start = int(restore_payload['step']) + 1
-        lapo_stage_start = int(restore_runtime.get('lapo_stage', 1))
+        lapo_stage_start = int(restore_runtime.get('lapo_stage') or 1)
         if algorithm == 'gc_pixel_lapo_decoder' and lapo_stage_start == 2:
             # stage2 steps are 1-indexed within the stage.
             offline_start = int(restore_runtime.get('stage_step', restore_payload['step'])) + 1
