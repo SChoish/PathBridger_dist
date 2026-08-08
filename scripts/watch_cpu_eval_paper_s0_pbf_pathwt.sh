@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# CPU eval watcher for paper_s0_pbf_pathwt (PathBridger PBF + path weighting).
-# When params_800000.pkl appears -> full NT grid eval; then 900k / 1M as they land.
-# Full NT grid: (1,0) + N in {1,2,4,8,16,32} x T in {0.25,0.5,1} (19 cells). MAX=4.
+# CPU eval watcher for paper_s0_pbf_pathwt / stoch groups (RUN_GROUP).
+# Default EVAL_GRID=best: paper Best-(N,T) only @800/900/1M. Set EVAL_GRID=full
+# for the legacy 19-cell NT sweep. MAX concurrent CPU jobs.
 #
 # Hardened: never `set -e`; skip `_quarantine_*` / missing ckpts; per-step LOCK
 # so a restarted watcher does not double-launch. GPU is never touched
@@ -22,6 +22,8 @@ CPU_BASE="${CPU_BASE:-32}"
 CPU_STRIDE="${CPU_STRIDE:-8}"
 AUTO_EXIT="${AUTO_EXIT:-0}"
 EXPECTED_RUNS="${EXPECTED_RUNS:-8}"
+# best = paper Best-(N,T) only; full = 19-cell NT sweep
+EVAL_GRID="${EVAL_GRID:-best}"
 
 export OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1
 export NUMEXPR_NUM_THREADS=1 TF_NUM_INTRAOP_THREADS=1 TF_NUM_INTEROP_THREADS=1
@@ -120,7 +122,7 @@ launch_eval() {
   cpu0=$((CPU_BASE + slot * CPU_STRIDE))
   cpu1=$((cpu0 + CPU_STRIDE - 1))
   out="$LOGROOT/${name}_step${step}.out"
-  log "LAUNCH ${name} step=${step} NT-grid cpus=${cpu0}-${cpu1} episodes=${EPISODES}"
+  log "LAUNCH ${name} step=${step} grid=${EVAL_GRID} cpus=${cpu0}-${cpu1} episodes=${EPISODES}"
   (
     set +e
     taskset -c "${cpu0}-${cpu1}" \
@@ -129,6 +131,7 @@ launch_eval() {
         --checkpoint-step="${step}" \
         --episodes="${EPISODES}" \
         --seed=0 \
+        --grid="${EVAL_GRID}" \
       >"$out" 2>&1
     exit $?
   ) &
@@ -174,7 +177,7 @@ for d in sorted(root.iterdir()):
 PY
 }
 
-log "START watcher EXP_ROOT=${EXP_ROOT} MAX=${MAX} EPISODES=${EPISODES} NT=full19 AUTO_EXIT=${AUTO_EXIT}"
+log "START watcher EXP_ROOT=${EXP_ROOT} MAX=${MAX} EPISODES=${EPISODES} grid=${EVAL_GRID} AUTO_EXIT=${AUTO_EXIT}"
 
 idle_rounds=0
 while true; do

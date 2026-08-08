@@ -48,7 +48,8 @@ while true; do
   sleep 1
 
   log "launch watcher"
-  bash "$WATCHER" >>"$LOGROOT/nohup_watcher.out" 2>&1 &
+  EVAL_GRID="${EVAL_GRID:-best}" \
+    bash "$WATCHER" >>"$LOGROOT/nohup_watcher.out" 2>&1 &
   child_watcher=$!
   echo "$child_watcher" >"$LOGROOT/watcher.pid"
   log "watcher pid=${child_watcher}"

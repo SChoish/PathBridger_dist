@@ -1107,6 +1107,7 @@ class PathBridgerAgent(flax.struct.PyTreeNode):
         *,
         num_samples: int,
         temperature: float,
+        reference: jnp.ndarray | None = None,
     ) -> jnp.ndarray:
         """Sample absolute prefixes for one already-selected endpoint per row."""
 
@@ -1116,11 +1117,12 @@ class PathBridgerAgent(flax.struct.PyTreeNode):
         )
         event_dim = event_steps * state_dim
         endpoint_displacements = endpoints - observations
-        reference = self._construct_bridge_at_indices(
-            observations,
-            endpoints,
-            jnp.arange(1, _ACTION_HORIZON + 1),
-        )
+        if reference is None:
+            reference = self._construct_bridge_at_indices(
+                observations,
+                endpoints,
+                jnp.arange(1, _ACTION_HORIZON + 1),
+            )
         temperature_array = jnp.asarray(temperature, dtype=observations.dtype)
 
         if self.config['prefix_model'] == 'low_rank_gaussian':
@@ -1210,13 +1212,27 @@ class PathBridgerAgent(flax.struct.PyTreeNode):
         temperature: float,
         include_deterministic: bool,
     ) -> jnp.ndarray:
-        deterministic_states = self._construct_bridge_at_indices(
-            observations,
-            endpoints,
-            jnp.arange(0, _ACTION_HORIZON + 1),
-        )[:, None, :, :]
         if self.config['prefix_model'] == 'deterministic':
-            return deterministic_states
+            return self._construct_bridge_at_indices(
+                observations,
+                endpoints,
+                jnp.arange(0, _ACTION_HORIZON + 1),
+            )[:, None, :, :]
+
+        deterministic_states = None
+        if include_deterministic:
+            deterministic_states = self._construct_bridge_at_indices(
+                observations,
+                endpoints,
+                jnp.arange(0, _ACTION_HORIZON + 1),
+            )
+            reference = deterministic_states[:, 1:, :]
+        else:
+            reference = self._construct_bridge_at_indices(
+                observations,
+                endpoints,
+                jnp.arange(1, _ACTION_HORIZON + 1),
+            )
 
         stochastic = self._sample_stochastic_prefixes(
             observations,
@@ -1224,9 +1240,13 @@ class PathBridgerAgent(flax.struct.PyTreeNode):
             seed,
             num_samples=num_samples,
             temperature=temperature,
+            reference=reference,
         )
         if include_deterministic:
-            return jnp.concatenate([deterministic_states, stochastic], axis=1)
+            return jnp.concatenate(
+                [deterministic_states[:, None, :, :], stochastic],
+                axis=1,
+            )
         return stochastic
 
     @partial(
@@ -1275,17 +1295,29 @@ class PathBridgerAgent(flax.struct.PyTreeNode):
         batch_size, num_prefixes, _, state_dim = prefixes.shape
         current = prefixes[:, :, :-1, :].reshape(-1, state_dim)
         following = prefixes[:, :, 1:, :].reshape(-1, state_dim)
-        transition_values = jax.nn.sigmoid(
-            self.network.select('target_value')(current, following)
-        ).reshape(batch_size, num_prefixes, _ACTION_HORIZON)
         final_states = prefixes[:, :, -1, :].reshape(-1, state_dim)
         repeated_endpoints = jnp.broadcast_to(
             endpoints[:, None, :],
             (batch_size, num_prefixes, state_dim),
         ).reshape(-1, state_dim)
-        remainder_values = jax.nn.sigmoid(
-            self.network.select('target_value')(final_states, repeated_endpoints)
-        ).reshape(batch_size, num_prefixes)
+        value_logits = self.network.select('target_value')(
+            jnp.concatenate([current, final_states], axis=0),
+            jnp.concatenate([following, repeated_endpoints], axis=0),
+        )
+        transition_logits, remainder_logits = jnp.split(
+            value_logits,
+            [current.shape[0]],
+            axis=0,
+        )
+        transition_values = jax.nn.sigmoid(transition_logits).reshape(
+            batch_size,
+            num_prefixes,
+            _ACTION_HORIZON,
+        )
+        remainder_values = jax.nn.sigmoid(remainder_logits).reshape(
+            batch_size,
+            num_prefixes,
+        )
         return (
             jnp.sum(jnp.log(jnp.clip(transition_values, _VALUE_EPS, 1.0)), axis=-1)
             + jnp.log(jnp.clip(remainder_values, _VALUE_EPS, 1.0))
@@ -1452,11 +1484,14 @@ class PathBridgerAgent(flax.struct.PyTreeNode):
             batch_size * num_candidates,
             goals.shape[-1],
         )
-        values_to_endpoint = jax.nn.sigmoid(
-            self.network.select('value')(flat_observations, flat_candidates)
+        value_logits = self.network.select('value')(
+            jnp.concatenate([flat_observations, flat_candidates], axis=0),
+            jnp.concatenate([flat_candidates, flat_goals], axis=0),
         )
-        values_to_goal = jax.nn.sigmoid(
-            self.network.select('value')(flat_candidates, flat_goals)
+        values_to_endpoint, values_to_goal = jnp.split(
+            jax.nn.sigmoid(value_logits),
+            2,
+            axis=0,
         )
         scores = (values_to_endpoint * values_to_goal).reshape(
             batch_size,

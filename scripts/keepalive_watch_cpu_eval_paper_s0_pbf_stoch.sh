@@ -52,6 +52,7 @@ while true; do
 
   log "launch watcher"
   RUN_GROUP="$RUN_GROUP" LOGROOT="$LOGROOT" EXP_ROOT="${EXP_ROOT:-}" \
+    EVAL_GRID="${EVAL_GRID:-best}" \
     bash "$WATCHER" >>"$LOGROOT/watcher_nohup.out" 2>&1 &
   child_watcher=$!
   echo "$child_watcher" >"$LOGROOT/watcher.pid"
